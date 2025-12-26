@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
     Table, Typography, Spin, Alert, Card, Row, Col, Tag, Button, Space,
-    Statistic, Badge, Input, Form, Modal, message, InputNumber, Avatar, Radio
+    Statistic, Badge, Input, Form, Modal, message, InputNumber, Radio, Checkbox
 } from 'antd';
 import {
     PlayCircleOutlined, PauseOutlined, ReloadOutlined, SettingOutlined, CopyOutlined, DownloadOutlined, SyncOutlined
@@ -13,8 +13,6 @@ const { Title, Text } = Typography;
 
 interface WhaleCandidate {
     address: string;
-    userName?: string;
-    profileImage?: string;
     discoveredAt: string;
     tradesObserved: number;
     volumeObserved: number;
@@ -47,6 +45,7 @@ function WhaleDiscovery() {
     const [timePeriod, setTimePeriod] = useState<'24h' | '7d' | '30d' | 'all'>('all');
     const [periodData, setPeriodData] = useState<Record<string, { pnl: number; volume: number; tradeCount: number; winRate: number; smartScore: number }>>({});
     const [loadingPeriod, setLoadingPeriod] = useState(false);
+    const [watchedAddresses, setWatchedAddresses] = useState<Set<string>>(new Set());
     const [form] = Form.useForm();
 
     // 版本信息
@@ -79,12 +78,36 @@ function WhaleDiscovery() {
         }
     }, []);
 
+    const loadWatched = useCallback(async () => {
+        try {
+            const res = await (whaleApi as any).getWatched();
+            setWatchedAddresses(new Set(res.data.map((a: string) => a.toLowerCase())));
+        } catch { }
+    }, []);
+
+    const toggleWatch = async (address: string, checked: boolean) => {
+        try {
+            const normalized = address.toLowerCase();
+            await (whaleApi as any).toggleWatch(normalized, checked);
+            setWatchedAddresses(prev => {
+                const next = new Set(prev);
+                if (checked) next.add(normalized);
+                else next.delete(normalized);
+                return next;
+            });
+            message.success(checked ? '已开始监控该地址' : '已取消监控');
+        } catch {
+            message.error('同步监控状态失败');
+        }
+    };
+
     // 加载时间段数据 - 优先使用批量缓存，秒级响应
     const loadPeriodData = useCallback(async (period: '24h' | '7d' | '30d' | 'all', addresses: string[]) => {
         if (addresses.length === 0) return;
 
         setLoadingPeriod(true);
-        setPeriodData({});
+        // 不再清空旧数据，保持界面平滑
+        // setPeriodData({});
 
         try {
             // 1. 先尝试批量获取缓存数据
@@ -104,7 +127,7 @@ function WhaleDiscovery() {
             }
 
             // 立即显示缓存数据
-            setPeriodData(newPeriodData);
+            setPeriodData(prev => ({ ...prev, ...newPeriodData }));
 
             // 2. 对于没有缓存的地址，顺序请求
             if (missingAddresses.length > 0) {
@@ -141,6 +164,7 @@ function WhaleDiscovery() {
     useEffect(() => {
         loadStatus().finally(() => setLoading(false));
         loadWhales();
+        loadWatched();
 
         // 每 5 秒刷新状态
         const interval = setInterval(() => {
@@ -149,19 +173,16 @@ function WhaleDiscovery() {
         }, 5000);
 
         return () => clearInterval(interval);
-    }, [loadStatus, loadWhales]);
+    }, [loadStatus, loadWhales, loadWatched]);
 
-    // 当时间段变化时加载时间段数据（不依赖 whales 变化，避免自动刷新）
+    // 当时间段变化时加载时间段数据
     useEffect(() => {
-        if (timePeriod !== 'all' && whales.length > 0) {
+        if (whales.length > 0) {
             const addresses = whales.map(w => w.address);
             loadPeriodData(timePeriod, addresses);
-        } else {
-            setPeriodData({});
         }
-        // 只在 timePeriod 变化时触发，不监听 whales 变化
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [timePeriod]);
+    }, [timePeriod, whales.length]);
 
     const handleStart = async () => {
         if (!infuraKey) {
@@ -345,45 +366,46 @@ function WhaleDiscovery() {
             key: 'trader',
             render: (_: any, record: WhaleCandidate) => (
                 <Space size={8}>
-                    <Avatar
-                        size={32}
-                        style={{ backgroundColor: '#1890ff' }}
+                    <a
+                        href={`https://polymarket.com/profile/${record.address}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ fontWeight: 500, color: '#1890ff' }}
                     >
-                        {record.address?.slice(2, 4).toUpperCase()}
-                    </Avatar>
-                    <div>
-                        <a
-                            href={`https://polymarket.com/profile/${record.address}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            style={{ fontWeight: 500, color: '#1890ff' }}
-                        >
-                            {`${record.address?.slice(0, 6)}...${record.address?.slice(-4)}`}
-                        </a>
-                        <Space size={4}>
-                            <Text type="secondary" style={{ fontSize: 11 }}>
-                                {record.address?.slice(0, 8)}...{record.address?.slice(-6)}
-                            </Text>
-                            <CopyOutlined
-                                style={{ color: '#888', cursor: 'pointer', fontSize: 11 }}
-                                onClick={() => {
-                                    navigator.clipboard.writeText(record.address);
-                                    message.success('地址已复制');
-                                }}
-                            />
-                        </Space>
-                    </div>
+                        {`${record.address?.slice(0, 6)}...${record.address?.slice(-4)}`}
+                    </a>
+                    <CopyOutlined
+                        style={{ color: '#888', cursor: 'pointer', fontSize: 12 }}
+                        onClick={() => {
+                            navigator.clipboard.writeText(record.address);
+                            message.success('地址已复制');
+                        }}
+                    />
                 </Space>
             ),
-            width: 220,
+            width: 160,
+        },
+        {
+            title: '监控',
+            key: 'watch',
+            render: (_: any, record: WhaleCandidate) => (
+                <Checkbox
+                    checked={watchedAddresses.has(record.address.toLowerCase())}
+                    onChange={(e) => toggleWatch(record.address, e.target.checked)}
+                />
+            ),
+            width: 70,
+            align: 'center' as const,
         },
         {
             title: '盈亏',
             key: 'pnl',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const pnl = timePeriod !== 'all' && pd ? pd.pnl : record.profile?.pnl;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profilePnl = record.profile?.pnl;
+                const pnl = pd ? pd.pnl : profilePnl;
+                // 如果没有缓存也没有 profile 数据，显示加载中
+                const showLoading = !pd && profilePnl === undefined;
                 if (showLoading) return <Spin size="small" />;
                 return (
                     <span style={{ color: pnl && pnl >= 0 ? '#52c41a' : '#ff4d4f' }}>
@@ -398,8 +420,9 @@ function WhaleDiscovery() {
             key: 'winRate',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const winRate = timePeriod !== 'all' && pd ? pd.winRate : record.profile?.winRate;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profileWinRate = record.profile?.winRate;
+                const winRate = pd ? pd.winRate : profileWinRate;
+                const showLoading = !pd && profileWinRate === undefined;
                 if (showLoading) return <Spin size="small" />;
                 return (
                     <Tag color={winRate && winRate >= 0.55 ? 'green' : 'default'}>
@@ -414,8 +437,9 @@ function WhaleDiscovery() {
             key: 'volume',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const volume = timePeriod !== 'all' && pd ? pd.volume : record.profile?.totalVolume;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profileVolume = record.profile?.totalVolume;
+                const volume = pd ? pd.volume : profileVolume;
+                const showLoading = !pd && profileVolume === undefined;
                 if (showLoading) return <Spin size="small" />;
                 return volume !== undefined ? formatAmount(volume) : 'N/A';
             },
@@ -426,8 +450,9 @@ function WhaleDiscovery() {
             key: 'tradeCount',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const tradeCount = timePeriod !== 'all' && pd ? pd.tradeCount : record.profile?.totalTrades;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profileTrades = record.profile?.totalTrades;
+                const tradeCount = pd ? pd.tradeCount : profileTrades;
+                const showLoading = !pd && profileTrades === undefined;
                 if (showLoading) return <Spin size="small" />;
                 return tradeCount !== undefined ? tradeCount : 'N/A';
             },
@@ -438,9 +463,11 @@ function WhaleDiscovery() {
             key: 'roi',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const pnl = timePeriod !== 'all' && pd ? pd.pnl : record.profile?.pnl;
-                const volume = timePeriod !== 'all' && pd ? pd.volume : record.profile?.totalVolume;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profilePnl = record.profile?.pnl;
+                const profileVolume = record.profile?.totalVolume;
+                const pnl = pd ? pd.pnl : profilePnl;
+                const volume = pd ? pd.volume : profileVolume;
+                const showLoading = !pd && (profilePnl === undefined || profileVolume === undefined);
                 if (showLoading) return <Spin size="small" />;
                 if (pnl === undefined || volume === undefined || volume === 0) return 'N/A';
                 const roi = (pnl / volume) * 100;
@@ -457,8 +484,9 @@ function WhaleDiscovery() {
             key: 'score',
             render: (_: any, record: WhaleCandidate) => {
                 const pd = periodData[record.address];
-                const score = timePeriod !== 'all' && pd ? pd.smartScore : record.profile?.smartScore;
-                const showLoading = timePeriod !== 'all' && loadingPeriod && !pd;
+                const profileScore = record.profile?.smartScore;
+                const score = pd ? pd.smartScore : profileScore;
+                const showLoading = !pd && profileScore === undefined;
                 if (showLoading) return <Spin size="small" />;
                 return <Tag color="blue">{score || 0}</Tag>;
             },

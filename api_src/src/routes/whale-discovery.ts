@@ -63,6 +63,30 @@ interface WhaleCache {
     };
 }
 
+// ===== 监控名单 =====
+const WATCHED_FILE = path.resolve(process.cwd(), '..', 'watched_addresses.json');
+let watchedAddresses = new Set<string>();
+
+function loadWatchedAddresses(): void {
+    try {
+        if (fs.existsSync(WATCHED_FILE)) {
+            const data = fs.readFileSync(WATCHED_FILE, 'utf-8');
+            const list = JSON.parse(data);
+            watchedAddresses = new Set(list.map((a: string) => a.toLowerCase()));
+        }
+    } catch (error) {
+        console.error('[Watched] Failed to load watched addresses:', error);
+    }
+}
+
+function saveWatchedAddresses(): void {
+    try {
+        fs.writeFileSync(WATCHED_FILE, JSON.stringify(Array.from(watchedAddresses), null, 2), 'utf-8');
+    } catch (error) {
+        console.error('[Watched] Failed to save watched addresses:', error);
+    }
+}
+
 let whaleCacheData: WhaleCache = {};
 
 // 读取缓存文件
@@ -71,7 +95,7 @@ function loadWhaleCache(): void {
         if (fs.existsSync(WHALE_CACHE_FILE)) {
             const data = fs.readFileSync(WHALE_CACHE_FILE, 'utf-8');
             whaleCacheData = JSON.parse(data);
-            console.log(`[WhaleCache] Loaded ${Object.keys(whaleCacheData).length} whales from cache`);
+            //console.log(`[WhaleCache] Loaded ${Object.keys(whaleCacheData).length} whales from cache`);
         }
     } catch (error) {
         console.error('[WhaleCache] Failed to load cache:', error);
@@ -103,110 +127,181 @@ function getCachedPeriodData(address: string, period: '24h' | '7d' | '30d' | 'al
     return whaleCacheData[normalizedAddress]?.periods[period] || null;
 }
 
-// 更新缓存数据
-// 更新缓存数据 - 只调用一次 API，本地聚合所有时间段
-async function updateWhaleCache(address: string): Promise<void> {
+// 更新队列
+const updateQueue: { address: string; force: boolean }[] = [];
+let isProcessingQueue = false;
+
+// 记录正在更新中的地址，防止并发重复调用
+const pendingUpdates = new Set<string>();
+
+// 排队更新缓存
+async function updateWhaleCache(address: string, force = false): Promise<void> {
+    const normalizedAddress = address.toLowerCase();
+
+    // 1. 并发锁校验 (防止同个地址重复入队)
+    if (pendingUpdates.has(normalizedAddress)) return;
+
+    // 2. 有效性校验 (除非强制更新)
+    if (!force && isCacheValid(normalizedAddress)) return;
+
+    pendingUpdates.add(normalizedAddress);
+    updateQueue.push({ address: normalizedAddress, force });
+
+    // 启动处理循环 (如果还未启动)
+    if (!isProcessingQueue) {
+        processUpdateQueue().catch(err => console.error('[WhaleCache] Queue process error:', err));
+    }
+}
+
+async function processUpdateQueue(): Promise<void> {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+
+    while (updateQueue.length > 0) {
+        const item = updateQueue.shift()!;
+        try {
+            await performWhaleCacheUpdate(item.address, item.force);
+            // 扫描任务之间增加 1.5 秒间隔，规避 429
+            await new Promise(r => setTimeout(r, 1500));
+        } catch (error) {
+            console.error(`[WhaleCache] Item process failed for ${item.address}:`, error);
+        } finally {
+            pendingUpdates.delete(item.address);
+        }
+    }
+
+    isProcessingQueue = false;
+}
+
+// 核心更新逻辑 - 执行真正的 API 请求和计算
+async function performWhaleCacheUpdate(address: string, force = false): Promise<void> {
+    const normalizedAddress = address.toLowerCase();
+
+    console.log(`[WhaleCache] Scanning ${normalizedAddress}... (Queue size: ${updateQueue.length})`);
     if (!sdk) {
         sdk = new PolymarketSDK();
     }
 
     try {
-        // 只调用一次 Data API，获取所有活动记录
-        const allActivities = await sdk.dataApi.getAllActivity(address, 10000);
+        // 方案 B 优化：分别抓取成交记录和结算记录，提升时间跨度
+        // 成交记录 (TRADE) 是计算量的核心，抓取 10,000 条
+        const trades = await sdk.dataApi.getAllActivity(normalizedAddress, 10000, 'TRADE');
+        // 结算记录 (REDEEM) 是计算盈利的核心，抓取 2,000 条
+        const redemptions = await sdk.dataApi.getAllActivity(normalizedAddress, 2000, 'REDEEM');
 
-        console.log(`[WhaleCache] Fetched ${allActivities.length} activities for ${address}`);
+        // 数据完整性核验：如果完全拿不到记录（且已知是鲸鱼），往往是接口超限或异常，此时不应由于空结果而清空缓存
+        if (trades.length === 0 && redemptions.length === 0) {
+            console.warn(`[WhaleCache] No data found for ${normalizedAddress}, skipping cache update to prevent pollution.`);
+            return;
+        }
+
+        const allActivities = [...trades, ...redemptions].sort((a, b) => b.timestamp - a.timestamp);
 
         // 获取当前持仓（用于未实现盈亏）
         let positions: any[] = [];
         try {
-            positions = await sdk.dataApi.getPositions(address);
+            positions = await sdk.dataApi.getPositions(normalizedAddress);
         } catch {
-            console.warn(`[WhaleCache] Failed to get positions for ${address}`);
+            console.warn(`[WhaleCache] Failed to get positions for ${normalizedAddress}`);
         }
 
-        const now = Date.now();
-        const periodConfigs = [
-            { period: '24h' as const, days: 1 },
-            { period: '7d' as const, days: 7 },
-            { period: '30d' as const, days: 30 },
-            { period: 'all' as const, days: 0 },
-        ];
-
+        const periods = ['24h', '7d', '30d', 'all'];
         const periodsData: any = {};
 
         // 对每个时间段进行聚合计算
-        for (const { period, days } of periodConfigs) {
-            const sinceTimestamp = days > 0 ? now - days * 24 * 60 * 60 * 1000 : 0;
-            const filtered = allActivities.filter((a: any) => a.timestamp >= sinceTimestamp);
+        for (const period of periods) {
+            const periodDays = period === '24h' ? 1 : period === '7d' ? 7 : period === '30d' ? 30 : 0;
+            const sinceTs = periodDays > 0 ? Date.now() - (periodDays * 24 * 60 * 60 * 1000) : 0;
 
-            // 分类
-            const trades = filtered.filter((a: any) => a.type === 'TRADE');
-            const redemptions = filtered.filter((a: any) => a.type === 'REDEEM');
-            const buys = trades.filter((a: any) => a.side === 'BUY');
-            const sells = trades.filter((a: any) => a.side === 'SELL');
+            const filteredTrades = trades.filter(t => t.timestamp >= sinceTs);
+            const filteredRedemptions = redemptions.filter(r => r.timestamp >= sinceTs);
 
-            // 计算交易量
-            const buyVolume = buys.reduce((sum: number, t: any) => sum + (t.usdcSize || t.size * t.price), 0);
-            const sellVolume = sells.reduce((sum: number, t: any) => sum + (t.usdcSize || t.size * t.price), 0);
+            // 严谨校验：如果数据量触顶且时间跨度不足，说明窗口不完整，置零 24h/7h/30h
+            const earliestTs = trades.length > 0 ? trades[trades.length - 1].timestamp : Date.now();
+            if (periodDays > 0 && trades.length >= 10000 && earliestTs > sinceTs) {
+                periodsData[period] = {
+                    pnl: 0,
+                    volume: 0,
+                    tradeCount: 0,
+                    winRate: 0.5,
+                    smartScore: 50,
+                };
+                continue;
+            }
+
+            // 计算该时间段的 PnL 和交易量
+            const buyVolume = filteredTrades.filter(t => t.side === 'BUY').reduce((sum, t) => sum + (t.usdcSize || t.size * t.price), 0);
+            const sellVolume = filteredTrades.filter(t => t.side === 'SELL').reduce((sum, t) => sum + (t.usdcSize || t.size * t.price), 0);
+            const redemptionValue = filteredRedemptions.reduce((sum, r) => sum + (r.usdcSize || r.size), 0);
+
+            const realizedPnl = sellVolume + redemptionValue - buyVolume;
+
+            let unrealizedPnl = 0;
+            if (period === 'all') {
+                unrealizedPnl = positions.reduce((sum, p) => sum + (p.cashPnl || 0), 0);
+            }
+
+            const pnl = realizedPnl + unrealizedPnl;
             const volume = buyVolume + sellVolume;
 
-            // 计算 PnL
-            const redemptionValue = redemptions.reduce((sum: number, r: any) => sum + (r.size || 0), 0);
-            const realizedPnl = sellVolume + redemptionValue - buyVolume;
-            const unrealizedPnl = positions.reduce((sum: number, p: any) => sum + (p.cashPnl || 0), 0);
-            const pnl = realizedPnl + unrealizedPnl;
-
             // 计算胜率
-            let winCount = 0;
-            for (const sell of sells) {
-                if (sell.price > 0.5) winCount++;
+            const marketGroups = new Map<string, { buys: number; exits: number }>();
+            for (const t of filteredTrades) {
+                const existing = marketGroups.get(t.conditionId) || { buys: 0, exits: 0 };
+                if (t.side === 'BUY') existing.buys += (t.usdcSize || t.size * t.price);
+                else existing.exits += (t.usdcSize || t.size * t.price);
+                marketGroups.set(t.conditionId, existing);
             }
-            winCount += redemptions.filter((r: any) => (r.size || 0) > 0).length;
-            const totalClosed = sells.length + redemptions.length;
-            const winRate = totalClosed > 0 ? winCount / totalClosed : 0.5;
+            for (const r of filteredRedemptions) {
+                const existing = marketGroups.get(r.conditionId) || { buys: 0, exits: 0 };
+                existing.exits += (r.usdcSize || r.size);
+                marketGroups.set(r.conditionId, existing);
+            }
+
+            let winCount = 0;
+            let endedMarkets = 0;
+            for (const [_, stats] of marketGroups) {
+                if (stats.exits > 0 && stats.buys > 0) {
+                    endedMarkets++;
+                    if (stats.exits > stats.buys) {
+                        winCount++;
+                    }
+                }
+            }
+
+            const winRate = endedMarkets > 0 ? winCount / endedMarkets : 0.5;
 
             // 计算评分
             const roi = volume > 0 ? (pnl / volume) * 100 : 0;
-            const activityScore = Math.min(20, trades.length / 10);
+            const activityScore = Math.min(20, filteredTrades.length / 10);
             const roiScore = Math.min(30, Math.max(-30, roi * 3));
             const smartScore = Math.round(Math.max(0, Math.min(100, 50 + roiScore + activityScore)));
 
             periodsData[period] = {
                 pnl,
                 volume,
-                tradeCount: trades.length,
+                tradeCount: filteredTrades.length,
                 winRate: Math.max(0, Math.min(1, winRate)),
                 smartScore,
             };
         }
 
-        whaleCacheData[address] = {
+        whaleCacheData[normalizedAddress] = {
             updatedAt: Date.now(),
             periods: periodsData,
         };
 
         saveWhaleCache();
-        console.log(`[WhaleCache] Updated cache for ${address} (all periods calculated from single API call)`);
 
     } catch (error) {
-        console.error(`[WhaleCache] Failed to update cache for ${address}:`, error);
-        // 设置默认值
-        const defaultData = { pnl: 0, volume: 0, tradeCount: 0, winRate: 0.5, smartScore: 50 };
-        whaleCacheData[address] = {
-            updatedAt: Date.now(),
-            periods: {
-                '24h': { ...defaultData },
-                '7d': { ...defaultData },
-                '30d': { ...defaultData },
-                'all': { ...defaultData },
-            },
-        };
-        saveWhaleCache();
+        console.error(`[WhaleCache] Critial scan error for ${normalizedAddress}:`, error);
+        // 重要：扫描失败时，绝对不能写全零占位，应当保留旧数据或等待下次更新
     }
 }
 
 // 启动时加载缓存
 loadWhaleCache();
+loadWatchedAddresses();
 
 // ===== Routes =====
 
@@ -273,7 +368,10 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
 
                 return {
                     pnl: profile.realizedPnL || 0,
-                    winRate: profile.avgPercentPnL > 0 ? Math.min(0.8, 0.5 + profile.avgPercentPnL / 200) : 0.4,
+                    // 修正胜率启发式算法：基于 PnL 和交易量估算，避免离谱的 100%
+                    winRate: profile.realizedPnL > 0 ?
+                        Math.min(0.85, 0.5 + (profile.avgPercentPnL / 200)) :
+                        Math.max(0.1, 0.5 + (profile.avgPercentPnL / 200)),
                     totalVolume: Math.abs(profile.totalPnL) * 10,
                     smartScore: profile.smartScore || 0,
                     totalTrades: profile.tradeCount || 0,
@@ -285,9 +383,10 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
 
         // 设置鲸鱼确认回调 - 只有确认是鲸鱼后才预热缓存
         whaleService.setWhaleConfirmedCallback(async (address: string) => {
-            if (!isCacheValid(address)) {
-                console.log(`[WhaleCache] Whale confirmed, pre-caching ${address}...`);
-                await updateWhaleCache(address);
+            const normalizedAddr = address.toLowerCase();
+            if (!isCacheValid(normalizedAddr)) {
+                //console.log(`[WhaleCache] Whale confirmed, pre-caching ${normalizedAddr}...`);
+                await updateWhaleCache(normalizedAddr);
             }
         });
 
@@ -424,23 +523,6 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
 
         const whales = whaleService.getWhales(sort, limit);
 
-        // 自动预热缓存：检查哪些地址没有缓存，后台异步更新
-        const uncachedAddresses = whales.filter(w => !isCacheValid(w.address)).map(w => w.address);
-        if (uncachedAddresses.length > 0) {
-            console.log(`[WhaleCache] Auto-caching ${uncachedAddresses.length} uncached whales...`);
-            // 后台异步更新，不阻塞响应
-            (async () => {
-                for (const addr of uncachedAddresses) {
-                    try {
-                        await updateWhaleCache(addr);
-                    } catch (err) {
-                        console.error(`[WhaleCache] Failed to auto-cache ${addr}:`, err);
-                    }
-                }
-                console.log(`[WhaleCache] Auto-cache completed for ${uncachedAddresses.length} whales`);
-            })();
-        }
-
         return whales.map((w) => ({
             ...w,
             discoveredAt: w.discoveredAt.toISOString(),
@@ -474,7 +556,7 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
         // 顺序更新每个鲸鱼的缓存
         for (const whale of whales) {
             try {
-                await updateWhaleCache(whale.address);
+                await updateWhaleCache(whale.address, true);
                 updated++;
             } catch (error) {
                 console.error(`[WhaleCache] Failed to update ${whale.address}:`, error);
@@ -801,6 +883,44 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
                 error: 'Data unavailable',
             };
         }
+    });
+
+    // GET /api/whale/watched - 获取监控名单
+    fastify.get('/watched', {
+        schema: {
+            tags: ['鲸鱼发现'],
+            summary: '获取监控名单',
+        },
+    }, async () => {
+        return Array.from(watchedAddresses);
+    });
+
+    // POST /api/whale/watch - 切换监控状态
+    fastify.post('/watch', {
+        schema: {
+            tags: ['鲸鱼发现'],
+            summary: '切换地址监控状态',
+            body: {
+                type: 'object',
+                required: ['address', 'watched'],
+                properties: {
+                    address: { type: 'string' },
+                    watched: { type: 'boolean' },
+                },
+            },
+        },
+    }, async (request: FastifyRequest<{ Body: { address: string; watched: boolean } }>) => {
+        const { address, watched } = request.body;
+        const normalized = address.toLowerCase();
+
+        if (watched) {
+            watchedAddresses.add(normalized);
+        } else {
+            watchedAddresses.delete(normalized);
+        }
+
+        saveWatchedAddresses();
+        return { status: 'success', address: normalized, watched };
     });
 }
 

@@ -1,204 +1,105 @@
 {
-  "0x2663daca3cecf3767ca1c3b126002a8578a8ed1f": {
-    "updatedAt": 1766733420913,
-    "periods": {
-      "24h": {
-        "pnl": 2003.6024940002135,
-        "volume": 37609.19010000022,
-        "tradeCount": 9819,
-        "winRate": 0,
-        "smartScore": 86
-      },
-      "7d": {
-        "pnl": 2003.6024940002135,
-        "volume": 37609.19010000022,
-        "tradeCount": 9819,
-        "winRate": 0,
-        "smartScore": 86
-      },
-      "30d": {
-        "pnl": 2003.6024940002135,
-        "volume": 37609.19010000022,
-        "tradeCount": 9819,
-        "winRate": 0,
-        "smartScore": 86
-      },
-      "all": {
-        "pnl": 2003.6024940002135,
-        "volume": 37609.19010000022,
-        "tradeCount": 9819,
-        "winRate": 0,
-        "smartScore": 86
-      }
-    }
-  },
-  "0xc120935423b10e490a138a3bbb27f18b92bba562": {
-    "updatedAt": 1766733430436,
-    "periods": {
-      "24h": {
-        "pnl": 169.9224650000001,
-        "volume": 3939.5341549999994,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 64
-      },
-      "7d": {
-        "pnl": 169.9224650000001,
-        "volume": 3939.5341549999994,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 64
-      },
-      "30d": {
-        "pnl": 169.9224650000001,
-        "volume": 3939.5341549999994,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 64
-      },
-      "all": {
-        "pnl": 169.9224650000001,
-        "volume": 3939.5341549999994,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 64
-      }
-    }
-  },
   "0xa61ef8773ec2e821962306ca87d4b57e39ff0abd": {
-    "updatedAt": 1766733527400,
+    "updatedAt": 1766744497444,
     "periods": {
       "24h": {
-        "pnl": -108363.5187759968,
-        "volume": 142534.6313439965,
-        "tradeCount": 9995,
-        "winRate": 0.009385999217833398,
-        "smartScore": 40
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "7d": {
-        "pnl": -108363.5187759968,
-        "volume": 142534.6313439965,
-        "tradeCount": 9995,
-        "winRate": 0.009385999217833398,
-        "smartScore": 40
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "30d": {
-        "pnl": -108363.5187759968,
-        "volume": 142534.6313439965,
-        "tradeCount": 9995,
-        "winRate": 0.009385999217833398,
-        "smartScore": 40
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "all": {
-        "pnl": -108363.5187759968,
-        "volume": 142534.6313439965,
-        "tradeCount": 9995,
-        "winRate": 0.009385999217833398,
-        "smartScore": 40
+        "pnl": 166228.38933299304,
+        "volume": 138124.51328399763,
+        "tradeCount": 10000,
+        "winRate": 0.6666666666666666,
+        "smartScore": 100
       }
     }
   },
-  "0x06dcaa14f57d8a0573f5dc5940565e6de667af59": {
-    "updatedAt": 1766733906064,
+  "0x011f2d377e56119fb09196dffb0948ae55711122": {
+    "updatedAt": 1766744512753,
     "periods": {
       "24h": {
-        "pnl": 14530.704962000007,
-        "volume": 9711.020098,
-        "tradeCount": 36,
-        "winRate": 0,
-        "smartScore": 84
-      },
-      "7d": {
-        "pnl": 112728.95497499984,
-        "volume": 322034.053635,
-        "tradeCount": 761,
-        "winRate": 0.6940639269406392,
+        "pnl": 124624.919898,
+        "volume": 59358.63792700002,
+        "tradeCount": 740,
+        "winRate": 0.8,
         "smartScore": 100
       },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
       "30d": {
-        "pnl": -255080.28674900986,
-        "volume": 1085837.0709129933,
-        "tradeCount": 9891,
-        "winRate": 0.4218566392479436,
-        "smartScore": 40
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "all": {
-        "pnl": -255080.28674900986,
-        "volume": 1085837.0709129933,
-        "tradeCount": 9891,
-        "winRate": 0.4218566392479436,
+        "pnl": 2769603.2888150327,
+        "volume": 932734.6893719678,
+        "tradeCount": 10000,
+        "winRate": 0.6666666666666666,
+        "smartScore": 100
+      }
+    }
+  },
+  "0x972bf37cae72a169e17ae0e6179821d5778b78ba": {
+    "updatedAt": 1766744633668,
+    "periods": {
+      "24h": {
+        "pnl": -26605.48618900001,
+        "volume": 29881.714595000012,
+        "tradeCount": 876,
+        "winRate": 0.5,
+        "smartScore": 40
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": -45566.232129983095,
+        "volume": 366378.7881709829,
+        "tradeCount": 10000,
+        "winRate": 0.5,
         "smartScore": 40
       }
     }
   },
   "0xdd572169e741c72227589c5cb56b9ddd638d694d": {
-    "updatedAt": 1766734286031,
-    "periods": {
-      "24h": {
-        "pnl": -32961.6949550048,
-        "volume": 602772.2254450046,
-        "tradeCount": 9945,
-        "winRate": 0.0035229874933943982,
-        "smartScore": 54
-      },
-      "7d": {
-        "pnl": -32961.6949550048,
-        "volume": 602772.2254450046,
-        "tradeCount": 9945,
-        "winRate": 0.0035229874933943982,
-        "smartScore": 54
-      },
-      "30d": {
-        "pnl": -32961.6949550048,
-        "volume": 602772.2254450046,
-        "tradeCount": 9945,
-        "winRate": 0.0035229874933943982,
-        "smartScore": 54
-      },
-      "all": {
-        "pnl": -32961.6949550048,
-        "volume": 602772.2254450046,
-        "tradeCount": 9945,
-        "winRate": 0.0035229874933943982,
-        "smartScore": 54
-      }
-    }
-  },
-  "0x373970374b1d9624c412e849d5ff36fb6c73d2ca": {
-    "updatedAt": 1766734393450,
-    "periods": {
-      "24h": {
-        "pnl": 1025.5917,
-        "volume": 1025.5917,
-        "tradeCount": 1,
-        "winRate": 1,
-        "smartScore": 80
-      },
-      "7d": {
-        "pnl": -1.0141000000000986,
-        "volume": 4070.4930999999997,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      },
-      "30d": {
-        "pnl": -1.0141000000000986,
-        "volume": 4070.4930999999997,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      },
-      "all": {
-        "pnl": -1.0141000000000986,
-        "volume": 4070.4930999999997,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      }
-    }
-  },
-  "0xa0291921a2423ba95addc054d218f4c8a93545fb": {
-    "updatedAt": 1766734399622,
+    "updatedAt": 1766744595794,
     "periods": {
       "24h": {
         "pnl": 0,
@@ -208,1048 +109,586 @@
         "smartScore": 50
       },
       "7d": {
-        "pnl": -971.41234,
-        "volume": 2883.1669,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -971.41234,
-        "volume": 2883.1669,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -971.41234,
-        "volume": 2883.1669,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0x8e4427777852b02277b97cbb1aab436178b9d8a1": {
-    "updatedAt": 1766734403811,
-    "periods": {
-      "24h": {
-        "pnl": -1164.1323949999985,
-        "volume": 134697.29955499998,
-        "tradeCount": 125,
-        "winRate": 1,
-        "smartScore": 60
-      },
-      "7d": {
-        "pnl": -1391.6721039998718,
-        "volume": 529050.5188039999,
-        "tradeCount": 789,
-        "winRate": 1,
-        "smartScore": 69
-      },
-      "30d": {
-        "pnl": -1391.6721039998718,
-        "volume": 529050.5188039999,
-        "tradeCount": 789,
-        "winRate": 1,
-        "smartScore": 69
-      },
-      "all": {
-        "pnl": -1391.6721039998718,
-        "volume": 529050.5188039999,
-        "tradeCount": 789,
-        "winRate": 1,
-        "smartScore": 69
-      }
-    }
-  },
-  "0x8621d9a832f8167d237e983c142544a94d544265": {
-    "updatedAt": 1766734409618,
-    "periods": {
-      "24h": {
         "pnl": 0,
         "volume": 0,
         "tradeCount": 0,
         "winRate": 0.5,
         "smartScore": 50
       },
-      "7d": {
-        "pnl": -950.2945400000001,
-        "volume": 2818.5646800000004,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
       "30d": {
-        "pnl": -950.2945400000001,
-        "volume": 2818.5646800000004,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -950.2945400000001,
-        "volume": 2818.5646800000004,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0x44dd541643baab379422d90c54d7e7a66861917d": {
-    "updatedAt": 1766734411442,
-    "periods": {
-      "24h": {
         "pnl": 0,
         "volume": 0,
         "tradeCount": 0,
         "winRate": 0.5,
         "smartScore": 50
       },
-      "7d": {
-        "pnl": -980.8084500000001,
-        "volume": 2911.04253,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -980.8084500000001,
-        "volume": 2911.04253,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
       "all": {
-        "pnl": -980.8084500000001,
-        "volume": 2911.04253,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
+        "pnl": 13875436.476497374,
+        "volume": 11790359.738288378,
+        "tradeCount": 10000,
+        "winRate": 0.5,
+        "smartScore": 100
       }
     }
   },
-  "0x6499ba163ae00c1bb6c2ad51f90c3ff69bc905d2": {
-    "updatedAt": 1766734412326,
+  "0x6864204009ba1e137989983eafee8644cb3f294b": {
+    "updatedAt": 1766744598790,
     "periods": {
       "24h": {
-        "pnl": -282.2202000000001,
-        "volume": 2532.428,
-        "tradeCount": 28,
-        "winRate": 0.6956521739130435,
-        "smartScore": 23
-      },
-      "7d": {
-        "pnl": -282.2202000000001,
-        "volume": 2532.428,
-        "tradeCount": 28,
-        "winRate": 0.6956521739130435,
-        "smartScore": 23
-      },
-      "30d": {
-        "pnl": -4269.746769999991,
-        "volume": 45564.55826999998,
-        "tradeCount": 575,
-        "winRate": 0.6202090592334495,
-        "smartScore": 42
-      },
-      "all": {
-        "pnl": -4269.746769999991,
-        "volume": 45564.55826999998,
-        "tradeCount": 575,
-        "winRate": 0.6202090592334495,
-        "smartScore": 42
-      }
-    }
-  },
-  "0x710ded4d3d43f1a314939d0dd0d687d35ed911cc": {
-    "updatedAt": 1766734413509,
-    "periods": {
-      "24h": {
-        "pnl": 0,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "7d": {
-        "pnl": -971.6195999999999,
-        "volume": 2883.7677599999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -971.6195999999999,
-        "volume": 2883.7677599999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -971.6195999999999,
-        "volume": 2883.7677599999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0x354d603f9419c3af38d1ef6cb9503a7887d0eb8f": {
-    "updatedAt": 1766734420249,
-    "periods": {
-      "24h": {
-        "pnl": -679.0759150000001,
-        "volume": 825.606575,
-        "tradeCount": 54,
-        "winRate": 0,
-        "smartScore": 25
-      },
-      "7d": {
-        "pnl": -472.82232799999997,
-        "volume": 2483.209824,
-        "tradeCount": 113,
-        "winRate": 0.1794871794871795,
-        "smartScore": 31
-      },
-      "30d": {
-        "pnl": -22.963734999999133,
-        "volume": 5827.307647,
-        "tradeCount": 179,
-        "winRate": 0.2962962962962963,
-        "smartScore": 67
-      },
-      "all": {
-        "pnl": -22.963734999999133,
-        "volume": 5827.307647,
-        "tradeCount": 179,
-        "winRate": 0.2962962962962963,
-        "smartScore": 67
-      }
-    }
-  },
-  "0x0e1900c69566687eb08ddc2c2b8a52bbab107b92": {
-    "updatedAt": 1766734420559,
-    "periods": {
-      "24h": {
-        "pnl": 0,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "7d": {
-        "pnl": -983.6288600000001,
-        "volume": 2917.44544,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -983.6288600000001,
-        "volume": 2917.44544,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -983.6288600000001,
-        "volume": 2917.44544,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0xc40d1d7c0f37c610bfb3d7714852720b0470d31c": {
-    "updatedAt": 1766734424116,
-    "periods": {
-      "24h": {
-        "pnl": 0,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "7d": {
-        "pnl": -989.63212,
-        "volume": 2937.2436399999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -989.63212,
-        "volume": 2937.2436399999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -989.63212,
-        "volume": 2937.2436399999997,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0x8b32db75109f5ad5b0228ebf2f9470debbb3e44c": {
-    "updatedAt": 1766734426821,
-    "periods": {
-      "24h": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "7d": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "30d": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "all": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      }
-    }
-  },
-  "0x3ce0e033254bc0b043aabc1c0d1540fd530f291a": {
-    "updatedAt": 1766734429548,
-    "periods": {
-      "24h": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "7d": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "30d": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      },
-      "all": {
-        "pnl": -6900,
-        "volume": 6900,
-        "tradeCount": 46,
-        "winRate": 0.5,
-        "smartScore": 25
-      }
-    }
-  },
-  "0x6358b1f763ef5ecac6e53eb518731ff0b780efdd": {
-    "updatedAt": 1766734443635,
-    "periods": {
-      "24h": {
-        "pnl": 1029.07581,
-        "volume": 1029.07581,
-        "tradeCount": 1,
-        "winRate": 1,
-        "smartScore": 80
-      },
-      "7d": {
-        "pnl": 0.013570000000072469,
-        "volume": 4083.32813,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      },
-      "30d": {
-        "pnl": 0.013570000000072469,
-        "volume": 4083.32813,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      },
-      "all": {
-        "pnl": 0.013570000000072469,
-        "volume": 4083.32813,
-        "tradeCount": 4,
-        "winRate": 1,
-        "smartScore": 50
-      }
-    }
-  },
-  "0x6db351b7050d230d21835affbbe4d90c1c1dfb77": {
-    "updatedAt": 1766734454662,
-    "periods": {
-      "24h": {
-        "pnl": 584.04504,
-        "volume": 584.04504,
-        "tradeCount": 1,
-        "winRate": 0,
-        "smartScore": 80
-      },
-      "7d": {
-        "pnl": -147.02241000000004,
-        "volume": 3305.0556899999997,
-        "tradeCount": 4,
-        "winRate": 0.5,
-        "smartScore": 37
-      },
-      "30d": {
-        "pnl": -147.02241000000004,
-        "volume": 3305.0556899999997,
-        "tradeCount": 4,
-        "winRate": 0.5,
-        "smartScore": 37
-      },
-      "all": {
-        "pnl": -147.02241000000004,
-        "volume": 3305.0556899999997,
-        "tradeCount": 4,
-        "winRate": 0.5,
-        "smartScore": 37
-      }
-    }
-  },
-  "0xabdfee93f3b356b71c23b6875fedd247e128b141": {
-    "updatedAt": 1766734459830,
-    "periods": {
-      "24h": {
-        "pnl": -2352.4001,
-        "volume": 2350,
-        "tradeCount": 2,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "7d": {
-        "pnl": -2352.4001,
-        "volume": 2350,
-        "tradeCount": 2,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -2352.4001,
-        "volume": 2350,
-        "tradeCount": 2,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -2167.4001,
-        "volume": 2535,
-        "tradeCount": 3,
-        "winRate": 1,
-        "smartScore": 20
-      }
-    }
-  },
-  "0x1d6f4261190ac571010966c6d314172603cae304": {
-    "updatedAt": 1766734464922,
-    "periods": {
-      "24h": {
-        "pnl": -2775,
-        "volume": 2590,
-        "tradeCount": 3,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "7d": {
-        "pnl": -2775,
-        "volume": 2590,
-        "tradeCount": 3,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -2775,
-        "volume": 2590,
-        "tradeCount": 3,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -2960,
-        "volume": 2775,
-        "tradeCount": 4,
-        "winRate": 0.5,
-        "smartScore": 20
-      }
-    }
-  },
-  "0xa5ef39c3d3e10d0b270233af41cac69796b12966": {
-    "updatedAt": 1766734589791,
-    "periods": {
-      "24h": {
-        "pnl": 5636751274.093094,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "7d": {
-        "pnl": 5636751274.093094,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "30d": {
-        "pnl": 5636751274.093094,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      },
-      "all": {
-        "pnl": 5636751274.093094,
-        "volume": 0,
-        "tradeCount": 0,
-        "winRate": 0.5,
-        "smartScore": 50
-      }
-    }
-  },
-  "0x69c4678b73addc8bd8a7c23d43556c6034ce13eb": {
-    "updatedAt": 1766734609182,
-    "periods": {
-      "24h": {
-        "pnl": -757.5391999999999,
-        "volume": 209.97359999999998,
-        "tradeCount": 2,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "7d": {
-        "pnl": -947.5392,
-        "volume": 399.97360000000003,
-        "tradeCount": 8,
-        "winRate": 0.5,
-        "smartScore": 21
-      },
-      "30d": {
-        "pnl": -1399.5392000000002,
-        "volume": 851.9736,
-        "tradeCount": 11,
-        "winRate": 0.5,
-        "smartScore": 21
-      },
-      "all": {
-        "pnl": -1399.5392000000002,
-        "volume": 851.9736,
-        "tradeCount": 11,
-        "winRate": 0.5,
-        "smartScore": 21
-      }
-    }
-  },
-  "0x0c36bdedfbe0282ad9583bb30e4d2f0683d074df": {
-    "updatedAt": 1766734617749,
-    "periods": {
-      "24h": {
-        "pnl": -294714.6380649909,
-        "volume": 293073.1547649909,
-        "tradeCount": 8442,
-        "winRate": 0.5,
-        "smartScore": 40
-      },
-      "7d": {
-        "pnl": -294714.6380649909,
-        "volume": 293073.1547649909,
-        "tradeCount": 8442,
-        "winRate": 0.5,
-        "smartScore": 40
-      },
-      "30d": {
-        "pnl": -294714.6380649909,
-        "volume": 293073.1547649909,
-        "tradeCount": 8442,
-        "winRate": 0.5,
-        "smartScore": 40
-      },
-      "all": {
-        "pnl": -294714.6380649909,
-        "volume": 293073.1547649909,
-        "tradeCount": 8442,
-        "winRate": 0.5,
-        "smartScore": 40
-      }
-    }
-  },
-  "0x8a9777a7d3079e208afc08de2ccdf744de78593d": {
-    "updatedAt": 1766734620653,
-    "periods": {
-      "24h": {
-        "pnl": -4063.1650700000005,
-        "volume": 5820.521210000001,
-        "tradeCount": 8,
-        "winRate": 0.3333333333333333,
-        "smartScore": 21
-      },
-      "7d": {
-        "pnl": -7259.888768999996,
-        "volume": 33220.097838999995,
-        "tradeCount": 327,
-        "winRate": 0.7704918032786885,
-        "smartScore": 40
-      },
-      "30d": {
-        "pnl": -7286.886925999994,
-        "volume": 33759.232766999994,
-        "tradeCount": 364,
-        "winRate": 0.782051282051282,
-        "smartScore": 40
-      },
-      "all": {
-        "pnl": -7286.886925999994,
-        "volume": 33759.232766999994,
-        "tradeCount": 364,
-        "winRate": 0.782051282051282,
-        "smartScore": 40
-      }
-    }
-  },
-  "0xbd95ce4f49090d566ef677759f655c59d4c2e333": {
-    "updatedAt": 1766734678666,
-    "periods": {
-      "24h": {
-        "pnl": -81822.2569390012,
-        "volume": 437247.2667630018,
-        "tradeCount": 9606,
-        "winRate": 0.3909691629955947,
-        "smartScore": 40
-      },
-      "7d": {
-        "pnl": -81822.2569390012,
-        "volume": 437247.2667630018,
-        "tradeCount": 9606,
-        "winRate": 0.3909691629955947,
-        "smartScore": 40
-      },
-      "30d": {
-        "pnl": -81822.2569390012,
-        "volume": 437247.2667630018,
-        "tradeCount": 9606,
-        "winRate": 0.3909691629955947,
-        "smartScore": 40
-      },
-      "all": {
-        "pnl": -81822.2569390012,
-        "volume": 437247.2667630018,
-        "tradeCount": 9606,
-        "winRate": 0.3909691629955947,
-        "smartScore": 40
-      }
-    }
-  },
-  "0xd21137c21cb618047d8cd488b94f3db808ca158d": {
-    "updatedAt": 1766734650113,
-    "periods": {
-      "24h": {
-        "pnl": 958.4747289999998,
-        "volume": 3853.788751,
-        "tradeCount": 8,
-        "winRate": 1,
-        "smartScore": 81
-      },
-      "7d": {
-        "pnl": 958.4729960000004,
-        "volume": 21199.602,
-        "tradeCount": 42,
-        "winRate": 1,
-        "smartScore": 68
-      },
-      "30d": {
-        "pnl": -44.278911999999735,
-        "volume": 28989.639821,
-        "tradeCount": 56,
-        "winRate": 1,
-        "smartScore": 55
-      },
-      "all": {
-        "pnl": -44.278911999999735,
-        "volume": 28989.639821,
-        "tradeCount": 56,
-        "winRate": 1,
-        "smartScore": 55
-      }
-    }
-  },
-  "0xb63ac06f20eed05d0a34f61116d0580a0afb4064": {
-    "updatedAt": 1766734704054,
-    "periods": {
-      "24h": {
-        "pnl": -108966.75690399986,
-        "volume": 150942.98821199988,
-        "tradeCount": 795,
-        "winRate": 1,
-        "smartScore": 40
-      },
-      "7d": {
-        "pnl": -2043638.216804007,
-        "volume": 2085614.448112007,
-        "tradeCount": 8567,
-        "winRate": 0.1111111111111111,
-        "smartScore": 40
-      },
-      "30d": {
-        "pnl": -2043638.216804007,
-        "volume": 2085614.448112007,
-        "tradeCount": 8567,
-        "winRate": 0.1111111111111111,
-        "smartScore": 40
-      },
-      "all": {
-        "pnl": -2043638.216804007,
-        "volume": 2085614.448112007,
-        "tradeCount": 8567,
-        "winRate": 0.1111111111111111,
-        "smartScore": 40
-      }
-    }
-  },
-  "0x350538eb1a7a2996393fd4952817f39b13c26ab4": {
-    "updatedAt": 1766734660036,
-    "periods": {
-      "24h": {
-        "pnl": 26269.572239999998,
-        "volume": 26228.16854,
-        "tradeCount": 7,
-        "winRate": 1,
-        "smartScore": 81
-      },
-      "7d": {
-        "pnl": 26269.572239999998,
-        "volume": 26228.16854,
-        "tradeCount": 7,
-        "winRate": 1,
-        "smartScore": 81
-      },
-      "30d": {
-        "pnl": 26269.572239999998,
-        "volume": 26228.16854,
-        "tradeCount": 7,
-        "winRate": 1,
-        "smartScore": 81
-      },
-      "all": {
-        "pnl": 4529.11884,
-        "volume": 49944.42194,
-        "tradeCount": 33,
-        "winRate": 0.9,
-        "smartScore": 81
-      }
-    }
-  },
-  "0xfc11957d29e28cebbaa4c26b1671b4a99e1d79a3": {
-    "updatedAt": 1766734670421,
-    "periods": {
-      "24h": {
-        "pnl": -1025.935198,
-        "volume": 999.999998,
-        "tradeCount": 1,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "7d": {
-        "pnl": -1125.935196,
-        "volume": 1099.999996,
-        "tradeCount": 2,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "30d": {
-        "pnl": -2225.9351939999997,
-        "volume": 2199.999994,
-        "tradeCount": 4,
-        "winRate": 0.5,
-        "smartScore": 20
-      },
-      "all": {
-        "pnl": -1914.5882699999993,
-        "volume": 5598.537155999999,
-        "tradeCount": 20,
+        "pnl": -21591.443864999987,
+        "volume": 32750.557172999994,
+        "tradeCount": 939,
         "winRate": 0.7777777777777778,
-        "smartScore": 22
-      }
-    }
-  },
-  "0x39dd86dda9086f4d9c91429df016ce2bacad1bb5": {
-    "updatedAt": 1766734672339,
-    "periods": {
-      "24h": {
-        "pnl": -1928.551800000001,
-        "volume": 5622.380000000001,
-        "tradeCount": 28,
-        "winRate": 0.5454545454545454,
-        "smartScore": 23
-      },
-      "7d": {
-        "pnl": -1928.551800000001,
-        "volume": 5622.380000000001,
-        "tradeCount": 28,
-        "winRate": 0.5454545454545454,
-        "smartScore": 23
-      },
-      "30d": {
-        "pnl": -2245.8936300000014,
-        "volume": 7631.759830000001,
-        "tradeCount": 64,
-        "winRate": 0.5,
-        "smartScore": 26
-      },
-      "all": {
-        "pnl": -2245.8936300000014,
-        "volume": 7631.759830000001,
-        "tradeCount": 64,
-        "winRate": 0.5,
-        "smartScore": 26
-      }
-    }
-  },
-  "0x2934e55ad87b0806043d0fad6729aaf087b89a60": {
-    "updatedAt": 1766734676062,
-    "periods": {
-      "24h": {
-        "pnl": -1290.5617000000002,
-        "volume": 6468.624,
-        "tradeCount": 37,
-        "winRate": 0.6,
-        "smartScore": 24
-      },
-      "7d": {
-        "pnl": -1290.5617000000002,
-        "volume": 6468.624,
-        "tradeCount": 37,
-        "winRate": 0.6,
-        "smartScore": 24
-      },
-      "30d": {
-        "pnl": -1901.1892099999986,
-        "volume": 18233.42511,
-        "tradeCount": 221,
-        "winRate": 0.5,
         "smartScore": 40
       },
-      "all": {
-        "pnl": -1901.1892099999986,
-        "volume": 18233.42511,
-        "tradeCount": 221,
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": -270874.72052201006,
+        "volume": 297521.8786080103,
+        "tradeCount": 10000,
+        "winRate": 0.6153846153846154,
         "smartScore": 40
       }
     }
   },
-  "0x0949a68c0401ec90b8f5c44c36170d42c80e7bd6": {
-    "updatedAt": 1766734677824,
+  "0x8936214e1dab02e74e5469d76b4c55cfe99cd010": {
+    "updatedAt": 1766744618848,
     "periods": {
       "24h": {
-        "pnl": -16073.591199999999,
-        "volume": 6773.5,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "7d": {
-        "pnl": -16073.591199999999,
-        "volume": 6773.5,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "30d": {
-        "pnl": -16077.09117,
-        "volume": 6776.99997,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": -1016.179437000757,
+        "volume": 46199.365487000774,
+        "tradeCount": 10000,
+        "winRate": 0.3235294117647059,
+        "smartScore": 63
+      }
+    }
+  },
+  "0x4bac379da2f29d87c01ff737843e396a2cec02b1": {
+    "updatedAt": 1766744649616,
+    "periods": {
+      "24h": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 1876.2688329999246,
+        "volume": 3579.4329169999714,
+        "tradeCount": 10000,
+        "winRate": 0.45454545454545453,
+        "smartScore": 100
+      }
+    }
+  },
+  "0xc8ab97a9089a9ff7e6ef0688e6e591a066946418": {
+    "updatedAt": 1766744683077,
+    "periods": {
+      "24h": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 1705518.3848689848,
+        "volume": 1664556.3300529975,
+        "tradeCount": 10000,
+        "winRate": 0.5128205128205128,
+        "smartScore": 100
+      }
+    }
+  },
+  "0x25dcf4635fe93082e0849fbbf81c95680cf5e33b": {
+    "updatedAt": 1766745228797,
+    "periods": {
+      "24h": {
+        "pnl": 29535.554851000008,
+        "volume": 12287.176756999997,
+        "tradeCount": 91,
+        "winRate": 0.6666666666666666,
+        "smartScore": 89
+      },
+      "7d": {
+        "pnl": 35210.50290500001,
+        "volume": 57800.88738300001,
+        "tradeCount": 472,
+        "winRate": 0.375,
+        "smartScore": 100
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 182249.85117999,
+        "volume": 1424977.0855050185,
+        "tradeCount": 10000,
+        "winRate": 0.3939393939393939,
+        "smartScore": 100
+      }
+    }
+  },
+  "0x02a17a92e6f673129b37d95359c7af628a3cdd72": {
+    "updatedAt": 1766745407542,
+    "periods": {
+      "24h": {
+        "pnl": 2589.382865,
+        "volume": 4118.374335,
+        "tradeCount": 9,
+        "winRate": 0.5,
+        "smartScore": 81
+      },
+      "7d": {
+        "pnl": 1557.9287000000004,
+        "volume": 5358.3283,
+        "tradeCount": 26,
+        "winRate": 0,
+        "smartScore": 83
+      },
+      "30d": {
+        "pnl": 5300.117014000024,
+        "volume": 38859.80027799998,
+        "tradeCount": 181,
+        "winRate": 0.375,
+        "smartScore": 98
+      },
+      "all": {
+        "pnl": -472503.6199149885,
+        "volume": 858439.4316389896,
+        "tradeCount": 10000,
+        "winRate": 0.35135135135135137,
+        "smartScore": 40
+      }
+    }
+  },
+  "0x53ecc53e7a69aad0e6dda60264cc2e363092df91": {
+    "updatedAt": 1766748886860,
+    "periods": {
+      "24h": {
+        "pnl": 7369.480116999997,
+        "volume": 6282.306648999997,
+        "tradeCount": 46,
+        "winRate": 0.5,
+        "smartScore": 85
+      },
+      "7d": {
+        "pnl": 8265.879723999988,
+        "volume": 45606.380012999995,
+        "tradeCount": 338,
+        "winRate": 0.3333333333333333,
+        "smartScore": 100
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": -194423.3160979995,
+        "volume": 1163496.4203560029,
+        "tradeCount": 10000,
+        "winRate": 0.3333333333333333,
+        "smartScore": 40
+      }
+    }
+  },
+  "0xe613b515bd46b1585a8b137a4d291d9b80bd540e": {
+    "updatedAt": 1766749023042,
+    "periods": {
+      "24h": {
+        "pnl": 5262.453177999999,
+        "volume": 5394.8225059999995,
+        "tradeCount": 732,
+        "winRate": 1,
+        "smartScore": 100
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 36711.698408000244,
+        "volume": 89726.80608500053,
+        "tradeCount": 10000,
+        "winRate": 0.5,
+        "smartScore": 100
+      }
+    }
+  },
+  "0x4ffe49ba2a4cae123536a8af4fda48faeb609f71": {
+    "updatedAt": 1766749536709,
+    "periods": {
+      "24h": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 700.7451789997803,
+        "volume": 42745.899190999946,
+        "tradeCount": 10000,
+        "winRate": 0.6477272727272727,
+        "smartScore": 75
+      }
+    }
+  },
+  "0x9703676286b93c2eca71ca96e8757104519a69c2": {
+    "updatedAt": 1766749612307,
+    "periods": {
+      "24h": {
+        "pnl": -1324.764956999998,
+        "volume": 4691.497132999999,
+        "tradeCount": 480,
+        "winRate": 0.6666666666666666,
+        "smartScore": 40
+      },
+      "7d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 844339.5445490015,
+        "volume": 106579.74152000128,
+        "tradeCount": 10000,
+        "winRate": 0.5,
+        "smartScore": 100
+      }
+    }
+  },
+  "0xe2b1fc269d0c2e27da11fadd1d9596fe28227d2a": {
+    "updatedAt": 1766750502810,
+    "periods": {
+      "24h": {
+        "pnl": -19713.979902,
+        "volume": 22553.979902,
+        "tradeCount": 29,
+        "winRate": 0.5,
+        "smartScore": 23
+      },
+      "7d": {
+        "pnl": -17802.352618000026,
+        "volume": 73207.46058700002,
+        "tradeCount": 333,
+        "winRate": 0.6666666666666666,
+        "smartScore": 40
+      },
+      "30d": {
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
+      },
+      "all": {
+        "pnl": 1927850.3787570081,
+        "volume": 597048.2287899911,
+        "tradeCount": 10000,
+        "winRate": 0.29411764705882354,
+        "smartScore": 100
+      }
+    }
+  },
+  "0x33f832b83b52aa61967fb8ecb2e753734767c5e4": {
+    "updatedAt": 1766750585716,
+    "periods": {
+      "24h": {
+        "pnl": -725.2699229999992,
+        "volume": 4620.211654999999,
+        "tradeCount": 82,
+        "winRate": 0.6666666666666666,
+        "smartScore": 28
+      },
+      "7d": {
+        "pnl": 15.338516000004347,
+        "volume": 12897.320227999997,
+        "tradeCount": 296,
+        "winRate": 0.84,
+        "smartScore": 70
+      },
+      "30d": {
+        "pnl": 1079.5745529999986,
+        "volume": 22188.440918000008,
+        "tradeCount": 571,
+        "winRate": 0.6521739130434783,
+        "smartScore": 85
+      },
+      "all": {
+        "pnl": 727.880251000006,
+        "volume": 23663.569066000004,
+        "tradeCount": 616,
+        "winRate": 0.673469387755102,
+        "smartScore": 79
+      }
+    }
+  },
+  "0xc8243e8e85927e32991a4720b9c1bb1ede1bdf08": {
+    "updatedAt": 1766750623013,
+    "periods": {
+      "24h": {
+        "pnl": 156.79963799999962,
+        "volume": 2107.8396319999997,
         "tradeCount": 13,
-        "winRate": 0.5,
-        "smartScore": 21
-      },
-      "all": {
-        "pnl": -20304.096571000005,
-        "volume": 22401.003630000007,
-        "tradeCount": 49,
-        "winRate": 1,
-        "smartScore": 25
-      }
-    }
-  },
-  "0x896c45cfd6ba830f969253fec43a11ef4da34d8a": {
-    "updatedAt": 1766734679754,
-    "periods": {
-      "24h": {
-        "pnl": -12023.2552,
-        "volume": 6773.5,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 21
+        "winRate": 0,
+        "smartScore": 74
       },
       "7d": {
-        "pnl": -12023.2552,
-        "volume": 6773.5,
-        "tradeCount": 9,
-        "winRate": 0.5,
-        "smartScore": 21
+        "pnl": -2758.315642000001,
+        "volume": 9781.23879,
+        "tradeCount": 43,
+        "winRate": 0.75,
+        "smartScore": 24
       },
       "30d": {
-        "pnl": -12026.755157,
-        "volume": 6776.999957,
-        "tradeCount": 12,
-        "winRate": 0.5,
-        "smartScore": 21
-      },
-      "all": {
-        "pnl": -8824.255157,
-        "volume": 20456.499957,
-        "tradeCount": 40,
-        "winRate": 1,
-        "smartScore": 24
-      }
-    }
-  },
-  "0x8b3234f9027f4e994e949df4b48b90ab79015950": {
-    "updatedAt": 1766734683958,
-    "periods": {
-      "24h": {
-        "pnl": -19222.075653000036,
-        "volume": 28773.310836999975,
-        "tradeCount": 656,
-        "winRate": 0,
+        "pnl": -20014.26713999999,
+        "volume": 72984.09718399994,
+        "tradeCount": 405,
+        "winRate": 0.7948717948717948,
         "smartScore": 40
       },
-      "7d": {
-        "pnl": 249129.25580800342,
-        "volume": 951806.9659699986,
-        "tradeCount": 10000,
-        "winRate": 0,
-        "smartScore": 100
-      },
-      "30d": {
-        "pnl": 249129.25580800342,
-        "volume": 951806.9659699986,
-        "tradeCount": 10000,
-        "winRate": 0,
-        "smartScore": 100
-      },
       "all": {
-        "pnl": 249129.25580800342,
-        "volume": 951806.9659699986,
-        "tradeCount": 10000,
-        "winRate": 0,
-        "smartScore": 100
+        "pnl": -35781.46919400004,
+        "volume": 110057.55862000003,
+        "tradeCount": 781,
+        "winRate": 0.8760330578512396,
+        "smartScore": 40
       }
     }
   },
-  "0x07b7dce1332b91468a0274b3961cb0b5aef200a0": {
-    "updatedAt": 1766734702950,
+  "0x2663daca3cecf3767ca1c3b126002a8578a8ed1f": {
+    "updatedAt": 1766750716754,
     "periods": {
       "24h": {
-        "pnl": -695.0971569999967,
-        "volume": 8159.689028999997,
-        "tradeCount": 500,
-        "winRate": 0.3588235294117647,
-        "smartScore": 44
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "7d": {
-        "pnl": 2886.2336640025987,
-        "volume": 657712.6114239971,
-        "tradeCount": 9995,
-        "winRate": 0.402771667399912,
-        "smartScore": 71
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "30d": {
-        "pnl": 2886.2336640025987,
-        "volume": 657712.6114239971,
-        "tradeCount": 9995,
-        "winRate": 0.402771667399912,
-        "smartScore": 71
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
+        "winRate": 0.5,
+        "smartScore": 50
       },
       "all": {
-        "pnl": 2886.2336640025987,
-        "volume": 657712.6114239971,
-        "tradeCount": 9995,
-        "winRate": 0.402771667399912,
-        "smartScore": 71
+        "pnl": -47569.565087000316,
+        "volume": 60354.70310699989,
+        "tradeCount": 10000,
+        "winRate": 0.2,
+        "smartScore": 40
       }
     }
   },
-  "0x54dcaa657c27af0bd8f09b7ba53e702f6b5943b9": {
-    "updatedAt": 1766734710772,
+  "0x928589e0b5b686e33f95aaddab8b6a0f8d3ac19d": {
+    "updatedAt": 1766750787849,
     "periods": {
       "24h": {
-        "pnl": -3906.0249,
-        "volume": 5185,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "7d": {
-        "pnl": -3906.0249,
-        "volume": 5185,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "30d": {
-        "pnl": -3906.0249,
-        "volume": 5185,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "all": {
-        "pnl": -3710.0249,
-        "volume": 5381,
-        "tradeCount": 11,
+        "pnl": -1172.2291709999013,
+        "volume": 4332.814062999898,
+        "tradeCount": 10000,
+        "winRate": 0.3333333333333333,
+        "smartScore": 40
+      }
+    }
+  },
+  "0x59a513a782dd4c1a98ef22932c52191129f5afc8": {
+    "updatedAt": 1766750906685,
+    "periods": {
+      "24h": {
+        "pnl": 81965.437931,
+        "volume": 15287.991579,
+        "tradeCount": 18,
+        "winRate": 0.5,
+        "smartScore": 82
+      },
+      "7d": {
+        "pnl": 13027.512516999966,
+        "volume": 151162.82439800003,
+        "tradeCount": 67,
         "winRate": 1,
-        "smartScore": 21
+        "smartScore": 83
+      },
+      "30d": {
+        "pnl": 42979.43117900076,
+        "volume": 1039744.1297590004,
+        "tradeCount": 602,
+        "winRate": 0.9333333333333333,
+        "smartScore": 82
+      },
+      "all": {
+        "pnl": -668534.4412840082,
+        "volume": 5768390.286101971,
+        "tradeCount": 10000,
+        "winRate": 0.7407407407407407,
+        "smartScore": 40
       }
     }
   },
-  "0x3693568099c7d1084fc4bd536592700ceb334b82": {
-    "updatedAt": 1766734713190,
+  "0x6480542954b70a674a74bd1a6015dec362dc8dc5": {
+    "updatedAt": 1766751637616,
     "periods": {
       "24h": {
-        "pnl": -6544.5461000000005,
-        "volume": 6373.405000000001,
-        "tradeCount": 10,
-        "winRate": 0.5,
-        "smartScore": 21
+        "pnl": 1522.4872070000006,
+        "volume": 5243.543391000001,
+        "tradeCount": 257,
+        "winRate": 0.6,
+        "smartScore": 100
       },
       "7d": {
-        "pnl": -6544.5461000000005,
-        "volume": 6373.405000000001,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "30d": {
-        "pnl": -6544.5461000000005,
-        "volume": 6373.405000000001,
-        "tradeCount": 10,
+        "pnl": 0,
+        "volume": 0,
+        "tradeCount": 0,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 50
       },
       "all": {
-        "pnl": -6740.5461000000005,
-        "volume": 6569.405000000001,
-        "tradeCount": 11,
+        "pnl": 7347.93133699992,
+        "volume": 7978.33946799992,
+        "tradeCount": 10000,
         "winRate": 0.5,
-        "smartScore": 21
+        "smartScore": 100
       }
     }
   }

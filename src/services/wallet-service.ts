@@ -57,7 +57,7 @@ export class WalletService {
   async getWalletProfile(address: string): Promise<WalletProfile> {
     const [positions, activities] = await Promise.all([
       this.dataApi.getPositions(address),
-      this.dataApi.getActivity(address, { limit: 100 }),
+      this.dataApi.getActivity(address, { limit: 1000 }),
     ]);
 
     const totalPnL = positions.reduce((sum, p) => sum + (p.cashPnl || 0), 0);
@@ -96,23 +96,22 @@ export class WalletService {
     winRate: number;
     smartScore: number;
   }> {
-    // 获取所有活动记录（不限制类型，以便包含 REDEMPTION）
-    // 使用足够大的 maxRecords 来确保获取完整数据
-    const maxRecords = 10000; // 足够覆盖大部分活跃用户
+    // 获取所有活动记录（分别抓取 TRADE 和 REDEEM 以确保数据深度）
+    const [trades, redemptions] = await Promise.all([
+      this.dataApi.getAllActivity(address, 10000, 'TRADE'),
+      this.dataApi.getAllActivity(address, 2000, 'REDEEM'),
+    ]);
 
-    // 获取所有类型的活动（包括 TRADE, REDEMPTION, SPLIT, MERGE）
-    const allActivities = await this.dataApi.getAllActivity(address, maxRecords);
+    const allActivities = [...trades, ...redemptions].sort((a, b) => b.timestamp - a.timestamp);
 
     // 按时间过滤
     const now = Date.now();
     const sinceTimestamp = periodDays > 0 ? now - periodDays * 24 * 60 * 60 * 1000 : 0;
-    const filteredActivities = allActivities.filter(a => a.timestamp >= sinceTimestamp);
+    const filteredTrades = trades.filter(a => a.timestamp >= sinceTimestamp);
+    const filteredRedemptions = redemptions.filter(a => a.timestamp >= sinceTimestamp);
 
-    // 分类活动
-    const trades = filteredActivities.filter(a => a.type === 'TRADE');
-    const redemptions = filteredActivities.filter(a => a.type === 'REDEEM');
-    const buys = trades.filter(a => a.side === 'BUY');
-    const sells = trades.filter(a => a.side === 'SELL');
+    const buys = filteredTrades.filter(a => a.side === 'BUY');
+    const sells = filteredTrades.filter(a => a.side === 'SELL');
 
     // === 计算交易量 ===
     // 交易量 = 买入 + 卖出（不含 Redemption）
@@ -123,7 +122,7 @@ export class WalletService {
     // === 计算 PnL ===
     // PnL = 卖出收入 + 交割收入 - 买入成本
     // Redemption: 如果 outcome 方向正确，每个 share 价值 1 USDC
-    const redemptionValue = redemptions.reduce((sum, r) => {
+    const redemptionValue = filteredRedemptions.reduce((sum, r) => {
       // Redemption 时，size 代表赎回的 share 数量，每个价值 1 USDC
       return sum + (r.size || 0);
     }, 0);
@@ -146,7 +145,7 @@ export class WalletService {
     // === 计算胜率 ===
     // 胜率 = (盈利的卖出交易 + 成功的交割) / (总卖出交易 + 总交割)
     let winCount = 0;
-    let totalClosedPositions = sells.length + redemptions.length;
+    let totalClosedPositions = sells.length + filteredRedemptions.length;
 
     // 卖出盈利：卖出价 > 0.5（表示高于成本价）
     for (const sell of sells) {
@@ -156,14 +155,14 @@ export class WalletService {
     }
 
     // 交割都算作盈利（因为只有正确预测才会有 redemption value > 0）
-    winCount += redemptions.filter(r => (r.size || 0) > 0).length;
+    winCount += filteredRedemptions.filter(r => (r.size || 0) > 0).length;
 
     const winRate = totalClosedPositions > 0 ? winCount / totalClosedPositions : 0.5;
 
     // === 计算评分 (基于该时间段的 ROI) ===
     // Score = 基础分 50 + ROI 调整 + 交易活跃度调整
     const roi = volume > 0 ? (pnl / volume) * 100 : 0; // ROI 百分比
-    const activityScore = Math.min(20, (trades.length / 10)); // 交易活跃度最多加 20 分
+    const activityScore = Math.min(20, (filteredTrades.length / 10)); // 交易活跃度最多加 20 分
     const roiScore = Math.min(30, Math.max(-30, roi * 3)); // ROI 最多影响 ±30 分
 
     const smartScore = Math.round(Math.max(0, Math.min(100, 50 + roiScore + activityScore)));
@@ -171,7 +170,7 @@ export class WalletService {
     return {
       pnl,
       volume,
-      tradeCount: trades.length,
+      tradeCount: filteredTrades.length,
       winRate: Math.max(0, Math.min(1, winRate)),
       smartScore,
     };

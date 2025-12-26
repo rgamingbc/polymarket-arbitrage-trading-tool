@@ -45,6 +45,9 @@ export const whaleApi = {
     refreshCache: () => api.post('/whale/cache/refresh'),
     getCacheStatus: () => api.get('/whale/cache/status'),
     getCacheBulk: (addresses: string[]) => api.get(`/whale/cache/bulk?addresses=${addresses.join(',')}`),
+    // 监控名单
+    getWatched: () => api.get('/whale/watched'),
+    toggleWatch: (address: string, watched: boolean) => api.post('/whale/watch', { address, watched }),
 };
 
 // 版本 API

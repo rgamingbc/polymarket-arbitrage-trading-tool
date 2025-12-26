@@ -153,6 +153,9 @@ export class ChainMonitorClient extends EventEmitter {
     private pollingTimer: ReturnType<typeof setInterval> | null = null;
     private lastScannedBlock = 0;
     private reconnectAttempts = 0;
+    private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+    private lastObservedCount = 0;
+    private watchdogCheckCount = 0;
 
     private stats: ChainMonitorStats = {
         mode: 'disconnected',
@@ -227,6 +230,12 @@ export class ChainMonitorClient extends EventEmitter {
         if (this.wsProvider) {
             this.wsProvider.destroy();
             this.wsProvider = null;
+        }
+
+        // 清理看门狗
+        if (this.watchdogTimer) {
+            clearInterval(this.watchdogTimer);
+            this.watchdogTimer = null;
         }
 
         // 清理合约
@@ -382,8 +391,34 @@ export class ChainMonitorClient extends EventEmitter {
         this.stats.mode = 'websocket';
         this.stats.connected = true;
         this.reconnectAttempts = 0;
+        this.lastObservedCount = this.stats.eventsObserved;
+        this.watchdogCheckCount = 0;
+
+        // 启动看门狗 (每 60 秒检查一次)
+        if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+        this.watchdogTimer = setInterval(() => this.checkWatchdog(), 60000);
 
         this.emit('connected', { mode: 'websocket' });
+    }
+
+    /**
+     * 看门狗检查逻辑
+     * 如果连续 3 分钟没有任何链上事件（且处于活跃市场时段），强制重连
+     */
+    private checkWatchdog(): void {
+        if (!this.isRunning || this.currentMode !== 'websocket') return;
+
+        if (this.stats.eventsObserved === this.lastObservedCount) {
+            this.watchdogCheckCount++;
+            // 连续 3 分钟没动静（考虑到 Polygon 可能极偶尔没交易，给 3 次机会）
+            if (this.watchdogCheckCount >= 3) {
+                console.warn('[ChainMonitor] Watchdog detected silent connection, forcing reconnect...');
+                this.handleDisconnect();
+            }
+        } else {
+            this.lastObservedCount = this.stats.eventsObserved;
+            this.watchdogCheckCount = 0;
+        }
     }
 
     private handleTransferSingle(
@@ -532,6 +567,12 @@ export class ChainMonitorClient extends EventEmitter {
             this.wsProvider = null;
             this.ctfContract = null;
             this.negRiskContract = null;
+        }
+
+        // 清理看门狗
+        if (this.watchdogTimer) {
+            clearInterval(this.watchdogTimer);
+            this.watchdogTimer = null;
         }
 
         // 自动重连

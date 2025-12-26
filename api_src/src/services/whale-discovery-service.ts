@@ -66,8 +66,6 @@ export interface WalletProfile {
 
 export interface WhaleCandidate {
     address: string;
-    userName?: string;           // 用户名
-    profileImage?: string;       // 头像 URL
     discoveredAt: Date;
     tradesObserved: number;
     volumeObserved: number;
@@ -513,21 +511,8 @@ export class WhaleDiscoveryService extends EventEmitter {
                 if (profile && this.meetsWhaleCriteria(profile)) {
                     const tradeInfo = this.addressTradeCount.get(address) || { count: 0, volume: 0 };
 
-                    // 获取用户信息（头像、用户名）
-                    let userInfo: { userName?: string; profileImage?: string } = {};
-                    if (this.fetchUserProfile) {
-                        try {
-                            const info = await this.fetchUserProfile(address);
-                            if (info) userInfo = info;
-                        } catch {
-                            // 忽略用户信息获取失败
-                        }
-                    }
-
                     const whale: WhaleCandidate = {
                         address,
-                        userName: userInfo.userName,
-                        profileImage: userInfo.profileImage,
                         discoveredAt: new Date(),
                         tradesObserved: tradeInfo.count,
                         volumeObserved: tradeInfo.volume,
