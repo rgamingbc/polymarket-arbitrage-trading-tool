@@ -90,15 +90,17 @@ function saveWhaleCache(): void {
 
 // 检查缓存是否过期
 function isCacheValid(address: string): boolean {
-    const cache = whaleCacheData[address];
+    const normalizedAddress = address.toLowerCase();
+    const cache = whaleCacheData[normalizedAddress];
     if (!cache) return false;
     return Date.now() - cache.updatedAt < CACHE_TTL_MS;
 }
 
 // 获取缓存数据
 function getCachedPeriodData(address: string, period: '24h' | '7d' | '30d' | 'all'): WhalePeriodData | null {
-    if (!isCacheValid(address)) return null;
-    return whaleCacheData[address]?.periods[period] || null;
+    const normalizedAddress = address.toLowerCase();
+    if (!isCacheValid(normalizedAddress)) return null;
+    return whaleCacheData[normalizedAddress]?.periods[period] || null;
 }
 
 // 更新缓存数据
@@ -539,8 +541,9 @@ export async function whaleDiscoveryRoutes(fastify: FastifyInstance): Promise<vo
         }> = {};
 
         for (const addr of addressList) {
-            const cached = whaleCacheData[addr];
-            if (cached && isCacheValid(addr)) {
+            const normalizedAddr = addr.toLowerCase();
+            const cached = whaleCacheData[normalizedAddr];
+            if (cached && isCacheValid(normalizedAddr)) {
                 result[addr] = { cached: true, periods: cached.periods };
             } else {
                 result[addr] = { cached: false };
