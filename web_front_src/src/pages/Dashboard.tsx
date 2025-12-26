@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Row, Col, Card, Statistic, Table, Typography, Spin, Alert } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined, FireOutlined, DollarOutlined } from '@ant-design/icons';
-import { marketApi, arbitrageApi, walletApi } from '../api/client';
+import { marketApi, arbitrageApi } from '../api/client';
 
 const { Title } = Typography;
 

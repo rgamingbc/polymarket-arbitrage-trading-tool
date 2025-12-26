@@ -102,7 +102,6 @@ function Arbitrage() {
     ];
 
     const profitableCount = opportunities.filter((o) => o.profitPercent > 0.5).length;
-    const totalPotentialProfit = opportunities.reduce((sum, o) => sum + o.profitPercent, 0);
 
     if (error) {
         return <Alert message="错误" description={error} type="error" showIcon />;
