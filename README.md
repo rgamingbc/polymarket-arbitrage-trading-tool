@@ -38,3 +38,11 @@ The API is exposed at `http://localhost:3000` and the docs are served at `http:/
 The dashboard is exposed at `http://localhost:5173`.
 
 See `docs/INSTALL.md` for detailed setup instructions and `docs/GROUP_ARB_STRATEGY.md` for the current trading logic.
+
+## [Backup Milestone] Git Snapshot with Docs
+
+- Initialized local git repo and added .gitignore.
+- Created docs: README, INSTALL, STRATEGY, CHANGELOG stub, DEPLOY.
+- Committed working code for weather scanner + manual buy-all.
+- Pushed to GitHub: https://github.com/rgamingbc/polymarket-arbitrage-trading-tool
+
