@@ -1,0 +1,202 @@
+import os
+
+TEMPLATE_PATH = "../templates/index.html"
+
+NEW_TEMPLATE = '''<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket Traders</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <style>
+    nav { display: flex; gap: 20px; padding: 20px; background: #222; margin-bottom: 20px; border-bottom: 1px solid #333; }
+    nav a { color: #aaa; text-decoration: none; font-weight: bold; padding: 5px 10px; border-radius: 4px; }
+    nav a:hover, nav a.active { color: white; background: #333; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="/" class="{{ 'active' if page == 'copy_trading' else '' }}">Strategy 1: Copy Trading</a>
+    <a href="/arbitrage" class="{{ 'active' if page == 'arbitrage' else '' }}">Strategy 2: Arbitrage</a>
+    <a href="/monitor" class="{{ 'active' if page == 'monitor' else '' }}">Monitor</a>
+  </nav>
+
+  <div class="container">
+    
+    {% if page == 'copy_trading' %}
+    <div class="header">
+      <div class="title">Copy Trading</div>
+      <div class="subtitle">Track traders and follow their orders</div>
+    </div>
+    
+    <div class="actions" style="margin-bottom: 20px;">
+        <button onclick="openManualTradeModal()" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">Manual Trade</button>
+    </div>
+
+    <form method="post" action="{{ url_for('add_trader') }}" class="add-form">
+      <input type="text" name="address" placeholder="Proxy wallet address (0x...)" required>
+      <button type="submit">Track Trader</button>
+    </form>
+    
+    <div class="grid">
+      {% for t in traders %}
+      <a class="card" href="{{ url_for('trader', address=t.address) }}">
+        <img src="{{ t.profile_image or ('https://api.dicebear.com/7.x/identicon/svg?seed=' ~ t.address) }}" alt="" class="avatar" onerror="this.src='https://api.dicebear.com/7.x/identicon/svg?seed={{ t.address }}';this.onerror=null;">
+        <div class="card-body">
+          <div class="name">{{ t.name or t.pseudonym or t.address }}</div>
+          <div class="address">{{ t.address }}</div>
+          <div class="muted">
+            {% set s = stats.get(t.address|lower) %}
+            {{ 'Trades: ' ~ (s.trades_count if s else 0) }}
+          </div>
+          <!-- Add Auto-Follow Toggle in future -->
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    <h2>Recent Trades</h2>
+    <div id="recent-trades"></div>
+    {% endif %}
+
+    {% if page == 'arbitrage' %}
+    <div class="header">
+      <div class="title">Arbitrage Strategies</div>
+      <div class="subtitle">Monitor price discrepancies</div>
+    </div>
+    <div class="card">
+        <div class="card-body">
+            <h3>Opportunities</h3>
+            {% if opportunities %}
+                <ul>
+                {% for opp in opportunities %}
+                    <li>{{ opp }}</li>
+                {% endfor %}
+                </ul>
+            {% else %}
+                <p>No arbitrage opportunities detected at the moment.</p>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if page == 'monitor' %}
+    <div class="header">
+      <div class="title">Dashboard Monitor</div>
+      <div class="subtitle">Wallet, Market, and Realtime Services</div>
+    </div>
+    
+    <!-- We can inject the Wallet Settings / Status here via JS -->
+    <div class="card" style="margin-bottom: 20px;">
+        <div class="card-body">
+            <h3>Wallet Status</h3>
+            <div id="wallet-status-monitor">Loading...</div>
+            <button onclick="openSettings()" style="margin-top: 10px; padding: 5px 10px;">Configure Wallet</button>
+        </div>
+    </div>
+    
+    <div class="card">
+        <div class="card-body">
+            <h3>Market Overview</h3>
+            <p>Realtime connection: <span id="ws-status">Polling...</span></p>
+        </div>
+    </div>
+    {% endif %}
+
+  </div>
+  
+  <script>
+    const page = "{{ page }}";
+    // Monitor Page Logic
+    if (page === 'monitor') {
+        // We can reuse the wallet fetching logic from app.js if we expose it or call it here
+        // For now, let app.js handle the global settings/wallet UI which is usually in a modal or top bar
+        // But we want it displayed in the dashboard too.
+        setInterval(async () => {
+             const res = await fetch("/api/cash");
+             if (res.ok) {
+                 const data = await res.json();
+                 if (data.error) {
+                     document.getElementById("wallet-status-monitor").innerText = "Error: " + data.error;
+                 } else {
+                     document.getElementById("wallet-status-monitor").innerHTML = `
+                        Cash: $${data.cash.toFixed(2)} <br>
+                        USDC (Native): $${data.usdc_native.toFixed(2)} <br>
+                        MATIC: ${data.matic.toFixed(4)} <br>
+                        Funder: ${data.funder}
+                     `;
+                 }
+             }
+        }, 5000);
+    }
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+
+  <!-- Manual Trade Modal (Always available or only on copy trading?) -->
+  <div id="manual-trade-modal" class="modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000;">
+    <div class="modal-content" style="background:#1a1a1a; margin: 10% auto; padding: 20px; width: 80%; max-width: 500px; border-radius: 8px; color: white;">
+      <h3>Manual Trade</h3>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Market Slug (e.g. "will-btc-hit-100k") OR Token ID</label>
+        <input type="text" id="mt-slug" placeholder="Slug or Token ID" style="width:100%; padding: 8px; margin-top: 5px;">
+      </div>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Outcome (if using Slug)</label>
+        <select id="mt-outcome" style="width:100%; padding: 8px; margin-top: 5px;">
+            <option value="">Select Outcome</option>
+            <option value="Yes">Yes</option>
+            <option value="No">No</option>
+        </select>
+      </div>
+
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Side</label>
+        <select id="mt-side" style="width:100%; padding: 8px; margin-top: 5px;">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+        </select>
+      </div>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Order Type</label>
+        <select id="mt-type" style="width:100%; padding: 8px; margin-top: 5px;">
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT">LIMIT</option>
+        </select>
+      </div>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Price (Limit only)</label>
+        <input type="number" id="mt-price" step="0.01" placeholder="Price" style="width:100%; padding: 8px; margin-top: 5px;">
+      </div>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Size (Shares)</label>
+        <input type="number" id="mt-size" step="0.1" placeholder="Shares" style="width:100%; padding: 8px; margin-top: 5px;">
+      </div>
+      
+      <div style="margin-bottom: 10px;">
+        <label style="display:block;">Amount (USDC - for Buy Market)</label>
+        <input type="number" id="mt-amount" step="0.1" placeholder="USDC Amount" style="width:100%; padding: 8px; margin-top: 5px;">
+      </div>
+      
+      <div class="modal-actions" style="margin-top: 20px; text-align: right;">
+        <button onclick="closeManualTradeModal()" style="padding: 8px 16px; margin-right: 10px; background: #555; border: none; color: white; cursor: pointer;">Cancel</button>
+        <button onclick="submitManualTrade()" style="padding: 8px 16px; background: #007bff; border: none; color: white; cursor: pointer;">Place Order</button>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
+'''
+
+def patch_template():
+    with open(TEMPLATE_PATH, "w") as f:
+        f.write(NEW_TEMPLATE)
+    print("Successfully patched index.html with Navigation")
+
+if __name__ == "__main__":
+    patch_template()

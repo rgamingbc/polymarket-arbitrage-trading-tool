@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Polymarket Traders</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">Polymarket Monitor</div>
+      <div class="subtitle">Track traders and watch their trades in real time</div>
+    </div>
+    <form method="post" action="{{ url_for('add_trader') }}" class="add-form">
+      <input type="text" name="address" placeholder="Proxy wallet address (0x...)" required>
+      <button type="submit">Track Trader</button>
+    </form>
+    <div class="grid">
+      {% for t in traders %}
+      <a class="card" href="{{ url_for('trader', address=t.address) }}">
+        <img src="{{ t.profile_image or ('https://api.dicebear.com/7.x/identicon/svg?seed=' ~ t.address) }}" alt="" class="avatar" onerror="this.src='https://api.dicebear.com/7.x/identicon/svg?seed={{ t.address }}';this.onerror=null;">
+        <div class="card-body">
+          <div class="name">{{ t.name or t.pseudonym or t.address }}</div>
+          <div class="address">{{ t.address }}</div>
+          <div class="muted">
+            {% set s = stats.get(t.address|lower) %}
+            {{ 'Trades: ' ~ (s.trades_count if s else 0) }}
+          </div>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+    <h2>Recent Trades</h2>
+    <div id="recent-trades"></div>
+  </div>
+  <script>
+    const page = "index";
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

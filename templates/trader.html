@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trader</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="container">
+    <a href="{{ url_for('index') }}">← Back</a>
+    <div class="trader-header">
+      <img src="{{ trader.profile_image or ('https://api.dicebear.com/7.x/identicon/svg?seed=' ~ trader.address) }}" alt="" class="avatar lg" onerror="this.src='https://api.dicebear.com/7.x/identicon/svg?seed={{ trader.address }}';this.onerror=null;">
+      <div>
+        <div class="name">{{ trader.name or trader.pseudonym or trader.address }}</div>
+        <div class="address">{{ trader.address }}</div>
+        {% if trader.bio %}<div class="bio">{{ trader.bio }}</div>{% endif %}
+      </div>
+    </div>
+    <h2>Trades</h2>
+    <div id="trades"></div>
+  </div>
+  <script>
+    const address = "{{ trader.address }}";
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

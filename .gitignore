@@ -1,0 +1,36 @@
+# Python env
+.venv/
+__pycache__/
+*.pyc
+
+# Node / JS
+node_modules/
+.npm-cache/
+.pnpm-store/
+.yarn/cache/
+
+# Builds and dist
+FKPolyTools_Repo/dist/
+FKPolySDK/dist/
+FKPolyTools_Repo/api_src/dist/
+FKPolyTools_Repo/web_front_src/dist/
+
+# Local databases and caches
+polymarket.db
+*.sqlite
+*.db
+.cache/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

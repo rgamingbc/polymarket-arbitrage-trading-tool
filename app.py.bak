@@ -1,0 +1,235 @@
+from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import session
+import json
+import requests
+import db
+import fetcher
+
+app = Flask(__name__)
+import os
+app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret")
+
+db.init_db()
+
+@app.route("/", methods=["GET"])
+def index():
+    traders = db.list_traders()
+    stats = db.get_trader_stats()
+    def norm(u):
+        if not u or not isinstance(u, str):
+            return None
+        if u.startswith("ipfs://"):
+            h = u.replace("ipfs://", "").strip()
+            return f"https://cloudflare-ipfs.com/ipfs/{h}"
+        return u
+    for t in traders:
+        t["profile_image"] = norm(t.get("profile_image")) or t.get("profile_image")
+    return render_template("index.html", traders=traders, stats=stats)
+
+@app.route("/add-trader", methods=["POST"])
+def add_trader():
+    address = request.form.get("address", "").strip()
+    if address:
+        db.add_trader(address)
+        try:
+            activity = fetcher.fetch_activity_for_user(address)
+            if len(activity) > 0:
+                fetcher.update_trader_profile(address, activity[0])
+                for item in activity:
+                    if item.get("type") == "TRADE":
+                        db.add_trade(item)
+            else:
+                trades = fetcher.fetch_trades_for_user(address)
+                if len(trades) > 0:
+                    fetcher.update_trader_profile(address, trades[0])
+                    for trade in trades:
+                        db.add_trade(trade)
+        except Exception:
+            pass
+    return redirect(url_for("trader", address=address))
+
+@app.route("/trader/<address>", methods=["GET"])
+def trader(address: str):
+    traders = [t for t in db.list_traders() if t["address"].lower() == address.lower()]
+    trader_info = traders[0] if traders else {"address": address}
+    trades = db.get_trades_for_trader(address, limit=200)
+    return render_template("trader.html", trader=trader_info, trades=trades)
+
+@app.route("/api/traders", methods=["GET"])
+def api_traders():
+    return jsonify(db.list_traders())
+
+@app.route("/api/trades", methods=["GET"])
+def api_trades():
+    address = request.args.get("address", "").strip()
+    if not address:
+        return jsonify([])
+    return jsonify(db.get_trades_for_trader(address, limit=200))
+
+@app.route("/api/recent-trades", methods=["GET"])
+def api_recent_trades():
+    return jsonify(db.get_recent_trades(limit=200))
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 5000)), debug=True)
+
+
+@app.route("/api/set-creds", methods=["POST"])
+def set_creds():
+    data = request.get_json(force=True)
+    pk = (data.get("private_key") or "").strip()
+    funder = (data.get("funder") or "").strip()
+    sig_type = int(data.get("signature_type") or 0)
+    if not pk:
+        return "missing private_key", 400
+    session["private_key"] = pk
+    session["funder"] = funder
+    session["signature_type"] = sig_type
+    return jsonify({"ok": True})
+
+def _get_market_by_slug(slug: str):
+    r = requests.get("https://gamma-api.polymarket.com/markets", params={"slug": slug}, timeout=20)
+    if r.status_code != 200:
+        return None
+    arr = r.json()
+    if not isinstance(arr, list) or len(arr) == 0:
+        return None
+    return arr[0]
+
+def _resolve_token_id(slug: str, outcome_index, outcome):
+    m = _get_market_by_slug(slug)
+    if not m:
+        return None
+    tokens = m.get("clobTokenIds")
+    outs = m.get("outcomes")
+    idx = None
+    try:
+        if isinstance(outcome_index, int):
+            idx = outcome_index
+        else:
+            if isinstance(outs, str):
+                outs = json.loads(outs)
+            if isinstance(outs, list) and outcome is not None:
+                for i, o in enumerate(outs):
+                    if str(o).strip().lower() == str(outcome).strip().lower():
+                        idx = i
+                        break
+    except Exception:
+        pass
+    if idx is None:
+        return None
+    if isinstance(tokens, str):
+        tokens = json.loads(tokens)
+    if not isinstance(tokens, list) or idx >= len(tokens):
+        return None
+    return tokens[idx]
+
+@app.route("/api/repeat-order", methods=["POST"])
+def repeat_order():
+    data = request.get_json(force=True)
+    slug = (data.get("slug") or "").strip()
+    outcome_index = data.get("outcome_index")
+    outcome = data.get("outcome")
+    side = (data.get("side") or "").strip()
+    size = data.get("size")
+    price = data.get("price")
+    if not slug or size is None or price is None or side.lower() not in ["buy", "sell"]:
+        return jsonify({"success": False, "error": "invalid input"}), 400
+    pk = session.get("private_key")
+    if not pk:
+        return jsonify({"success": False, "error": "missing credentials"}), 400
+    token_id = _resolve_token_id(slug, outcome_index, outcome)
+    if not token_id:
+        return jsonify({"success": False, "error": "token not found"}), 400
+    sig_type = int(session.get("signature_type", 0))
+    funder = session.get("funder") or None
+    from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+client = ClobClient(
+        host="https://clob.polymarket.com",
+        chain_id=137,
+        key=pk,
+        signature_type=sig_type,
+        funder=funder
+    )
+    client.set_api_creds(client.create_or_derive_api_creds())
+    s = BUY if side.lower() == "buy" else SELL
+    order = OrderArgs(price=float(price), size=float(size), side=s, token_id=token_id)
+    signed = client.create_order(order)
+    resp = client.post_order(signed, OrderType.GTC)
+    return jsonify(resp)
+
+@app.route("/api/cash", methods=["GET"]) 
+def api_cash(): 
+    pk = session.get("private_key") 
+    if not pk:
+        return jsonify({"error": "missing credentials"}), 400
+    sig_type = int(session.get("signature_type", 0))
+    funder = session.get("funder") or None
+    cash = 0.0
+    try:
+        from py_clob_client.client import ClobClient
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=137,
+            key=pk,
+            signature_type=sig_type,
+            funder=funder,
+        )
+        client.set_api_creds(client.create_or_derive_api_creds())
+        try:
+            if hasattr(client, "get_balance_and_allowance"):
+                usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                info = client.get_balance_and_allowance(usdc_e)
+                if isinstance(info, dict):
+                    b = info.get("balance") or info.get("amount") or info.get("available")
+                    if b is not None:
+                        cash = float(b)
+            elif hasattr(client, "get_balances"):
+                info = client.get_balances()
+                if isinstance(info, dict):
+                    b = info.get("USDC") or info.get("USDC.e") or info.get("quote")
+                    if b is not None:
+                        cash = float(b)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        if cash == 0.0 and funder:
+            cash_rpc = _erc20_balance(funder, usdc_e)
+            if cash_rpc is not None:
+                cash = cash_rpc
+    except Exception:
+        pass
+    return jsonify({"cash": cash})
+
+
+def _erc20_balance(address: str, token: str) -> float:
+    try:
+        addr = (address or "").strip().lower()
+        tok = (token or "").strip().lower()
+        if not addr.startswith("0x") or len(addr) != 42:
+            return 0.0
+        if not tok.startswith("0x") or len(tok) != 42:
+            return 0.0
+        selector = "0x70a08231"  # balanceOf(address)
+        padded = addr.replace("0x", "").rjust(64, "0")
+        data = selector + padded
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": tok, "data": data}, "latest"],
+            "id": 1,
+        }
+        r = requests.post("https://polygon-rpc.com", json=payload, timeout=20)
+        if r.status_code != 200:
+            return 0.0
+        j = r.json()
+        hx = (j.get("result") or "0x0")
+        val = int(hx, 16)
+        return float(val) / 1_000_000.0  # USDC.e has 6 decimals
+    except Exception:
+        return 0.0
