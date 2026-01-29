@@ -284,6 +284,423 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+<<<<<<< HEAD
+=======
+    fastify.get('/performance', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Cashflow P/L by timeframe and strategy'
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const range = String(q.range || '1D').toUpperCase();
+                const limit = q.limit != null ? Number(q.limit) : 200;
+
+                const nowSec = Math.floor(Date.now() / 1000);
+                const rangeToSec: any = { '1D': 86400, '1W': 604800, '1M': 2592000, 'ALL': Number.POSITIVE_INFINITY };
+                const windowSec = rangeToSec[range] ?? 86400;
+                const fromSec = windowSec == Number.POSITIVE_INFINITY ? 0 : (nowSec - windowSec);
+
+                const history = scanner.getHistory();
+                const orderIdToStrategy = new Map<string, string>();
+                for (const entry of history) {
+                    const tag = entry?.mode === 'manual' ? 'manual' : entry?.mode === 'auto' ? 'auto' : entry?.mode === 'semi' ? 'semi' : String(entry?.mode || 'unknown');
+                    for (const r of (entry?.results || [])) {
+                        const orderId = r?.orderId;
+                        if (orderId) orderIdToStrategy.set(String(orderId), tag);
+                    }
+                }
+
+                const trades = await scanner.getTrades({ limit: Number.isFinite(limit) ? limit : 200 }).catch(() => []);
+                const filtered = (trades || []).filter((t: any) => {
+                    const mt = Number(t?.match_time ?? t?.matchTime ?? 0);
+                    return Number.isFinite(mt) && mt >= fromSec;
+                });
+
+                const byStrategy: Record<string, any> = {};
+                let totalNet = 0;
+                let totalBuy = 0;
+                let totalSell = 0;
+
+                const tagForTrade = (t: any) => {
+                    const ids: string[] = [];
+                    const taker = t?.taker_order_id ?? t?.takerOrderId;
+                    if (taker) ids.push(String(taker));
+                    const makers = t?.maker_orders ?? t?.makerOrders;
+                    if (Array.isArray(makers)) {
+                        for (const mo of makers) {
+                            const oid = mo?.order_id ?? mo?.orderId;
+                            if (oid) ids.push(String(oid));
+                        }
+                    }
+                    for (const id of ids) {
+                        const tag = orderIdToStrategy.get(id);
+                        if (tag) return tag;
+                    }
+                    return 'external';
+                };
+
+                for (const t of filtered) {
+                    const side = String(t?.side || '').toUpperCase();
+                    const price = Number(t?.price ?? 0);
+                    const size = Number(t?.size ?? 0);
+                    if (!Number.isFinite(price) || !Number.isFinite(size) || price <= 0 || size <= 0) continue;
+
+                    const cash = (side === 'SELL' ? 1 : -1) * price * size;
+                    const tag = tagForTrade(t);
+
+                    if (!byStrategy[tag]) byStrategy[tag] = { strategy: tag, netCashflow: 0, buyVolume: 0, sellVolume: 0, tradeCount: 0 };
+                    byStrategy[tag].netCashflow += cash;
+                    byStrategy[tag].tradeCount += 1;
+                    if (side === 'BUY') byStrategy[tag].buyVolume += price * size;
+                    if (side === 'SELL') byStrategy[tag].sellVolume += price * size;
+
+                    totalNet += cash;
+                    if (side === 'BUY') totalBuy += price * size;
+                    if (side === 'SELL') totalSell += price * size;
+                }
+
+                const rows = Object.values(byStrategy).sort((a: any, b: any) => (b.netCashflow - a.netCashflow));
+
+                return {
+                    success: true,
+                    range,
+                    fromSec,
+                    toSec: nowSec,
+                    total: { netCashflow: totalNet, buyVolume: totalBuy, sellVolume: totalSell, tradeCount: filtered.length },
+                    byStrategy: rows
+                };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/pnl', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Profit/Loss time series (Polymarket-style)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    range: { type: 'string' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const range = String(q.range || '1D').toUpperCase() as any;
+                const r = scanner.getPnl(range);
+                return { success: true, ...r };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/redeem-now', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Redeem resolved positions (Data API redeemable=true)',
+            body: {
+                type: 'object',
+                properties: {
+                    max: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const max = b.max != null ? Number(b.max) : 20;
+                const result = await scanner.redeemNow({ max, source: 'manual' });
+                return { success: true, result };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/redeem-drain', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Redeem ASAP (one-by-one drain; non-blocking confirmations)',
+            body: {
+                type: 'object',
+                properties: {
+                    maxTotal: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const maxTotal = b.maxTotal != null ? Number(b.maxTotal) : undefined;
+                const started = scanner.startRedeemDrain({ maxTotal, source: 'manual' });
+                return { success: true, started };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/auto-redeem/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Configure auto redeem',
+            body: {
+                type: 'object',
+                properties: {
+                    enabled: { type: 'boolean' },
+                    intervalMinutes: { type: 'number' },
+                    maxPerCycle: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const config = scanner.setAutoRedeemConfig({
+                    enabled: b.enabled,
+                    intervalMinutes: b.intervalMinutes,
+                    maxPerCycle: b.maxPerCycle
+                });
+                return { success: true, config };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/auto-redeem/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get auto redeem status',
+        },
+        handler: async () => {
+            return { success: true, status: scanner.getAutoRedeemStatus() };
+        }
+    });
+
+    fastify.get('/relayer/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get relayer status',
+        },
+        handler: async () => {
+            return { success: true, status: scanner.getRelayerStatus() };
+        }
+    });
+
+    fastify.post('/relayer/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Configure builder relayer credentials (persisted to disk)',
+            body: {
+                type: 'object',
+                properties: {
+                    apiKey: { type: 'string' },
+                    secret: { type: 'string' },
+                    passphrase: { type: 'string' },
+                    label: { type: 'string' },
+                    keys: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                apiKey: { type: 'string' },
+                                secret: { type: 'string' },
+                                passphrase: { type: 'string' },
+                                label: { type: 'string' },
+                            },
+                            required: ['apiKey', 'secret', 'passphrase'],
+                        }
+                    },
+                    activeIndex: { type: 'number' },
+                    relayerUrl: { type: 'string' },
+                    persist: { type: 'boolean' },
+                    testRedeem: { type: 'boolean' },
+                    testMax: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const persist = b.persist !== false;
+                const relayerUrl = b.relayerUrl != null ? String(b.relayerUrl) : undefined;
+                let result: any = null;
+                if (Array.isArray(b.keys) && b.keys.length) {
+                    const keys = b.keys.map((k: any) => ({
+                        apiKey: String(k.apiKey || ''),
+                        secret: String(k.secret || ''),
+                        passphrase: String(k.passphrase || ''),
+                        label: k.label != null ? String(k.label) : undefined,
+                    }));
+                    const activeIndex = b.activeIndex != null ? Number(b.activeIndex) : undefined;
+                    result = scanner.configureRelayerKeys({ keys, relayerUrl, activeIndex, persist });
+                } else if (b.activeIndex != null && !b.apiKey) {
+                    result = scanner.setActiveRelayerKeyIndex(Number(b.activeIndex), { persist });
+                } else {
+                    result = scanner.configureRelayer({
+                        apiKey: String(b.apiKey || ''),
+                        secret: String(b.secret || ''),
+                        passphrase: String(b.passphrase || ''),
+                        relayerUrl,
+                        persist,
+                    });
+                }
+
+                const testRedeem = b.testRedeem === true;
+                const testMax = b.testMax != null ? Number(b.testMax) : 1;
+                const test = testRedeem && result?.success ? await scanner.redeemNow({ max: testMax, source: 'manual' }) : null;
+                const results: any[] = Array.isArray(test?.results) ? test.results : [];
+                const firstFail = results.find(r => !r?.success);
+                const errMsg = firstFail?.error ? String(firstFail.error) : '';
+                if (errMsg.includes('invalid authorization') || errMsg.includes('"status":401') || errMsg.includes('Unauthorized')) {
+                    scanner.clearRelayerConfig({ deleteFile: true });
+                }
+                return { success: true, result, status: scanner.getRelayerStatus(), testRedeemResult: test };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/relayer/active', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Set active builder key index',
+            body: {
+                type: 'object',
+                required: ['activeIndex'],
+                properties: {
+                    activeIndex: { type: 'number' },
+                    persist: { type: 'boolean' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const persist = b.persist !== false;
+                const result = scanner.setActiveRelayerKeyIndex(Number(b.activeIndex), { persist });
+                return { success: true, result, status: scanner.getRelayerStatus() };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/relayer/simulate-quota', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Simulate relayer quota exceeded (dev helper)',
+            body: {
+                type: 'object',
+                properties: {
+                    resetsInSeconds: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const result = scanner.simulateRelayerQuotaExceeded({ resetsInSeconds: b.resetsInSeconds != null ? Number(b.resetsInSeconds) : undefined });
+                return { success: true, result };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/redeem/diagnose', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Redeem diagnostics (redeemables + wallet info)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const limit = q.limit != null ? Number(q.limit) : 50;
+                const diag = await scanner.getRedeemDiagnostics({ limit });
+                return { success: true, diagnostics: diag };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/redeem/conditions', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Redeem specific conditions (creates history entry)',
+            body: {
+                type: 'object',
+                properties: {
+                    source: { type: 'string' },
+                    items: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                conditionId: { type: 'string' },
+                                title: { type: 'string' },
+                                slug: { type: 'string' },
+                                eventSlug: { type: 'string' },
+                                outcome: { type: 'string' },
+                            },
+                            required: ['conditionId']
+                        }
+                    }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = request.body as any;
+                const items = Array.isArray(b?.items) ? b.items : [];
+                const source = String(b?.source || 'manual') === 'auto' ? 'auto' : 'manual';
+                const r = await scanner.redeemByConditions(items, { source });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/redeem/in-flight', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get in-flight redeem transactions (submitted/confirmed/failed)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const limit = q.limit != null ? Number(q.limit) : 50;
+                const inflight = scanner.getRedeemInFlight({ limit });
+                return { success: true, inflight };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+>>>>>>> 4a0b989 (Relayer key rotation + safer persistence)
     fastify.get('/history', {
         schema: {
             tags: ['Group Arb'],
