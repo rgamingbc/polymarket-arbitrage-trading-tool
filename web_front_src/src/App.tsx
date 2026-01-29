@@ -9,6 +9,7 @@ import Wallets from './pages/Wallets';
 import WhaleDiscovery from './pages/WhaleDiscovery';
 import TopWhaleDiscovery from './pages/TopWhaleDiscovery';
 import WatchedWhales from './pages/WatchedWhales';
+import Advanced from './pages/Advanced'; // Advanced Strategy
 
 const { Content } = Layout;
 
@@ -29,6 +30,7 @@ function App() {
                             <Route path="/whale" element={<WhaleDiscovery />} />
                             <Route path="/top-whale" element={<TopWhaleDiscovery />} />
                             <Route path="/watched-whales" element={<WatchedWhales />} />
+                            <Route path="/advanced" element={<Advanced />} />
                         </Routes>
                     </Content>
                 </Layout>

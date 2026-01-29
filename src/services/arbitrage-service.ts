@@ -84,6 +84,8 @@ export interface ArbitrageServiceConfig {
   sizeSafetyFactor?: number;
   /** Auto-fix imbalance after failed execution (default: true) */
   autoFixImbalance?: boolean;
+  /** Strategy for fixing imbalance: 'dump' (sell excess) or 'chase' (buy missing) (default: 'dump') */
+  imbalanceStrategy?: 'dump' | 'chase';
 }
 
 export interface RebalanceAction {
@@ -1266,6 +1268,54 @@ export class ArbitrageService extends EventEmitter {
   }
 
   /**
+   * Fix imbalance by CHASING the failed leg (buying the missing tokens)
+   */
+  private async chaseImbalance(opportunity: ArbitrageOpportunity): Promise<void> {
+    if (!this.ctf || !this.tradingClient || !this.market) return;
+
+    await this.updateBalance();
+    const imbalance = this.balance.yesTokens - this.balance.noTokens;
+
+    if (Math.abs(imbalance) <= this.config.imbalanceThreshold) return;
+
+    this.log(`\n🏃 CHASING Imbalance: ${imbalance > 0 ? 'Missing NO' : 'Missing YES'} (Diff: ${Math.abs(imbalance).toFixed(2)})`);
+
+    const buyAmount = Math.floor(Math.abs(imbalance) * 1e6) / 1e6;
+    if (buyAmount < this.config.minTradeSize) return;
+
+    try {
+        let result;
+        if (imbalance > 0) {
+            // Excess YES, buy NO
+            result = await this.tradingClient.createMarketOrder({
+                tokenId: this.market.noTokenId,
+                side: 'BUY',
+                amount: buyAmount,
+                orderType: 'FOK',
+            });
+            if (result.success) this.log(`   ✅ Chased NO: Bought ${buyAmount.toFixed(2)}`);
+        } else {
+            // Excess NO, buy YES
+            result = await this.tradingClient.createMarketOrder({
+                tokenId: this.market.yesTokenId,
+                side: 'BUY',
+                amount: buyAmount,
+                orderType: 'FOK',
+            });
+            if (result.success) this.log(`   ✅ Chased YES: Bought ${buyAmount.toFixed(2)}`);
+        }
+        
+        if (!result.success) {
+             this.log(`   ❌ Chase failed: ${result.errorMsg}. Fallback to DUMP.`);
+             await this.fixImbalanceIfNeeded();
+        }
+    } catch (error: any) {
+        this.log(`   ❌ Chase error: ${error.message}`);
+        await this.fixImbalanceIfNeeded();
+    }
+  }
+
+  /**
    * Fix YES/NO imbalance immediately after partial execution
    * This is critical when one side of a parallel order fails
    */
@@ -1386,8 +1436,13 @@ export class ArbitrageService extends EventEmitter {
       if (!buyYesResult.success || !buyNoResult.success) {
         // Check if partial execution created imbalance
         if (buyYesResult.success !== buyNoResult.success) {
-          this.log(`  ⚠️ Partial execution detected - attempting to fix imbalance...`);
-          await this.fixImbalanceIfNeeded();
+          this.log(`  ⚠️ Partial execution detected - attempting to fix imbalance (${this.config.imbalanceStrategy})...`);
+          
+          if (this.config.imbalanceStrategy === 'chase') {
+              await this.chaseImbalance(opportunity);
+          } else {
+              await this.fixImbalanceIfNeeded();
+          }
         }
         return {
           success: false,

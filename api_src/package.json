@@ -15,8 +15,12 @@
         "@fastify/swagger": "^8.14.0",
         "@fastify/swagger-ui": "^3.0.0",
         "@fastify/websocket": "^10.0.1",
+        "@polymarket/builder-relayer-client": "^0.0.8",
+        "@polymarket/builder-signing-sdk": "^0.0.8",
+        "dotenv": "^17.2.3",
         "fastify": "^4.26.0",
         "sql.js": "^1.11.0",
+        "viem": "^2.45.0",
         "zod": "^3.22.4"
     },
     "devDependencies": {

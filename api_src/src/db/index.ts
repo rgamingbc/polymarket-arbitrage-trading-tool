@@ -7,7 +7,7 @@ import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const DATA_DIR = path.resolve(process.cwd(), '../datas');
+const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'whales.db');
 
 let db: SqlJsDatabase | null = null;
@@ -84,7 +84,7 @@ export function saveDb(): void {
     ensureDataDir();
     const data = db.export();
     const buffer = Buffer.from(data);
-    fs.writeFileSync(DB_PATH, buffer);
+    // fs.writeFileSync(DB_PATH, buffer);
 }
 
 // 关闭数据库

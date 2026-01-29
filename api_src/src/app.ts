@@ -12,6 +12,8 @@ import { config } from './config.js';
 // 路由导入
 import { marketRoutes } from './routes/markets.js';
 import { arbitrageRoutes } from './routes/arbitrage.js';
+import { groupArbRoutes } from './routes/group-arb.js';
+import { thetaFarmerRoutes } from './routes/theta-farmer.js';
 import { walletRoutes } from './routes/wallets.js';
 import { whaleDiscoveryRoutes } from './routes/whale-discovery.js';
 import { realtimeRoutes } from './websocket/realtime.js';
@@ -76,6 +78,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     // 注册路由
     await app.register(marketRoutes, { prefix: '/api/markets' });
     await app.register(arbitrageRoutes, { prefix: '/api/arbitrage' });
+    await app.register(groupArbRoutes, { prefix: '/api/group-arb' });
+    await app.register(thetaFarmerRoutes, { prefix: '/api/theta' });
     await app.register(walletRoutes, { prefix: '/api/wallets' });
     await app.register(whaleDiscoveryRoutes, { prefix: '/api/whale' });
     await app.register(realtimeRoutes, { prefix: '/ws' });

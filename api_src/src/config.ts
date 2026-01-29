@@ -3,6 +3,11 @@
  * 
  * 所有配置项支持通过环境变量覆盖
  */
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Load .env from project root
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 export const config = {
     // ===== 服务器配置 =====

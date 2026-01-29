@@ -2,7 +2,7 @@ import axios from 'axios';
 
 const api = axios.create({
     baseURL: '/api',
-    timeout: 30000,
+    timeout: 120000, // Increased timeout to 120s
 });
 
 // 市场 API
@@ -19,6 +19,7 @@ export const arbitrageApi = {
     scan: (minVolume = 5000, limit = 50, minProfit = 0.003) =>
         api.get(`/arbitrage/scan?minVolume=${minVolume}&limit=${limit}&minProfit=${minProfit}`),
     check: (conditionId: string) => api.get(`/arbitrage/${conditionId}`),
+    execute: (market: any, opportunity: any, size: number) => api.post('/arbitrage/execute', { market, opportunity, size }),
 };
 
 // 钱包 API
