@@ -1,6 +1,15 @@
 import { PolymarketSDK, RateLimiter, ApiType, PolymarketError, ErrorCode, withRetry } from '../../../dist/index.js';
 import { TradingClientOverride as TradingClient } from '../clients/trading-client-override.js';
+import { CTFClient } from '../../../dist/clients/ctf-client.js';
 import { ethers } from 'ethers';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import { RelayClient, RelayerTxType } from '@polymarket/builder-relayer-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
+import { createWalletClient, http, encodeFunctionData, parseAbi, type Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { polygon } from 'viem/chains';
 
 export interface GroupArbOpportunity {
     marketId: string;
@@ -13,6 +22,9 @@ export interface GroupArbOpportunity {
     yesPrice: number;
     noPrice: number;
     totalCost: number;
+    spreadSum?: number;
+    yesSpread?: number;
+    noSpread?: number;
     profit: number;
     profitPercent: number;
     liquidity: number;
@@ -24,24 +36,58 @@ export interface GroupArbOpportunity {
     volume24hr?: number;
 }
 
-interface MonitoredTrade {
+interface StrategySettings {
+    targetProfitPercent: number;
+    cutLossPercent: number;
+    trailingStopPercent: number;
+    enableOneLegTimeout?: boolean;
+    oneLegTimeoutMinutes: number;
+    autoCancelUnfilledOnTimeout?: boolean;
+    wideSpreadCents: number;
+    forceMarketExitFromPeakPercent: number;
+    enableHedgeComplete?: boolean;
+    oneLegTimeoutAction?: 'UNWIND_EXIT' | 'HEDGE_COMPLETE';
+    maxSpreadCentsForHedge?: number;
+    maxSlippageCents?: number;
+}
+
+interface MonitoredLeg {
+    outcome: 'Yes' | 'No';
+    tokenId: string;
+    orderId: string;
+    entryPrice: number;
+    size: number;
+    filledSize: number;
+    peakMid: number;
+    status: 'live' | 'filled' | 'closed';
+}
+
+interface MonitoredPosition {
     marketId: string;
-    entryTime: number;
-    entryPrice: number; // Avg cost per set
-    peakPrice: number; // Track highest price for trailing stop
-    tokenIds: string[];
-    status: 'active' | 'closed';
+    createdAt: number;
+    mode: 'semi' | 'auto';
+    settings: StrategySettings;
+    legs: { yes: MonitoredLeg; no: MonitoredLeg };
+    status: 'orders_live' | 'one_leg_filled' | 'both_legs_filled' | 'exited';
 }
 
 export class GroupArbitrageScanner {
     private sdk: PolymarketSDK;
     private tradingClient: TradingClient;
+    private ctf?: CTFClient;
+    private redeemProvider?: ethers.providers.JsonRpcProvider;
+    private redeemWallet?: ethers.Wallet;
+    private relayerSafe?: RelayClient;
+    private relayerProxy?: RelayClient;
+    private relayerConfigured = false;
     public latestResults: GroupArbOpportunity[] = [];
     public latestLogs: string[] = [];
     public orderHistory: any[] = []; // In-memory order history
-<<<<<<< HEAD
-    private monitoredTrades: Map<string, MonitoredTrade> = new Map(); // Track active trades for cut-loss
-=======
+    private orderHistoryPath: string = '';
+    private orderHistoryLoadedAt: string | null = null;
+    private orderHistoryPersistedAt: string | null = null;
+    private orderHistoryPersistLastError: string | null = null;
+    private orderHistoryPersistTimer: any = null;
     private monitoredPositions: Map<string, MonitoredPosition> = new Map();
     private orderStatusCache: Map<string, { updatedAtMs: number; data: any }> = new Map();
     private systemCanceledOrderIds: Set<string> = new Set();
@@ -59,9 +105,19 @@ export class GroupArbitrageScanner {
     private autoRedeemConfigLoadedAt: string | null = null;
     private autoRedeemConfigPersistedAt: string | null = null;
     private autoRedeemConfigPersistLastError: string | null = null;
+    private crypto15mAutoEnabled = false;
+    private crypto15mAutoTimer: any = null;
+    private crypto15mAutoConfig: { pollMs: number; expiresWithinSec: number; minProb: number; amountUsd: number } = { pollMs: 2_000, expiresWithinSec: 180, minProb: 0.9, amountUsd: 1 };
+    private crypto15mLastScanAt: string | null = null;
+    private crypto15mLastError: string | null = null;
+    private crypto15mActivesBySymbol: Map<string, any> = new Map();
+    private crypto15mTrackedByCondition: Map<string, any> = new Map();
+    private crypto15mCooldownUntilBySymbol: Map<string, number> = new Map();
+    private crypto15mCryptoTagId: string | null = null;
+    private crypto15mNextScanAllowedAtMs = 0;
     private redeemDrainRunning = false;
     private redeemDrainLast: any = null;
-    private redeemInFlight: Map<string, { conditionId: string; submittedAt: string; method: string; txHash?: string; transactionId?: string; status: 'submitted' | 'confirmed' | 'failed'; error?: string }> = new Map();
+    private redeemInFlight: Map<string, { conditionId: string; submittedAt: string; method: string; txHash?: string; transactionId?: string; status: 'submitted' | 'confirmed' | 'failed'; error?: string; txStatus?: number | null; payoutUsdc?: number; payoutReceivedUsdc?: number; payoutSentUsdc?: number; payoutNetUsdc?: number; payoutRecipients?: string[]; paid?: boolean; payoutComputedAt?: string; usdcTransfers?: Array<{ token: string; from: string; to: string; amount: number }> }> = new Map();
     private relayerUrl: string = 'https://relayer-v2.polymarket.com';
     private relayerConfigPath: string = '';
     private relayerConfigLoadedAt: string | null = null;
@@ -74,9 +130,9 @@ export class GroupArbitrageScanner {
     private relayerSafeDeployed = false;
     private rpcUrls: string[] = [];
     private rpcIndex = 0;
->>>>>>> 4a0b989 (Relayer key rotation + safer persistence)
     private isRunning = false;
     private hasValidKey = false;
+    private rpcPrivateKey: string = '';
 
     constructor(privateKey?: string) {
         this.sdk = new PolymarketSDK({
@@ -85,29 +141,68 @@ export class GroupArbitrageScanner {
 
         this.hasValidKey = !!privateKey && privateKey.length > 50; // Simple check
         const effectiveKey = this.hasValidKey ? privateKey! : '0x0000000000000000000000000000000000000000000000000000000000000001';
+        this.rpcPrivateKey = effectiveKey;
 
         // Initialize Trading Client manually since SDK doesn't expose it publically
         const rateLimiter = new RateLimiter(); 
         
-        // Check for Proxy Address in env
         const proxyAddress = process.env.POLY_PROXY_ADDRESS;
-        if (proxyAddress) {
-            console.log(`ℹ️ Using Proxy Address for Trading: ${proxyAddress}`);
-        }
 
         this.tradingClient = new TradingClient(rateLimiter, {
             privateKey: effectiveKey,
             chainId: 137,
             proxyAddress: proxyAddress
         });
+
+        if (this.hasValidKey) {
+            this.relayerConfigPath = process.env.POLY_RELAYER_CONFIG_PATH
+                ? String(process.env.POLY_RELAYER_CONFIG_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'relayer.json');
+            this.autoRedeemConfigPath = process.env.POLY_AUTO_REDEEM_CONFIG_PATH
+                ? String(process.env.POLY_AUTO_REDEEM_CONFIG_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'auto-redeem.json');
+            this.orderHistoryPath = process.env.POLY_ORDER_HISTORY_PATH
+                ? String(process.env.POLY_ORDER_HISTORY_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'history.json');
+            const envList = process.env.POLY_RPC_URLS || process.env.POLY_CTF_RPC_URLS || process.env.POLY_RPC_FALLBACK_URLS;
+            const urls = (envList ? String(envList).split(',') : [
+                process.env.POLY_CTF_RPC_URL,
+                process.env.POLY_RPC_URL,
+                'https://polygon-rpc.com',
+                'https://rpc.ankr.com/polygon',
+                'https://polygon.llamarpc.com',
+            ])
+                .filter(Boolean)
+                .map((s) => String(s).trim())
+                .filter((s) => s.startsWith('http'));
+            this.rpcUrls = urls.length ? urls : ['https://polygon-rpc.com'];
+            this.rpcIndex = 0;
+            const rpcUrl = this.rpcUrls[this.rpcIndex];
+            this.ctf = new CTFClient({ privateKey: effectiveKey, rpcUrl, chainId: 137 });
+            this.redeemProvider = this.createRpcProvider(rpcUrl);
+            this.redeemWallet = new ethers.Wallet(effectiveKey, this.redeemProvider);
+
+            const account = privateKeyToAccount(effectiveKey as Hex);
+            this.relayerWalletClient = createWalletClient({
+                account,
+                chain: polygon,
+                transport: http(rpcUrl),
+            });
+            this.loadRelayerConfigFromFile();
+            this.configureRelayerFromEnv();
+            this.loadAutoRedeemConfigFromFile();
+            this.loadOrderHistoryFromFile();
+        }
+
+        this.pnlPersistencePath = process.env.POLY_PNL_SNAPSHOT_PATH
+            ? String(process.env.POLY_PNL_SNAPSHOT_PATH)
+            : path.join(os.tmpdir(), 'polymarket-tools', 'pnl-snapshots.json');
         
         // Initialize async
-        this.tradingClient.initialize().catch(e => console.error('Failed to init trading client:', e));
+        this.tradingClient.initialize().catch((e: any) => console.error('Failed to init trading client:', e));
         
         // Start monitoring loop for cut-loss/trailing stop
         this.startMonitoring();
-<<<<<<< HEAD
-=======
 
         if (this.hasValidKey) {
             this.loadPnlSnapshots().finally(() => this.startPnlSnapshots());
@@ -532,13 +627,14 @@ export class GroupArbitrageScanner {
 
         const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
         const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const parentCollectionId = await this.getRedeemParentCollectionId(conditionId);
         const ctfAbi = parseAbi([
             'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)'
         ]);
         const calldata = encodeFunctionData({
             abi: ctfAbi,
             functionName: 'redeemPositions',
-            args: [USDCe_ADDRESS, '0x0000000000000000000000000000000000000000000000000000000000000000', conditionId as any, [1n, 2n]],
+            args: [USDCe_ADDRESS, parentCollectionId as any, conditionId as any, [1n, 2n]],
         });
 
         const tx = { to: CTF_ADDRESS, data: calldata, value: '0' };
@@ -599,7 +695,6 @@ export class GroupArbitrageScanner {
         if (proxyErr) throw new Error(`Relayer failed (proxy): ${proxyErr?.message || String(proxyErr)}`);
         if (safeErr) throw new Error(`Relayer failed (safe): ${safeErr?.message || String(safeErr)}`);
         throw new Error('No relayer client available');
->>>>>>> 4a0b989 (Relayer key rotation + safer persistence)
     }
 
     // Start background scanning loop
@@ -744,6 +839,7 @@ export class GroupArbitrageScanner {
 
                     const getTokenId = (t: any): string | undefined => t?.token_id ?? t?.tokenId ?? t?.id;
                     const bestAskCentsByOutcome: Record<string, number> = {};
+                    const spreadCentsByOutcome: Record<string, number> = {};
                     const tokenIds: string[] = [];
 
                     let bidSumCents = 0;
@@ -772,7 +868,10 @@ export class GroupArbitrageScanner {
                         const askCents = bestAsk * 100;
                         bestAskCentsByOutcome[outcome] = askCents;
 
-                        if (Number.isFinite(bestBid) && bestBid > 0) bidSumCents += bestBid * 100;
+                        if (Number.isFinite(bestBid) && bestBid > 0) {
+                            bidSumCents += bestBid * 100;
+                            spreadCentsByOutcome[outcome] = Math.max(0, (bestAsk - bestBid) * 100);
+                        }
                         if (Number.isFinite(askSize) && askSize > 0) minLiquidityFound = Math.min(minLiquidityFound, askSize * askCents);
                     }
 
@@ -786,6 +885,9 @@ export class GroupArbitrageScanner {
                     const profitPercent = 100 - totalCostCents;
                     const profit = profitPercent / 100;
                     const ratioScore = 1 - Math.min(1, Math.abs((yesCents / totalCostCents) - 0.5) * 2);
+                    const yesSpread = spreadCentsByOutcome['yes'];
+                    const noSpread = spreadCentsByOutcome['no'];
+                    const spreadSum = (Number.isFinite(yesSpread) ? yesSpread : 0) + (Number.isFinite(noSpread) ? noSpread : 0);
 
                     if (true) {
                         opportunities.push({
@@ -799,6 +901,9 @@ export class GroupArbitrageScanner {
                             yesPrice: yesCents,
                             noPrice: noCents,
                             totalCost: totalCostCents,
+                            spreadSum: Number.isFinite(spreadSum) ? spreadSum : undefined,
+                            yesSpread: Number.isFinite(yesSpread) ? yesSpread : undefined,
+                            noSpread: Number.isFinite(noSpread) ? noSpread : undefined,
                             profit,
                             profitPercent,
                             liquidity: minLiquidityFound,
@@ -828,10 +933,12 @@ export class GroupArbitrageScanner {
 
         return { 
             opportunities: opportunities.sort((a, b) => {
-                const diffA = Math.abs(a.totalCost - 100);
-                const diffB = Math.abs(b.totalCost - 100);
-                if (diffA !== diffB) return diffA - diffB;
-                return a.totalCost - b.totalCost;
+                const sa = a.spreadSum ?? Number.POSITIVE_INFINITY;
+                const sb = b.spreadSum ?? Number.POSITIVE_INFINITY;
+                if (a.ratioScore !== b.ratioScore) return b.ratioScore - a.ratioScore;
+                if (sa !== sb) return sa - sb;
+                if (a.totalCost !== b.totalCost) return a.totalCost - b.totalCost;
+                return (b.liquidity ?? 0) - (a.liquidity ?? 0);
             }), 
             logs 
         };
@@ -863,11 +970,65 @@ export class GroupArbitrageScanner {
 
     async getAllOpenOrders(): Promise<any[]> {
         const orders = await this.tradingClient.getOpenOrders();
-        return orders || [];
+        const list = orders || [];
+        const orderIdToStrategy = this.buildOrderIdToStrategyMap();
+        const enriched = await Promise.all(list.map(async (o: any) => {
+            const marketId = String(o?.marketId || o?.market || '').trim();
+            if (!marketId) return o;
+            const meta = await this.resolveMarketMeta(marketId);
+            const orderId = String(o?.id || o?.orderId || '').trim();
+            const strategy = orderId ? orderIdToStrategy.get(orderId) : undefined;
+            const source = strategy ? 'tool' : 'external';
+            const status = String(o?.status || '').toUpperCase();
+            return { ...o, status, strategy: strategy || 'external', source, marketQuestion: meta.title, slug: meta.slug, eventSlug: meta.eventSlug };
+        }));
+        return enriched;
     }
 
     async getTrades(params?: any): Promise<any[]> {
-        return await this.tradingClient.getTrades(params);
+        const trades = await this.tradingClient.getTrades(params);
+        const list = trades || [];
+        const orderIdToStrategy = this.buildOrderIdToStrategyMap();
+        const enriched = await Promise.all(list.map(async (t: any) => {
+            const marketId = String(t?.market || t?.marketId || t?.conditionId || '').trim();
+            const candidates: string[] = [];
+            if (t?.taker_order_id) candidates.push(String(t.taker_order_id));
+            if (Array.isArray(t?.maker_orders)) {
+                for (const mo of t.maker_orders) {
+                    if (mo?.order_id) candidates.push(String(mo.order_id));
+                }
+            }
+            let strategy: string | undefined;
+            for (const id of candidates) {
+                const s = orderIdToStrategy.get(id);
+                if (s) {
+                    strategy = s;
+                    break;
+                }
+            }
+            const source = strategy ? 'tool' : 'external';
+            if (!marketId) return { ...t, strategy: strategy || 'external', source, orderIds: candidates };
+            const meta = await this.resolveMarketMeta(marketId);
+            const status = String(t?.status || '').toUpperCase();
+            return { ...t, status, marketId, strategy: strategy || 'external', source, orderIds: candidates, title: t?.title ?? meta.title, slug: t?.slug ?? meta.slug, eventSlug: t?.eventSlug ?? meta.eventSlug };
+        }));
+        return enriched;
+    }
+
+    private buildOrderIdToStrategyMap(): Map<string, string> {
+        const m = new Map<string, string>();
+        for (const entry of this.orderHistory) {
+            const mode = entry?.mode;
+            const strategy = mode === 'manual' ? 'manual' : mode === 'auto' ? 'auto' : mode === 'semi' ? 'semi' : undefined;
+            if (!strategy) continue;
+            const results = Array.isArray(entry?.results) ? entry.results : [];
+            for (const r of results) {
+                const orderId = r?.orderId;
+                if (!orderId) continue;
+                m.set(String(orderId), strategy);
+            }
+        }
+        return m;
     }
 
     async getTradingStatus(): Promise<any> {
@@ -925,6 +1086,7 @@ export class GroupArbitrageScanner {
     }
 
     async cancelOrder(orderId: string): Promise<any> {
+        this.systemCanceledOrderIds.add(orderId);
         return await this.tradingClient.cancelOrder(orderId);
     }
 
@@ -933,8 +1095,58 @@ export class GroupArbitrageScanner {
         return this.orderHistory;
     }
 
-<<<<<<< HEAD
-=======
+    private loadOrderHistoryFromFile() {
+        if (!this.orderHistoryPath) return;
+        try {
+            if (!fs.existsSync(this.orderHistoryPath)) return;
+            const raw = fs.readFileSync(this.orderHistoryPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '[]'));
+            if (!Array.isArray(parsed)) return;
+            this.orderHistory = parsed.filter((e: any) => !!e && typeof e === 'object').slice(0, 200);
+            this.orderHistoryLoadedAt = new Date().toISOString();
+        } catch {
+        }
+    }
+
+    private persistOrderHistoryToFile() {
+        if (!this.orderHistoryPath) return;
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
+            fs.mkdirSync(dir, { recursive: true });
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+
+        try {
+            const payload = JSON.stringify(this.orderHistory.slice(0, 200));
+            writeAtomic(this.orderHistoryPath, payload);
+            this.orderHistoryPersistedAt = new Date().toISOString();
+            this.orderHistoryPersistLastError = null;
+        } catch (e: any) {
+            this.orderHistoryPersistLastError = e?.message ? String(e.message) : 'Failed to write history file';
+        }
+    }
+
+    private schedulePersistOrderHistory() {
+        if (!this.orderHistoryPath) return;
+        if (this.orderHistoryPersistTimer) return;
+        this.orderHistoryPersistTimer = setTimeout(() => {
+            this.orderHistoryPersistTimer = null;
+            this.persistOrderHistoryToFile();
+        }, 250);
+    }
+
     async getMonitoredPositionsSummary(): Promise<any[]> {
         const summaries: any[] = [];
 
@@ -1096,19 +1308,92 @@ export class GroupArbitrageScanner {
         }
     }
 
-    private async fetchUsdcBalance(address: string): Promise<number> {
+    private async fetchErc20Balance(tokenAddress: string, address: string): Promise<number> {
         const a = String(address || '').trim();
-        if (!a) return 0;
-        const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const t = String(tokenAddress || '').trim();
+        if (!a || !t) return 0;
         const erc20Abi = ['function balanceOf(address) view returns (uint256)', 'function decimals() view returns (uint8)'];
         const [bal, dec] = await this.withRpcRetry(async () => {
             const provider = this.redeemProvider || this.createRpcProvider(process.env.POLY_CTF_RPC_URL || process.env.POLY_RPC_URL || 'https://polygon-rpc.com');
-            const c = new ethers.Contract(USDCe_ADDRESS, erc20Abi, provider);
+            const c = new ethers.Contract(t, erc20Abi, provider);
             return await Promise.all([c.balanceOf(a), c.decimals()]);
         });
         const decimals = Number(dec);
         const value = Number(ethers.utils.formatUnits(bal, Number.isFinite(decimals) ? decimals : 6));
         return Number.isFinite(value) ? value : 0;
+    }
+
+    private async fetchUsdcBalance(address: string): Promise<number> {
+        const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        return this.fetchErc20Balance(USDCe_ADDRESS, address);
+    }
+
+    private async fetchStableBalances(address: string): Promise<{ usdc: number; usdcE: number; total: number }> {
+        const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const USDC_ADDRESS = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+        const [usdcE, usdc] = await Promise.all([
+            this.fetchErc20Balance(USDCe_ADDRESS, address).catch(() => 0),
+            this.fetchErc20Balance(USDC_ADDRESS, address).catch(() => 0),
+        ]);
+        const total = Number(usdcE) + Number(usdc);
+        return { usdc: Number(usdc) || 0, usdcE: Number(usdcE) || 0, total: Number.isFinite(total) ? total : 0 };
+    }
+
+    private async computeUsdcTransfersFromTxHash(txHash: string, options?: { recipients?: string[] }): Promise<{ totalUsdc: number; transfers: Array<{ token: string; from: string; to: string; amount: number }>; recipients: string[]; receivedUsdc: number; sentUsdc: number; netUsdc: number; txStatus: number | null }> {
+        const hash = String(txHash || '').trim();
+        if (!hash) return { totalUsdc: 0, transfers: [], recipients: [], receivedUsdc: 0, sentUsdc: 0, netUsdc: 0, txStatus: null };
+        const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const USDC_ADDRESS = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+        const provider = this.redeemProvider || this.createRpcProvider(process.env.POLY_CTF_RPC_URL || process.env.POLY_RPC_URL || 'https://polygon-rpc.com');
+        const receipt: any = await this.withRpcRetry(() => provider.getTransactionReceipt(hash));
+        const txStatusRaw = receipt?.status;
+        const txStatus = txStatusRaw === '0x1' ? 1 : txStatusRaw === '0x0' ? 0 : Number.isFinite(Number(txStatusRaw)) ? Number(txStatusRaw) : null;
+        const logs: any[] = Array.isArray(receipt?.logs) ? receipt.logs : [];
+        const iface = new ethers.utils.Interface(['event Transfer(address indexed from, address indexed to, uint256 value)']);
+        const topic0 = iface.getEventTopic('Transfer');
+        const transfers: Array<{ token: string; from: string; to: string; amount: number }> = [];
+        let totalUsdc = 0;
+        const isAddress = (v: string) => /^0x[a-fA-F0-9]{40}$/.test(String(v || '').trim());
+        const recipients = Array.from(new Set(((options?.recipients && options.recipients.length) ? options.recipients : [this.getFunderAddress()])
+            .map((a) => String(a || '').trim())
+            .filter((a) => !!a && isAddress(a))
+            .map((a) => a.toLowerCase())));
+        const recipientsSet = new Set(recipients);
+        let receivedUsdc = 0;
+        let sentUsdc = 0;
+        for (const log of logs) {
+            const addr = String(log?.address || '').toLowerCase();
+            const token =
+                addr === USDCe_ADDRESS.toLowerCase() ? 'USDCe' :
+                addr === USDC_ADDRESS.toLowerCase() ? 'USDC' :
+                null;
+            if (!token) continue;
+            const topics: any[] = Array.isArray(log?.topics) ? log.topics : [];
+            if (!topics.length || String(topics[0]).toLowerCase() !== String(topic0).toLowerCase()) continue;
+            try {
+                const parsed = iface.parseLog(log);
+                const from = String(parsed?.args?.from || '');
+                const to = String(parsed?.args?.to || '');
+                const value = parsed?.args?.value;
+                const amount = Number(ethers.utils.formatUnits(value, 6));
+                if (!Number.isFinite(amount) || amount <= 0) continue;
+                transfers.push({ token, from, to, amount });
+                totalUsdc += amount;
+                if (recipientsSet.size) {
+                    const fromLc = String(from || '').toLowerCase();
+                    const toLc = String(to || '').toLowerCase();
+                    if (recipientsSet.has(toLc)) receivedUsdc += amount;
+                    if (recipientsSet.has(fromLc)) sentUsdc += amount;
+                }
+            } catch {
+            }
+        }
+        const netUsdc = recipientsSet.size ? (receivedUsdc - sentUsdc) : totalUsdc;
+        return { totalUsdc, transfers, recipients, receivedUsdc, sentUsdc, netUsdc, txStatus };
+    }
+
+    private async getRedeemParentCollectionId(conditionId: string): Promise<string> {
+        return ethers.constants.HashZero;
     }
 
     private async resolveMarketMeta(conditionId: string): Promise<{ title?: string; slug?: string; eventSlug?: string }> {
@@ -1133,12 +1418,25 @@ export class GroupArbitrageScanner {
     async getPortfolioSummary(options?: { positionsLimit?: number }) {
         const funder = this.getFunderAddress();
         const positionsLimit = Math.max(1, Math.floor(Number(options?.positionsLimit ?? 50)));
-        const [positions, positionsValue, cash] = await Promise.all([
+        const [positions, positionsValue] = await Promise.all([
             this.fetchDataApiPositions(funder),
             this.fetchDataApiPositionsValue(funder),
-            this.fetchUsdcBalance(funder),
         ]);
         const list = Array.isArray(positions) ? positions : [];
+        const isAddress = (v: string) => /^0x[a-fA-F0-9]{40}$/.test(String(v || '').trim());
+        const proxyWallets = Array.from(new Set(list
+            .map((p: any) => String(p?.proxyWallet || '').trim())
+            .filter((a) => !!a && isAddress(a))))
+            .filter((a) => a.toLowerCase() !== funder.toLowerCase())
+            .slice(0, 5);
+        const cashWallets = [funder, ...proxyWallets];
+        const balances = await Promise.all(cashWallets.map(async (address) => {
+            const b = await this.fetchStableBalances(address).catch(() => ({ usdc: 0, usdcE: 0, total: 0 }));
+            return { address, usdc: Number(b.usdc) || 0, usdcE: Number(b.usdcE) || 0, total: Number(b.total) || 0 };
+        }));
+        const cash = balances.reduce((s, b) => s + (Number(b.total) || 0), 0);
+        const cashUsdc = balances.reduce((s, b) => s + (Number(b.usdc) || 0), 0);
+        const cashUsdcE = balances.reduce((s, b) => s + (Number(b.usdcE) || 0), 0);
         const claimable = list.filter((p: any) => !!p?.redeemable && p?.conditionId && !this.isRedeemConfirmed(String(p.conditionId)));
         const topPositions = list.slice(0, positionsLimit);
         const portfolioValue = Number(positionsValue) + Number(cash);
@@ -1146,25 +1444,62 @@ export class GroupArbitrageScanner {
             funder,
             portfolioValue,
             cash,
+            cashUsdc,
+            cashUsdcE,
+            cashWallets: balances,
             positionsValue,
             claimableCount: claimable.length,
             positions: topPositions,
         };
     }
 
+    private async isLikelyGnosisSafe(address: string): Promise<boolean> {
+        const a = String(address || '').trim();
+        if (!a || !/^0x[a-fA-F0-9]{40}$/.test(a)) return false;
+        const provider = this.redeemProvider || this.createRpcProvider(process.env.POLY_CTF_RPC_URL || process.env.POLY_RPC_URL || 'https://polygon-rpc.com');
+        const code = await this.withRpcRetry(() => provider.getCode(a)).catch(() => '');
+        if (!code || code === '0x') return false;
+        const safeAbi = ['function nonce() view returns (uint256)'];
+        const safe = new ethers.Contract(a, safeAbi, provider);
+        try {
+            await this.withRpcRetry(() => safe.nonce());
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private async getMaticBalance(address: string): Promise<number> {
+        const a = String(address || '').trim();
+        if (!a || !/^0x[a-fA-F0-9]{40}$/.test(a)) return 0;
+        const provider = this.redeemProvider || this.createRpcProvider(process.env.POLY_CTF_RPC_URL || process.env.POLY_RPC_URL || 'https://polygon-rpc.com');
+        const wei = await this.withRpcRetry(() => provider.getBalance(a)).catch(() => ethers.BigNumber.from(0));
+        return Number(ethers.utils.formatEther(wei));
+    }
+
+    private async ensureOwnerHasGas(minMatic: number): Promise<void> {
+        const owner = this.redeemWallet?.address;
+        if (!owner) throw new Error('Redeem wallet not configured');
+        const bal = await this.getMaticBalance(owner);
+        if (bal >= minMatic) return;
+        throw new Error(`Owner wallet needs MATIC for onchain proxy tx. owner=${owner} balance=${bal} minRequired=${minMatic}`);
+    }
+
     private async redeemViaSafe(proxyWallet: string, conditionId: string): Promise<string> {
         if (!this.redeemWallet) throw new Error('Redeem wallet not configured');
         const safeAddress = String(proxyWallet || '').trim();
         if (!safeAddress) throw new Error('Missing proxy wallet');
+        await this.ensureOwnerHasGas(0.02);
 
         const CTF_ADDRESS = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045';
         const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const parentCollectionId = await this.getRedeemParentCollectionId(conditionId);
         const redeemInterface = new ethers.utils.Interface([
             'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)'
         ]);
         const redeemData = redeemInterface.encodeFunctionData('redeemPositions', [
             USDCe_ADDRESS,
-            ethers.constants.HashZero,
+            parentCollectionId,
             conditionId,
             [1, 2],
         ]);
@@ -1213,15 +1548,17 @@ export class GroupArbitrageScanner {
         if (!this.redeemWallet) throw new Error('Redeem wallet not configured');
         const proxyAddress = String(proxyWallet || '').trim();
         if (!proxyAddress) throw new Error('Missing proxy wallet');
+        await this.ensureOwnerHasGas(0.02);
 
         const CTF_ADDRESS = '0x4d97dcd97ec945f40cf65f87097ace5ea0476045';
         const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const parentCollectionId = await this.getRedeemParentCollectionId(conditionId);
         const redeemInterface = new ethers.utils.Interface([
             'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)'
         ]);
         const redeemData = redeemInterface.encodeFunctionData('redeemPositions', [
             USDCe_ADDRESS,
-            ethers.constants.HashZero,
+            parentCollectionId,
             conditionId,
             [1, 2],
         ]);
@@ -1255,6 +1592,11 @@ export class GroupArbitrageScanner {
             configLoadedAt: this.autoRedeemConfigLoadedAt,
             configPersistedAt: this.autoRedeemConfigPersistedAt,
             configPersistLastError: this.autoRedeemConfigPersistLastError,
+            historyPath: this.orderHistoryPath || null,
+            historyFilePresent: this.orderHistoryPath ? fs.existsSync(this.orderHistoryPath) : false,
+            historyLoadedAt: this.orderHistoryLoadedAt,
+            historyPersistedAt: this.orderHistoryPersistedAt,
+            historyPersistLastError: this.orderHistoryPersistLastError,
         };
     }
 
@@ -1348,6 +1690,14 @@ export class GroupArbitrageScanner {
                 r.redeemStatus = inflight.status;
                 r.transactionId = inflight.transactionId ?? r.transactionId;
                 r.txHash = inflight.txHash ?? r.txHash;
+                r.payoutUsdc = inflight.payoutUsdc ?? r.payoutUsdc;
+                r.payoutReceivedUsdc = inflight.payoutReceivedUsdc ?? r.payoutReceivedUsdc;
+                r.payoutSentUsdc = inflight.payoutSentUsdc ?? r.payoutSentUsdc;
+                r.payoutNetUsdc = inflight.payoutNetUsdc ?? r.payoutNetUsdc;
+                r.payoutRecipients = inflight.payoutRecipients ?? r.payoutRecipients;
+                r.txStatus = inflight.txStatus ?? r.txStatus;
+                r.paid = inflight.paid ?? r.paid;
+                r.usdcTransfers = inflight.usdcTransfers ?? r.usdcTransfers;
                 if (inflight.status === 'failed') {
                     r.success = false;
                     r.error = inflight.error ?? r.error;
@@ -1364,23 +1714,24 @@ export class GroupArbitrageScanner {
         const id = String(conditionId || '').trim();
         if (!id) return false;
         const r = this.redeemInFlight.get(id);
-        return !!r && r.status === 'confirmed';
+        return !!r && r.status === 'confirmed' && r.paid === true;
     }
 
-    private async redeemViaRelayerSubmit(conditionId: string): Promise<{ txType: 'PROXY' | 'SAFE'; transactionId?: string; txHash?: string }> {
+    private async redeemViaRelayerSubmit(conditionId: string, options?: { proxyWallet?: string | null; recipients?: string[] | null }): Promise<{ txType: 'PROXY' | 'SAFE'; transactionId?: string; txHash?: string }> {
         if (!this.relayerConfigured || (!this.relayerSafe && !this.relayerProxy)) {
             throw new Error('Relayer not configured');
         }
 
         const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
         const USDCe_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const parentCollectionId = await this.getRedeemParentCollectionId(conditionId);
         const ctfAbi = parseAbi([
             'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)'
         ]);
         const calldata = encodeFunctionData({
             abi: ctfAbi,
             functionName: 'redeemPositions',
-            args: [USDCe_ADDRESS, '0x0000000000000000000000000000000000000000000000000000000000000000', conditionId as any, [1n, 2n]],
+            args: [USDCe_ADDRESS, parentCollectionId as any, conditionId as any, [1n, 2n]],
         });
 
         const tx = { to: CTF_ADDRESS, data: calldata, value: '0' };
@@ -1391,7 +1742,14 @@ export class GroupArbitrageScanner {
             const resp: any = await this.withTimeout((client as any).execute([tx], `redeem ${conditionId}`), 15_000, `Relayer execute (${txType})`);
             const transactionId = resp?.transactionID || resp?.transactionId || resp?.id;
             const submittedAt = new Date().toISOString();
-            this.redeemInFlight.set(conditionId, { conditionId, submittedAt, method: `relayer_${txType.toLowerCase()}`, transactionId: transactionId ? String(transactionId) : undefined, status: 'submitted' });
+            const isAddress = (v: string) => /^0x[a-fA-F0-9]{40}$/.test(String(v || '').trim());
+            const rawRecipients = Array.isArray(options?.recipients) ? options!.recipients! : [options?.proxyWallet, this.getFunderAddress()];
+            const payoutRecipients = Array.from(new Set(rawRecipients
+                .map((a) => String(a || '').trim())
+                .filter((a) => !!a && isAddress(a))
+                .map((a) => a.toLowerCase())));
+            this.redeemInFlight.set(conditionId, { conditionId, submittedAt, method: `relayer_${txType.toLowerCase()}`, transactionId: transactionId ? String(transactionId) : undefined, status: 'submitted', payoutRecipients });
+            this.crypto15mSyncFromRedeemInFlight(conditionId);
 
             const waitPromise = (async () => {
                 try {
@@ -1400,7 +1758,27 @@ export class GroupArbitrageScanner {
                     const cur = this.redeemInFlight.get(conditionId);
                     if (cur) {
                         cur.status = 'confirmed';
-                        if (txHash) cur.txHash = String(txHash);
+                        if (txHash) {
+                            cur.txHash = String(txHash);
+                            try {
+                                const payout = await this.computeUsdcTransfersFromTxHash(cur.txHash, { recipients: cur.payoutRecipients });
+                                cur.txStatus = payout.txStatus;
+                                cur.payoutUsdc = payout.netUsdc;
+                                cur.payoutReceivedUsdc = payout.receivedUsdc;
+                                cur.payoutSentUsdc = payout.sentUsdc;
+                                cur.payoutNetUsdc = payout.netUsdc;
+                                cur.payoutRecipients = payout.recipients;
+                                cur.usdcTransfers = payout.transfers;
+                                cur.paid = payout.txStatus === 0 ? false : Number(payout.netUsdc) > 0;
+                                if (payout.txStatus !== 0 && Number(payout.netUsdc) <= 0) {
+                                    cur.status = 'failed';
+                                    cur.error = 'No USDC payout detected';
+                                }
+                                cur.payoutComputedAt = new Date().toISOString();
+                            } catch {
+                            }
+                        }
+                        this.crypto15mSyncFromRedeemInFlight(conditionId);
                     }
                 } catch (e: any) {
                     const cur = this.redeemInFlight.get(conditionId);
@@ -1408,6 +1786,7 @@ export class GroupArbitrageScanner {
                         cur.status = 'failed';
                         cur.error = e?.message || String(e);
                     }
+                    this.crypto15mSyncFromRedeemInFlight(conditionId);
                 }
             })();
             waitPromise.catch(() => null);
@@ -1421,7 +1800,7 @@ export class GroupArbitrageScanner {
             } catch (e: any) {
                 if (this.isRelayerQuotaExceeded(e)) {
                     const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
-                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId);
+                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId, options);
                     throw e;
                 }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer proxy auth failed: ${e?.message || String(e)}`);
@@ -1433,7 +1812,7 @@ export class GroupArbitrageScanner {
             } catch (e: any) {
                 if (this.isRelayerQuotaExceeded(e)) {
                     const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
-                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId);
+                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId, options);
                     throw e;
                 }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer safe auth failed: ${e?.message || String(e)}`);
@@ -1468,10 +1847,14 @@ export class GroupArbitrageScanner {
         const run = async () => {
             try {
                 const funder = this.getFunderAddress();
+                const before = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
+                const cashBefore = before?.cash != null ? Number(before.cash) : null;
+                const claimableCountBefore = before?.claimableCount != null ? Number(before.claimableCount) : null;
                 let submitted = 0;
                 let skippedInFlight = 0;
                 let errors = 0;
                 const submittedResults: any[] = [];
+                const conditionIds: string[] = [];
                 while (submitted < maxTotal) {
                     this.cleanupRedeemInFlight();
                     const positions = await this.fetchDataApiPositions(funder);
@@ -1484,13 +1867,74 @@ export class GroupArbitrageScanner {
                     }
                     const conditionId = String(next.conditionId);
                     try {
-                        if (this.relayerConfigured) {
-                            const r = await this.redeemViaRelayerSubmit(conditionId);
+                        const proxyWallet = String(next.proxyWallet || '').trim();
+                        const shouldUseSafe = !this.relayerConfigured && proxyWallet && this.redeemWallet && proxyWallet.toLowerCase() != this.redeemWallet.address.toLowerCase();
+                        if (shouldUseSafe) {
+                            let method: string = 'proxy';
+                            let txHash: string = '';
+                            try {
+                                txHash = await this.redeemViaPolymarketProxy(proxyWallet, conditionId);
+                                method = 'proxy';
+                            } catch (e1: any) {
+                                const canUseSafe = await this.isLikelyGnosisSafe(proxyWallet);
+                                if (!canUseSafe) throw e1;
+                                txHash = await this.redeemViaSafe(proxyWallet, conditionId);
+                                method = 'safe';
+                            }
+                            const payout = await this.computeUsdcTransfersFromTxHash(txHash, { recipients: [proxyWallet, funder] }).catch(() => null);
+                            const submittedAt = new Date().toISOString();
+                            this.redeemInFlight.set(conditionId, {
+                                conditionId,
+                                submittedAt,
+                                method,
+                                txHash,
+                                status: 'confirmed',
+                                txStatus: payout?.txStatus ?? 1,
+                                payoutUsdc: payout?.netUsdc ?? 0,
+                                payoutReceivedUsdc: payout?.receivedUsdc ?? 0,
+                                payoutSentUsdc: payout?.sentUsdc ?? 0,
+                                payoutNetUsdc: payout?.netUsdc ?? 0,
+                                payoutRecipients: payout?.recipients ?? [proxyWallet.toLowerCase(), funder.toLowerCase()],
+                                paid: (payout?.txStatus ?? 1) === 0 ? false : Number(payout?.netUsdc ?? 0) > 0,
+                                payoutComputedAt: new Date().toISOString(),
+                                usdcTransfers: payout?.transfers ?? [],
+                            });
+                            this.crypto15mSyncFromRedeemInFlight(conditionId);
                             submitted += 1;
+                            conditionIds.push(conditionId);
                             this.redeemDrainLast.submitted = submitted;
                             this.redeemDrainLast.remaining = redeemables.length - submitted;
                             this.autoRedeemLast = { at: new Date().toISOString(), source, count: submitted, ok: submitted, fail: 0 };
-                        this.autoRedeemLastError = null;
+                            this.autoRedeemLastError = null;
+                            submittedResults.push({
+                                success: true,
+                                confirmed: true,
+                                redeemStatus: 'confirmed',
+                                conditionId,
+                                title: next.title,
+                                outcome: next.outcome,
+                                slug: next.slug,
+                                eventSlug: next.eventSlug,
+                                polymarketUrl: this.buildPolymarketMarketUrlFromSlug(next.slug),
+                                txHash,
+                                method,
+                                payoutUsdc: payout?.netUsdc ?? 0,
+                                payoutReceivedUsdc: payout?.receivedUsdc ?? 0,
+                                payoutSentUsdc: payout?.sentUsdc ?? 0,
+                                payoutNetUsdc: payout?.netUsdc ?? 0,
+                                payoutRecipients: payout?.recipients ?? [proxyWallet.toLowerCase(), funder.toLowerCase()],
+                                txStatus: payout?.txStatus ?? 1,
+                                paid: (payout?.txStatus ?? 1) === 0 ? false : Number(payout?.netUsdc ?? 0) > 0,
+                                usdcTransfers: payout?.transfers ?? [],
+                            });
+                        } else if (this.relayerConfigured) {
+                            const r = await this.redeemViaRelayerSubmit(conditionId, { proxyWallet: next.proxyWallet });
+                            submitted += 1;
+                            conditionIds.push(conditionId);
+                            this.redeemDrainLast.submitted = submitted;
+                            this.redeemDrainLast.remaining = redeemables.length - submitted;
+                            this.autoRedeemLast = { at: new Date().toISOString(), source, count: submitted, ok: submitted, fail: 0 };
+                            this.autoRedeemLastError = null;
                             submittedResults.push({
                                 success: true,
                                 confirmed: false,
@@ -1522,6 +1966,7 @@ export class GroupArbitrageScanner {
                         const error = e?.message || String(e);
                         const submittedAt = new Date().toISOString();
                         this.redeemInFlight.set(conditionId, { conditionId, submittedAt, method: 'redeem_failed', status: 'failed', error });
+                        this.crypto15mSyncFromRedeemInFlight(conditionId);
                         submittedResults.push({
                             success: false,
                             confirmed: false,
@@ -1545,6 +1990,52 @@ export class GroupArbitrageScanner {
                 }
                 this.redeemDrainLast.skippedInFlight = skippedInFlight;
                 this.redeemDrainLast.errors = errors;
+
+                if (source === 'manual' && conditionIds.length) {
+                    const start = Date.now();
+                    const timeoutMs = 3 * 60_000;
+                    while (Date.now() - start < timeoutMs) {
+                        const pending = conditionIds.filter((id) => {
+                            const st = this.redeemInFlight.get(id)?.status;
+                            return st === 'submitted' || !st;
+                        });
+                        if (!pending.length) break;
+                        await new Promise(r => setTimeout(r, 750));
+                    }
+                }
+
+                for (const r of submittedResults) {
+                    const cid = r?.conditionId ? String(r.conditionId) : '';
+                    if (!cid) continue;
+                    const inflight = this.redeemInFlight.get(cid);
+                    if (!inflight) continue;
+                    r.redeemStatus = inflight.status;
+                    r.txHash = inflight.txHash ?? r.txHash;
+                    r.payoutUsdc = inflight.payoutUsdc ?? r.payoutUsdc;
+                    r.payoutReceivedUsdc = inflight.payoutReceivedUsdc ?? r.payoutReceivedUsdc;
+                    r.payoutSentUsdc = inflight.payoutSentUsdc ?? r.payoutSentUsdc;
+                    r.payoutNetUsdc = inflight.payoutNetUsdc ?? r.payoutNetUsdc;
+                    r.payoutRecipients = inflight.payoutRecipients ?? r.payoutRecipients;
+                    r.txStatus = inflight.txStatus ?? r.txStatus;
+                    r.paid = inflight.paid ?? r.paid;
+                    r.usdcTransfers = inflight.usdcTransfers ?? r.usdcTransfers;
+                    if (inflight.status === 'confirmed') r.confirmed = true;
+                    if (inflight.status === 'failed') {
+                        r.success = false;
+                        r.error = inflight.error ?? r.error;
+                        r.errorSummary = this.summarizeErrorMessage(r.error);
+                    }
+                }
+
+                const after = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
+                const cashAfter = after?.cash != null ? Number(after.cash) : null;
+                const claimableCountAfter = after?.claimableCount != null ? Number(after.claimableCount) : null;
+                const cashDelta = cashBefore != null && cashAfter != null ? (cashAfter - cashBefore) : null;
+                this.redeemDrainLast.cashBefore = cashBefore;
+                this.redeemDrainLast.cashAfter = cashAfter;
+                this.redeemDrainLast.cashDelta = cashDelta;
+                this.redeemDrainLast.claimableCountBefore = claimableCountBefore;
+                this.redeemDrainLast.claimableCountAfter = claimableCountAfter;
                 if (submittedResults.length) {
                     this.orderHistory.unshift({
                         id: Date.now(),
@@ -1552,9 +2043,15 @@ export class GroupArbitrageScanner {
                         marketQuestion: `Redeem batch (${submittedResults.length})`,
                         mode: source,
                         action: 'redeem',
+                        cashBefore,
+                        cashAfter,
+                        cashDelta,
+                        claimableCountBefore,
+                        claimableCountAfter,
                         results: submittedResults,
                     });
                     if (this.orderHistory.length > 50) this.orderHistory.pop();
+                    this.schedulePersistOrderHistory();
                 }
             } finally {
                 this.redeemDrainRunning = false;
@@ -1635,6 +2132,507 @@ export class GroupArbitrageScanner {
         return this.autoRedeemConfig;
     }
 
+    private async fetchGammaJson(url: string): Promise<any> {
+        const headers: any = {
+            'accept': 'application/json, text/plain, */*',
+            'user-agent': 'Mozilla/5.0 (compatible; polymarket-tools/1.0)',
+        };
+        const res = await fetch(url, { headers });
+        if (!res.ok) {
+            const retryAfter = res.headers?.get ? res.headers.get('retry-after') : null;
+            const err: any = new Error(`Gamma API failed (${res.status})`);
+            if (res.status === 429) {
+                const sec = retryAfter != null && retryAfter !== '' ? Number(retryAfter) : NaN;
+                err.retryAfterMs = Number.isFinite(sec) ? Math.max(1, sec) * 1000 : 60_000;
+            }
+            throw err;
+        }
+        return await res.json();
+    }
+
+    private tryParseJsonArray(raw: any): any[] {
+        if (Array.isArray(raw)) return raw;
+        try {
+            const parsed = JSON.parse(String(raw || '[]'));
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+
+    private async resolveCryptoTagId(): Promise<string | null> {
+        if (this.crypto15mCryptoTagId) return this.crypto15mCryptoTagId;
+        try {
+            const tags = await this.fetchGammaJson('https://gamma-api.polymarket.com/tags?limit=200');
+            const list = Array.isArray(tags) ? tags : [];
+            const t = list.find((x: any) => String(x?.slug || '').toLowerCase() === 'crypto' || String(x?.label || '').toLowerCase() === 'crypto');
+            const id = t?.id != null ? String(t.id) : null;
+            if (id) this.crypto15mCryptoTagId = id;
+            return id;
+        } catch {
+            return null;
+        }
+    }
+
+    private async fetchCrypto15mSlugsFromSite(limit: number): Promise<string[]> {
+        try {
+            const headers: any = {
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+            };
+            const res = await fetch('https://polymarket.com/crypto/15M', { headers });
+            if (!res.ok) return [];
+            const html = await res.text();
+            const slugs: string[] = [];
+            const re = /\/event\/([a-z0-9-]{6,})/gi;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(html)) && slugs.length < limit * 3) {
+                slugs.push(String(m[1]).toLowerCase());
+            }
+            return Array.from(new Set(slugs)).slice(0, limit);
+        } catch {
+            return [];
+        }
+    }
+
+    private findObjectDeep(root: any, predicate: (x: any) => boolean): any | null {
+        const seen = new Set<any>();
+        const stack: any[] = [root];
+        while (stack.length) {
+            const cur = stack.pop();
+            if (!cur || typeof cur !== 'object') continue;
+            if (seen.has(cur)) continue;
+            seen.add(cur);
+            try {
+                if (predicate(cur)) return cur;
+            } catch {
+            }
+            if (Array.isArray(cur)) {
+                for (const v of cur) stack.push(v);
+            } else {
+                for (const v of Object.values(cur)) stack.push(v);
+            }
+        }
+        return null;
+    }
+
+    private async fetchEventMarketFromSite(eventSlug: string): Promise<any | null> {
+        try {
+            const url = `https://polymarket.com/event/${encodeURIComponent(eventSlug)}`;
+            const headers: any = {
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+            };
+            const res = await fetch(url, { headers });
+            if (!res.ok) return null;
+            const html = await res.text();
+            const m = html.match(/id=\"__NEXT_DATA__\"[^>]*>([\s\S]*?)<\/script>/i);
+            if (!m || !m[1]) return null;
+            const data = JSON.parse(m[1]);
+            const found = this.findObjectDeep(data, (x: any) => x?.slug === eventSlug && x?.conditionId && x?.outcomes && x?.outcomePrices && x?.clobTokenIds);
+            return found;
+        } catch {
+            return null;
+        }
+    }
+
+    async getCrypto15mCandidates(options?: { minProb?: number; expiresWithinSec?: number; limit?: number }) {
+        const minProb = Math.max(0, Math.min(1, Number(options?.minProb ?? this.crypto15mAutoConfig.minProb)));
+        const expiresWithinSec = Math.max(5, Math.floor(Number(options?.expiresWithinSec ?? this.crypto15mAutoConfig.expiresWithinSec)));
+        const limit = Math.max(1, Math.floor(Number(options?.limit ?? 20)));
+
+        const now = Date.now();
+        const is15m = (m: any) => {
+            const title = String(m?.question || m?.title || '').toLowerCase();
+            const slug = String(m?.slug || '').toLowerCase();
+            const has15m = /\b15\s*(m|min|mins|minute|minutes)\b/.test(title) || slug.includes('15m') || slug.includes('15-min') || slug.includes('-15m-');
+            const hasUpDown = title.includes('up or down') || title.includes('up/down') || title.includes('updown') || slug.includes('updown');
+            return has15m && hasUpDown;
+        };
+
+        const markets: any[] = [];
+
+        const slugs = await this.fetchCrypto15mSlugsFromSite(30);
+        const priorityPrefixes = ['btc-updown-15m', 'eth-updown-15m', 'sol-updown-15m'];
+        const nowSec = Math.floor(now / 1000);
+        const getSymbolFromSlug = (slug: string): string | null => {
+            const s = String(slug || '').toLowerCase();
+            if (s.startsWith('btc-')) return 'BTC';
+            if (s.startsWith('eth-')) return 'ETH';
+            if (s.startsWith('sol-')) return 'SOL';
+            return null;
+        };
+        const parseStartSecFromSlug = (slug: string): number | null => {
+            const parts = String(slug || '').split('-');
+            const last = parts[parts.length - 1];
+            const n = Number(last);
+            if (!Number.isFinite(n)) return null;
+            if (n < 1_500_000_000) return null;
+            return Math.floor(n);
+        };
+        const uniqueSlugs = Array.from(new Set(slugs));
+        const candidateSlugs = uniqueSlugs
+            .filter(s => priorityPrefixes.some(p => s.startsWith(p)))
+            .map(s => {
+                const startSec = parseStartSecFromSlug(s);
+                const endSec = startSec != null ? startSec + 15 * 60 : null;
+                return { slug: s, startSec, endSec };
+            })
+            .filter(x => x.endSec != null && (x.endSec as number) >= nowSec - 60)
+            .sort((a, b) => (a.endSec as number) - (b.endSec as number));
+
+        const picked: string[] = [];
+        for (const prefix of priorityPrefixes) {
+            const next = candidateSlugs.find(x => x.slug.startsWith(prefix) && (x.endSec as number) >= nowSec);
+            if (next) picked.push(next.slug);
+        }
+        const orderedSlugs = Array.from(new Set(picked.concat(candidateSlugs.slice(0, 6).map(x => x.slug)))).slice(0, 8);
+
+        for (const eventSlug of orderedSlugs) {
+            const m = await this.fetchEventMarketFromSite(eventSlug);
+            if (m) markets.push(m);
+        }
+
+        if (!markets.length) {
+            const tagId = await this.resolveCryptoTagId();
+            const tagParam = tagId ? `&tag_id=${encodeURIComponent(tagId)}` : '';
+            const url = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&offset=0${tagParam}`;
+            const data = await this.fetchGammaJson(url);
+            if (Array.isArray(data)) markets.push(...data);
+        }
+
+        const candidates: any[] = [];
+        for (const m of markets) {
+            if (!m || !is15m(m)) continue;
+            const conditionId = String(m?.conditionId || m?.condition_id || '').trim();
+            if (!conditionId || !conditionId.startsWith('0x')) continue;
+            const end = m?.endDateIso || m?.endDate || m?.umaEndDateIso || m?.umaEndDate;
+            const slugStartSec = parseStartSecFromSlug(String(m?.slug || ''));
+            let endMs = slugStartSec != null ? (slugStartSec + 15 * 60) * 1000 : Date.parse(String(end || ''));
+            if (!Number.isFinite(endMs)) endMs = Date.parse(String(end || ''));
+            if (!Number.isFinite(endMs)) continue;
+            const secondsToExpire = Math.floor((endMs - now) / 1000);
+            if (!(secondsToExpire > 0)) continue;
+
+            const outcomes = this.tryParseJsonArray(m?.outcomes);
+            const tokenIds = this.tryParseJsonArray(m?.clobTokenIds);
+            if (outcomes.length < 2 || tokenIds.length < 2) continue;
+            const outsLower = outcomes.map(x => x.toLowerCase());
+            const hasUp = outsLower.some(x => x.includes('up'));
+            const hasDown = outsLower.some(x => x.includes('down'));
+            if (!hasUp || !hasDown) continue;
+
+            const books = await Promise.allSettled(tokenIds.slice(0, 2).map((t: any) => {
+                const tokenId = String(t ?? '').trim();
+                if (!tokenId) return Promise.resolve(null as any);
+                return withRetry(() => this.sdk.clobApi.getOrderbook(tokenId), { maxRetries: 1 });
+            }));
+            const prices = books.map((r: any) => {
+                if (r?.status !== 'fulfilled') return NaN;
+                const ob = r.value;
+                const bestAsk = Number(ob?.asks?.[0]?.price);
+                return Number.isFinite(bestAsk) && bestAsk > 0 ? bestAsk : NaN;
+            });
+            if (!Number.isFinite(prices[0]) || !Number.isFinite(prices[1])) continue;
+
+            let bestIdx = -1;
+            let bestPrice = -1;
+            for (let i = 0; i < Math.min(outcomes.length, tokenIds.length, prices.length); i++) {
+                const pr = Number(prices[i]);
+                if (!Number.isFinite(pr)) continue;
+                if (pr > bestPrice) {
+                    bestPrice = pr;
+                    bestIdx = i;
+                }
+            }
+            if (bestIdx < 0) continue;
+
+            candidates.push({
+                symbol: getSymbolFromSlug(String(m?.slug || '')),
+                conditionId,
+                slug: m?.slug,
+                title: m?.question || m?.title,
+                endDate: new Date(endMs).toISOString(),
+                secondsToExpire,
+                eligibleByExpiry: secondsToExpire <= expiresWithinSec,
+                meetsMinProb: bestPrice >= minProb,
+                outcomes: outcomes.slice(0, 2),
+                prices: prices.slice(0, 2),
+                tokenIds: tokenIds.slice(0, 2),
+                chosenIndex: bestIdx,
+                chosenOutcome: String(outcomes[bestIdx]),
+                chosenPrice: bestPrice,
+                chosenTokenId: String(tokenIds[bestIdx]),
+            });
+        }
+
+        candidates.sort((a, b) => (b.meetsMinProb ? 1 : 0) - (a.meetsMinProb ? 1 : 0) || b.chosenPrice - a.chosenPrice || a.secondsToExpire - b.secondsToExpire);
+        const countEligible = candidates.filter(c => c.meetsMinProb && c.eligibleByExpiry).length;
+        return { success: true, count: candidates.length, countEligible, candidates: candidates.slice(0, limit) };
+    }
+
+    getCrypto15mStatus() {
+        this.crypto15mUpdateTracking(Date.now());
+        const actives: any = {};
+        for (const [symbol, a] of this.crypto15mActivesBySymbol.entries()) {
+            actives[symbol] = a;
+        }
+        const tracked = Array.from(this.crypto15mTrackedByCondition.values())
+            .sort((a: any, b: any) => String(b?.startedAt || '').localeCompare(String(a?.startedAt || '')))
+            .slice(0, 50);
+        return {
+            enabled: this.crypto15mAutoEnabled,
+            config: this.crypto15mAutoConfig,
+            lastScanAt: this.crypto15mLastScanAt,
+            lastError: this.crypto15mLastError,
+            actives,
+            tracked,
+        };
+    }
+
+    private crypto15mUpdateTracking(nowMs: number) {
+        for (const [symbol, a] of this.crypto15mActivesBySymbol.entries()) {
+            const endMs = a?.expiresAtMs != null ? Number(a.expiresAtMs) : Date.parse(String(a?.endDate || ''));
+            if (Number.isFinite(endMs) && nowMs > endMs) {
+                const expired = { ...a, phase: 'expired', expiredAt: new Date(nowMs).toISOString() };
+                this.crypto15mTrackedByCondition.set(String(expired.conditionId), expired);
+                this.crypto15mActivesBySymbol.delete(symbol);
+                this.crypto15mCooldownUntilBySymbol.set(symbol, nowMs + 2_000);
+            }
+        }
+        const cutoff = nowMs - 48 * 60 * 60_000;
+        for (const [cid, a] of this.crypto15mTrackedByCondition.entries()) {
+            const started = Date.parse(String(a?.startedAt || a?.started_at || ''));
+            if (Number.isFinite(started) && started < cutoff) this.crypto15mTrackedByCondition.delete(cid);
+        }
+    }
+
+    private crypto15mUpdateTracked(conditionId: string, updater: (cur: any) => any) {
+        const cid = String(conditionId || '').trim();
+        if (!cid) return;
+        const cur = this.crypto15mTrackedByCondition.get(cid);
+        if (!cur) return;
+        const next = updater(cur);
+        this.crypto15mTrackedByCondition.set(cid, next);
+        const symbol = String(next?.symbol || '').toUpperCase();
+        if (symbol && this.crypto15mActivesBySymbol.get(symbol)?.conditionId === cid) {
+            this.crypto15mActivesBySymbol.set(symbol, next);
+        }
+    }
+
+    private crypto15mSyncFromRedeemInFlight(conditionId: string) {
+        const cid = String(conditionId || '').trim();
+        if (!cid) return;
+        const r = this.redeemInFlight.get(cid);
+        if (!r) return;
+        this.crypto15mUpdateTracked(cid, (cur) => ({
+            ...cur,
+            redeemStatus: r.status,
+            redeemMethod: r.method,
+            redeemTransactionId: r.transactionId ?? cur.redeemTransactionId,
+            redeemTxHash: r.txHash ?? cur.redeemTxHash,
+            redeemPaid: r.paid ?? cur.redeemPaid,
+            redeemPayoutUsdc: r.payoutNetUsdc ?? r.payoutUsdc ?? cur.redeemPayoutUsdc,
+            redeemUpdatedAt: new Date().toISOString(),
+            phase: r.status === 'confirmed' && r.paid === true ? 'redeemed' : r.status === 'failed' ? 'redeem_failed' : cur.phase,
+        }));
+    }
+
+    private async crypto15mTryAutoOnce() {
+        if (!this.crypto15mAutoEnabled) return;
+        if (Date.now() < this.crypto15mNextScanAllowedAtMs) return;
+        if (!this.hasValidKey) {
+            this.crypto15mLastError = 'Missing private key';
+            return;
+        }
+        const nowMs = Date.now();
+        this.crypto15mUpdateTracking(nowMs);
+        this.crypto15mLastScanAt = new Date(nowMs).toISOString();
+        try {
+            const r = await this.getCrypto15mCandidates({ minProb: this.crypto15mAutoConfig.minProb, expiresWithinSec: this.crypto15mAutoConfig.expiresWithinSec, limit: 30 });
+            const candidates = Array.isArray((r as any)?.candidates) ? (r as any).candidates : [];
+            const symbols = ['BTC', 'ETH', 'SOL'];
+            for (const symbol of symbols) {
+                if (this.crypto15mActivesBySymbol.has(symbol)) continue;
+                const cd = this.crypto15mCooldownUntilBySymbol.get(symbol);
+                if (cd != null && nowMs < cd) continue;
+                const pick = candidates.find((c: any) => String(c?.symbol || '').toUpperCase() === symbol && c?.eligibleByExpiry && c?.meetsMinProb) || null;
+                if (!pick) continue;
+                const cid = String(pick.conditionId || '');
+                if (cid && this.crypto15mTrackedByCondition.has(cid)) continue;
+                await this.placeCrypto15mOrder({
+                    conditionId: cid,
+                    outcomeIndex: Number(pick.chosenIndex),
+                    amountUsd: this.crypto15mAutoConfig.amountUsd,
+                    minPrice: this.crypto15mAutoConfig.minProb,
+                    source: 'auto',
+                    symbol,
+                    endDate: pick.endDate,
+                    secondsToExpire: pick.secondsToExpire,
+                    chosenPrice: pick.chosenPrice,
+                });
+            }
+        } catch (e: any) {
+            if (e?.retryAfterMs != null || String(e?.message || '').includes('(429)')) {
+                const retryAfterMs = e?.retryAfterMs != null ? Number(e.retryAfterMs) : 60_000;
+                this.crypto15mNextScanAllowedAtMs = Date.now() + Math.max(5_000, retryAfterMs);
+            }
+            this.crypto15mLastError = e?.message || String(e);
+        }
+    }
+
+    startCrypto15mAuto(config?: { enabled?: boolean; amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number }) {
+        const enabled = config?.enabled != null ? !!config.enabled : true;
+        const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mAutoConfig.amountUsd;
+        const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mAutoConfig.minProb;
+        const expiresWithinSec = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec;
+        const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mAutoConfig.pollMs;
+
+        this.crypto15mAutoConfig = {
+            pollMs: Math.max(500, Math.floor(pollMs)),
+            expiresWithinSec: Math.max(5, Math.floor(expiresWithinSec)),
+            minProb: Math.max(0, Math.min(1, minProb)),
+            amountUsd: Math.max(0.5, Number.isFinite(amountUsd) ? amountUsd : 1),
+        };
+
+        this.crypto15mAutoEnabled = enabled;
+        this.crypto15mLastError = null;
+
+        if (this.crypto15mAutoTimer) {
+            clearInterval(this.crypto15mAutoTimer);
+            this.crypto15mAutoTimer = null;
+        }
+
+        if (this.crypto15mAutoEnabled) {
+            const tick = () => {
+                this.crypto15mTryAutoOnce().catch(() => {});
+            };
+            tick();
+            this.crypto15mAutoTimer = setInterval(tick, this.crypto15mAutoConfig.pollMs);
+            if (!this.autoRedeemConfig.enabled) {
+                this.setAutoRedeemConfig({ enabled: true, persist: true });
+            }
+        }
+
+        return this.getCrypto15mStatus();
+    }
+
+    stopCrypto15mAuto() {
+        this.crypto15mAutoEnabled = false;
+        if (this.crypto15mAutoTimer) {
+            clearInterval(this.crypto15mAutoTimer);
+            this.crypto15mAutoTimer = null;
+        }
+        return this.getCrypto15mStatus();
+    }
+
+    resetCrypto15mActive() {
+        this.crypto15mActivesBySymbol.clear();
+        this.crypto15mTrackedByCondition.clear();
+        this.crypto15mCooldownUntilBySymbol.clear();
+        return this.getCrypto15mStatus();
+    }
+
+    async placeCrypto15mOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number }) {
+        if (!this.hasValidKey) throw new Error('Missing private key');
+        const conditionId = String(params.conditionId || '').trim();
+        if (!conditionId) throw new Error('Missing conditionId');
+        const amountUsd = params.amountUsd != null ? Number(params.amountUsd) : this.crypto15mAutoConfig.amountUsd;
+        const source = params.source || 'semi';
+        const force = params.force === true;
+        const minPrice = params.minPrice != null ? Number(params.minPrice) : this.crypto15mAutoConfig.minProb;
+
+        const market = await withRetry(() => this.sdk.clobApi.getMarket(conditionId), { maxRetries: 2 });
+        const tokens = Array.isArray(market?.tokens) ? market.tokens : [];
+        if (tokens.length < 2) throw new Error('Invalid market tokens');
+        const idx = params.outcomeIndex != null ? Math.max(0, Math.min(tokens.length - 1, Math.floor(Number(params.outcomeIndex)))) : 0;
+        const tok = tokens[idx];
+        const tokenId = String(tok?.token_id ?? tok?.tokenId ?? tok?.id ?? '').trim();
+        if (!tokenId) throw new Error('Missing tokenId');
+        const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
+        const ob = await withRetry(() => this.sdk.clobApi.getOrderbook(tokenId), { maxRetries: 1 }).catch(() => null);
+        const bestAsk = Number(ob?.asks?.[0]?.price);
+        const price = Number.isFinite(bestAsk) && bestAsk > 0 ? bestAsk : Number(tok?.price ?? tok?.last_price ?? tok?.lastPrice ?? 0);
+        if (!force && Number.isFinite(minPrice) && minPrice > 0 && (!Number.isFinite(price) || price < minPrice)) {
+            throw new Error(`Price below threshold: bestAsk=${Number.isFinite(price) ? price : 'N/A'} < minPrice=${minPrice}`);
+        }
+
+        const order = await this.tradingClient.createMarketOrder({
+            tokenId,
+            side: 'BUY',
+            amount: Math.max(0.5, amountUsd),
+            orderType: 'FOK',
+        });
+
+        const marketSlug = String(market?.market_slug ?? market?.marketSlug ?? '');
+        const q = String(market?.question || '');
+        const symbol = String(params.symbol || (marketSlug.toLowerCase().startsWith('btc-') ? 'BTC' : marketSlug.toLowerCase().startsWith('eth-') ? 'ETH' : marketSlug.toLowerCase().startsWith('sol-') ? 'SOL' : q.toLowerCase().includes('bitcoin') ? 'BTC' : q.toLowerCase().includes('ethereum') ? 'ETH' : q.toLowerCase().includes('solana') ? 'SOL' : 'UNKNOWN'));
+        let endDate: string | null = params.endDate != null ? String(params.endDate) : null;
+        if (!endDate && marketSlug.includes('-15m-')) {
+            const parts = marketSlug.split('-');
+            const last = parts[parts.length - 1];
+            const n = Number(last);
+            if (Number.isFinite(n) && n > 1_500_000_000) {
+                const endMs = (Math.floor(n) + 15 * 60) * 1000;
+                endDate = new Date(endMs).toISOString();
+            }
+        }
+        const expiresAtMs = endDate ? Date.parse(endDate) : NaN;
+        if (symbol && symbol !== 'UNKNOWN') {
+            if (this.crypto15mActivesBySymbol.has(symbol)) throw new Error(`Crypto15m already has an active order for ${symbol}`);
+        }
+
+        const entry = {
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            mode: source,
+            action: 'crypto15m_order',
+            marketId: conditionId,
+            symbol,
+            slug: marketSlug || undefined,
+            marketQuestion: market?.question,
+            outcome,
+            price,
+            amountUsd: Math.max(0.5, amountUsd),
+            results: [{ ...order, tokenId, outcome, conditionId }],
+        };
+        this.orderHistory.unshift(entry);
+        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+
+        const active = {
+            startedAt: entry.timestamp,
+            phase: order?.success ? 'ordered' : 'failed',
+            symbol,
+            conditionId,
+            tokenId,
+            outcome,
+            price,
+            amountUsd: Math.max(0.5, amountUsd),
+            source,
+            orderId: order?.orderId ?? order?.id ?? null,
+            order,
+            endDate,
+            expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : null,
+            secondsToExpire: params.secondsToExpire,
+            chosenPrice: params.chosenPrice,
+        };
+        this.crypto15mTrackedByCondition.set(conditionId, active);
+        if (active.phase === 'ordered' && symbol && symbol !== 'UNKNOWN') {
+            this.crypto15mActivesBySymbol.set(symbol, active);
+        } else if (symbol && symbol !== 'UNKNOWN') {
+            this.crypto15mCooldownUntilBySymbol.set(symbol, Date.now() + 5_000);
+        }
+
+        return { success: true, active, order };
+    }
+
     async redeemNow(options?: { max?: number; source?: 'manual' | 'auto' }): Promise<any> {
         if (!this.ctf || !this.hasValidKey) {
             return { success: false, error: 'CTF not configured (missing private key)' };
@@ -1652,25 +2650,21 @@ export class GroupArbitrageScanner {
             const conditionId = String(p.conditionId);
 
             try {
-                if (this.relayerConfigured) {
-                    const relayed = await this.redeemViaRelayerSubmit(conditionId);
-                    results.push({ success: true, confirmed: false, redeemStatus: 'submitted', conditionId, title: p.title, outcome: p.outcome, txHash: relayed.txHash, transactionId: relayed.transactionId, method: `relayer_${relayed.txType.toLowerCase()}` });
-                    continue;
-                }
                 const proxyWallet = String(p.proxyWallet || '').trim();
-                const shouldUseSafe = proxyWallet && this.redeemWallet && proxyWallet.toLowerCase() != this.redeemWallet.address.toLowerCase();
+                const shouldUseSafe = !this.relayerConfigured && proxyWallet && this.redeemWallet && proxyWallet.toLowerCase() != this.redeemWallet.address.toLowerCase();
 
-                if (shouldUseSafe) {
+                if (this.relayerConfigured) {
+                    const relayed = await this.redeemViaRelayerSubmit(conditionId, { proxyWallet: p.proxyWallet });
+                    results.push({ success: true, confirmed: false, redeemStatus: 'submitted', conditionId, title: p.title, outcome: p.outcome, txHash: relayed.txHash, transactionId: relayed.transactionId, method: `relayer_${relayed.txType.toLowerCase()}` });
+                } else if (shouldUseSafe) {
                     try {
                         const txHash = await this.redeemViaPolymarketProxy(proxyWallet, conditionId);
                         results.push({ success: true, conditionId, title: p.title, outcome: p.outcome, txHash, method: 'proxy', proxyWallet });
                     } catch (e1: any) {
-                        try {
-                            const txHash = await this.redeemViaSafe(proxyWallet, conditionId);
-                            results.push({ success: true, conditionId, title: p.title, outcome: p.outcome, txHash, method: 'safe', proxyWallet, proxyError: e1?.message || String(e1) });
-                        } catch (e2: any) {
-                            throw new Error(`proxy: ${e1?.message || String(e1)}; safe: ${e2?.message || String(e2)}`);
-                        }
+                        const canUseSafe = await this.isLikelyGnosisSafe(proxyWallet);
+                        if (!canUseSafe) throw e1;
+                        const txHash = await this.redeemViaSafe(proxyWallet, conditionId);
+                        results.push({ success: true, conditionId, title: p.title, outcome: p.outcome, txHash, method: 'safe', proxyWallet, proxyError: e1?.message || String(e1) });
                     }
                 } else {
                     const market = await withRetry(() => this.sdk.clobApi.getMarket(conditionId), { maxRetries: 2 });
@@ -1700,6 +2694,7 @@ export class GroupArbitrageScanner {
         };
         this.orderHistory.unshift(entry);
         if (this.orderHistory.length > 50) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
 
         const okCount = results.filter(r => r.success).length;
         const failCount = results.filter(r => !r.success).length;
@@ -1715,25 +2710,108 @@ export class GroupArbitrageScanner {
         return { success: true, funder, count: results.length, results };
     }
 
-    async redeemByConditions(items: Array<{ conditionId: string; title?: string; slug?: string; eventSlug?: string; outcome?: string }>, options?: { source?: 'manual' | 'auto' }) {
+    async redeemByConditions(items: Array<{ conditionId: string; title?: string; slug?: string; eventSlug?: string; outcome?: string }>, options?: { source?: 'manual' | 'auto'; force?: boolean }) {
         const list = Array.isArray(items) ? items : [];
         const source = options?.source || 'manual';
+        const force = options?.force === true;
+        const before = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
+        const cashBefore = before?.cash != null ? Number(before.cash) : null;
+        const claimableCountBefore = before?.claimableCount != null ? Number(before.claimableCount) : null;
+        const funder = this.getFunderAddress();
+        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
+        const conditionToMeta = new Map((Array.isArray(positions) ? positions : [])
+            .map((p: any) => [String(p?.conditionId || '').trim(), { proxyWallet: String(p?.proxyWallet || '').trim(), redeemable: !!p?.redeemable, title: p?.title, slug: p?.slug, eventSlug: p?.eventSlug, outcome: p?.outcome }] as const)
+            .filter(([cid]) => !!cid));
         const results: any[] = [];
+        const conditionIds: string[] = [];
         for (const it of list) {
             const conditionId = String(it?.conditionId || '').trim();
             if (!conditionId) continue;
+            conditionIds.push(conditionId);
             try {
-                if (this.relayerConfigured) {
-                    const r = await this.redeemViaRelayerSubmit(conditionId);
+                const meta = conditionToMeta.get(conditionId);
+                if (!force && meta && meta.redeemable === false) {
+                    results.push({
+                        success: false,
+                        confirmed: false,
+                        redeemStatus: 'skipped',
+                        conditionId,
+                        title: it?.title ?? meta.title,
+                        outcome: it?.outcome ?? meta.outcome,
+                        slug: it?.slug ?? meta.slug,
+                        eventSlug: it?.eventSlug ?? meta.eventSlug,
+                        polymarketUrl: this.buildPolymarketMarketUrlFromSlug(it?.slug ?? meta.slug),
+                        error: 'Not redeemable yet (data-api redeemable=false)',
+                        errorSummary: 'Not redeemable yet',
+                    });
+                    continue;
+                }
+
+                const proxyWallet = String(meta?.proxyWallet || '').trim();
+                const shouldUseSafe = !this.relayerConfigured && proxyWallet && this.redeemWallet && proxyWallet.toLowerCase() != this.redeemWallet.address.toLowerCase();
+                if (shouldUseSafe) {
+                    let method: string = 'proxy';
+                    let txHash: string = '';
+                    try {
+                        txHash = await this.redeemViaPolymarketProxy(proxyWallet, conditionId);
+                        method = 'proxy';
+                    } catch (e1: any) {
+                        const canUseSafe = await this.isLikelyGnosisSafe(proxyWallet);
+                        if (!canUseSafe) throw e1;
+                        txHash = await this.redeemViaSafe(proxyWallet, conditionId);
+                        method = 'safe';
+                    }
+                    const payout = await this.computeUsdcTransfersFromTxHash(txHash, { recipients: [proxyWallet, funder] }).catch(() => null);
+                    const submittedAt = new Date().toISOString();
+                    this.redeemInFlight.set(conditionId, {
+                        conditionId,
+                        submittedAt,
+                        method,
+                        txHash,
+                        status: 'confirmed',
+                        txStatus: payout?.txStatus ?? 1,
+                        payoutUsdc: payout?.netUsdc ?? 0,
+                        payoutReceivedUsdc: payout?.receivedUsdc ?? 0,
+                        payoutSentUsdc: payout?.sentUsdc ?? 0,
+                        payoutNetUsdc: payout?.netUsdc ?? 0,
+                        payoutRecipients: payout?.recipients ?? [proxyWallet.toLowerCase(), funder.toLowerCase()],
+                        paid: (payout?.txStatus ?? 1) === 0 ? false : Number(payout?.netUsdc ?? 0) > 0,
+                        payoutComputedAt: new Date().toISOString(),
+                        usdcTransfers: payout?.transfers ?? [],
+                    });
+                    this.crypto15mSyncFromRedeemInFlight(conditionId);
+                    results.push({
+                        success: true,
+                        confirmed: true,
+                        redeemStatus: 'confirmed',
+                        conditionId,
+                        title: it?.title ?? meta?.title,
+                        outcome: it?.outcome ?? meta?.outcome,
+                        slug: it?.slug ?? meta?.slug,
+                        eventSlug: it?.eventSlug ?? meta?.eventSlug,
+                        polymarketUrl: this.buildPolymarketMarketUrlFromSlug(it?.slug),
+                        txHash,
+                        method,
+                        payoutUsdc: payout?.netUsdc ?? 0,
+                        payoutReceivedUsdc: payout?.receivedUsdc ?? 0,
+                        payoutSentUsdc: payout?.sentUsdc ?? 0,
+                        payoutNetUsdc: payout?.netUsdc ?? 0,
+                        payoutRecipients: payout?.recipients ?? [proxyWallet.toLowerCase(), funder.toLowerCase()],
+                        txStatus: payout?.txStatus ?? 1,
+                        paid: (payout?.txStatus ?? 1) === 0 ? false : Number(payout?.netUsdc ?? 0) > 0,
+                        usdcTransfers: payout?.transfers ?? [],
+                    });
+                } else if (this.relayerConfigured) {
+                    const r = await this.redeemViaRelayerSubmit(conditionId, { proxyWallet: proxyWallet });
                     results.push({
                         success: true,
                         confirmed: false,
                         redeemStatus: 'submitted',
                         conditionId,
-                        title: it?.title,
-                        outcome: it?.outcome,
-                        slug: it?.slug,
-                        eventSlug: it?.eventSlug,
+                        title: it?.title ?? meta?.title,
+                        outcome: it?.outcome ?? meta?.outcome,
+                        slug: it?.slug ?? meta?.slug,
+                        eventSlug: it?.eventSlug ?? meta?.eventSlug,
                         polymarketUrl: this.buildPolymarketMarketUrlFromSlug(it?.slug),
                         transactionId: r?.transactionId,
                         method: `relayer_${String(r?.txType || '').toLowerCase()}`,
@@ -1747,6 +2825,7 @@ export class GroupArbitrageScanner {
                 const error = e?.message || String(e);
                 const submittedAt = new Date().toISOString();
                 this.redeemInFlight.set(conditionId, { conditionId, submittedAt, method: 'redeem_failed', status: 'failed', error });
+                this.crypto15mSyncFromRedeemInFlight(conditionId);
                 results.push({
                     success: false,
                     confirmed: false,
@@ -1763,6 +2842,47 @@ export class GroupArbitrageScanner {
             }
         }
 
+        if (source === 'manual' && conditionIds.length) {
+            const start = Date.now();
+            const timeoutMs = 3 * 60_000;
+            while (Date.now() - start < timeoutMs) {
+                const pending = conditionIds.filter((id) => {
+                    const st = this.redeemInFlight.get(id)?.status;
+                    return st === 'submitted';
+                });
+                if (!pending.length) break;
+                await new Promise(r => setTimeout(r, 750));
+            }
+        }
+
+        for (const r of results) {
+            const cid = r?.conditionId ? String(r.conditionId) : '';
+            if (!cid) continue;
+            const inflight = this.redeemInFlight.get(cid);
+            if (!inflight) continue;
+            r.redeemStatus = inflight.status;
+            r.txHash = inflight.txHash ?? r.txHash;
+            r.payoutUsdc = inflight.payoutUsdc ?? r.payoutUsdc;
+            r.payoutReceivedUsdc = inflight.payoutReceivedUsdc ?? r.payoutReceivedUsdc;
+            r.payoutSentUsdc = inflight.payoutSentUsdc ?? r.payoutSentUsdc;
+            r.payoutNetUsdc = inflight.payoutNetUsdc ?? r.payoutNetUsdc;
+            r.payoutRecipients = inflight.payoutRecipients ?? r.payoutRecipients;
+            r.txStatus = inflight.txStatus ?? r.txStatus;
+            r.paid = inflight.paid ?? r.paid;
+            r.usdcTransfers = inflight.usdcTransfers ?? r.usdcTransfers;
+            if (inflight.status === 'confirmed') r.confirmed = true;
+            if (inflight.status === 'failed') {
+                r.success = false;
+                r.error = inflight.error ?? r.error;
+                r.errorSummary = this.summarizeErrorMessage(r.error);
+            }
+        }
+
+        const after = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
+        const cashAfter = after?.cash != null ? Number(after.cash) : null;
+        const claimableCountAfter = after?.claimableCount != null ? Number(after.claimableCount) : null;
+        const cashDelta = cashBefore != null && cashAfter != null ? (cashAfter - cashBefore) : null;
+
         if (results.length) {
             this.orderHistory.unshift({
                 id: Date.now(),
@@ -1770,12 +2890,18 @@ export class GroupArbitrageScanner {
                 marketQuestion: `Redeem selected (${results.length})`,
                 mode: source,
                 action: 'redeem',
+                cashBefore,
+                cashAfter,
+                cashDelta,
+                claimableCountBefore,
+                claimableCountAfter,
                 results,
             });
             if (this.orderHistory.length > 50) this.orderHistory.pop();
+            this.schedulePersistOrderHistory();
         }
 
-        return { success: true, source, count: results.length, results };
+        return { success: true, source, count: results.length, cashBefore, cashAfter, cashDelta, claimableCountBefore, claimableCountAfter, results };
     }
 
     async refreshHistoryStatuses(options?: { maxEntries?: number; minIntervalMs?: number }): Promise<any[]> {
@@ -1823,6 +2949,7 @@ export class GroupArbitrageScanner {
         }
 
         this.refreshRedeemHistoryFromInFlight({ maxEntries });
+        this.schedulePersistOrderHistory();
         return this.orderHistory;
     }
 
@@ -1874,6 +3001,7 @@ export class GroupArbitrageScanner {
                 result: { success: false, error: 'No filled leg detected', cancelResults }
             });
             if (this.orderHistory.length > 50) this.orderHistory.pop();
+            this.schedulePersistOrderHistory();
             return { success: false, error: 'No filled leg detected', cancelResults };
         }
 
@@ -1921,6 +3049,7 @@ export class GroupArbitrageScanner {
                 result: fallbackLimit?.success ? { ...fallbackLimit, method: 'limit_best_bid' } : { ...sell, method: attempt1?.success ? 'market_fak' : 'market_fak_with_price', fallbackLimit }
             });
             if (this.orderHistory.length > 50) this.orderHistory.pop();
+            this.schedulePersistOrderHistory();
 
             if (sell?.success || fallbackLimit?.success) pos.status = 'exited';
 
@@ -1930,7 +3059,6 @@ export class GroupArbitrageScanner {
         }
     }
 
->>>>>>> 4a0b989 (Relayer key rotation + safer persistence)
     private extractMarketSlug(identifier: string): string | null {
         if (!identifier) return null;
         const trimmed = identifier.trim();
@@ -2052,6 +3180,8 @@ export class GroupArbitrageScanner {
 
         this.orderHistory.unshift(historyEntry);
         if (this.orderHistory.length > 50) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+        this.schedulePersistOrderHistory();
 
         return { success: true, marketId: resolved.marketId, question: market.question, results, openOrders };
     }
@@ -2259,6 +3389,8 @@ export class GroupArbitrageScanner {
                     orderId: order.orderId, 
                     tx: order.transactionHashes?.[0], 
                     outcome: token.outcome,
+                    price: finalPrice,
+                    size: sharesToBuy,
                     error: order.success ? undefined : (order.errorMsg || order.rawStatus || 'Order rejected')
                 });
 
@@ -2270,17 +3402,30 @@ export class GroupArbitrageScanner {
         
         console.log(`   ⚠️ Orders placed as GTC (Maker). Auto-merge skipped until filled.`);
 
-        // --- STEP 4: Register for Monitoring (Cut Loss / Trailing Stop) ---
-        if (canCalculate) {
-            this.monitoredTrades.set(marketId, {
+        const yesAny = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'yes');
+        const noAny = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'no');
+        const yes = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'yes' && r.orderId) || yesAny;
+        const no = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'no' && r.orderId) || noAny;
+        if (canCalculate && yes?.orderId && no?.orderId) {
+            const settings: StrategySettings = {
+                targetProfitPercent: 10,
+                cutLossPercent: 25,
+                trailingStopPercent: 10,
+                oneLegTimeoutMinutes: 10,
+                wideSpreadCents: 5,
+                forceMarketExitFromPeakPercent: 15,
+            };
+            this.monitoredPositions.set(marketId, {
                 marketId,
-                entryTime: Date.now(),
-                entryPrice: totalAskSum, // Approximate entry cost (if filled)
-                peakPrice: totalAskSum, // Start tracking peak from here
-                tokenIds,
-                status: 'active'
+                createdAt: Date.now(),
+                mode: 'semi',
+                settings,
+                status: 'orders_live',
+                legs: {
+                    yes: { outcome: 'Yes', tokenId: yes.tokenId, orderId: yes.orderId, entryPrice: Number(yes.price ?? 0), size: Number(yes.size ?? 0), filledSize: 0, peakMid: Number(yes.price ?? 0), status: 'live' },
+                    no: { outcome: 'No', tokenId: no.tokenId, orderId: no.orderId, entryPrice: Number(no.price ?? 0), size: Number(no.size ?? 0), filledSize: 0, peakMid: Number(no.price ?? 0), status: 'live' },
+                }
             });
-            console.log(`   📡 Trade registered for monitoring (Cut Loss: 3h, Trailing Stop: 10%)`);
         }
 
         console.log(`   ⏳ Waiting 1s for order propagation...`);
@@ -2300,6 +3445,7 @@ export class GroupArbitrageScanner {
             timestamp: new Date().toISOString(),
             marketId,
             marketQuestion: market.question, 
+            mode: 'semi',
             amount,
             results,
             openOrdersCount: openOrders.length
@@ -2308,6 +3454,141 @@ export class GroupArbitrageScanner {
         // Add to history (limit to 50)
         this.orderHistory.unshift(historyEntry);
         if (this.orderHistory.length > 50) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+
+        return { success: true, results, openOrders };
+    }
+
+    async executeByShares(marketId: string, shares: number, options?: Partial<StrategySettings>): Promise<any> {
+        console.log(`🚀 Executing Group Arb (By Shares) for Market: ${marketId}, Shares: ${shares}`);
+
+        if (!this.hasValidKey) {
+            const error = "❌ Error: Missing Private Key. Please set POLY_PRIVKEY in .env. API Key provided is not enough for trading.";
+            console.error(error);
+            return { success: false, error };
+        }
+
+        const metaSlug = (options as any)?.slug;
+        const metaQuestion = (options as any)?.question;
+
+        const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
+
+        const settings: StrategySettings = {
+            targetProfitPercent: Number(options?.targetProfitPercent ?? 10),
+            cutLossPercent: Number(options?.cutLossPercent ?? 25),
+            trailingStopPercent: Number(options?.trailingStopPercent ?? 10),
+            enableOneLegTimeout: (options as any)?.enableOneLegTimeout ?? true,
+            oneLegTimeoutMinutes: clamp(Number(options?.oneLegTimeoutMinutes ?? 10), 1, 120),
+            autoCancelUnfilledOnTimeout: (options as any)?.autoCancelUnfilledOnTimeout ?? true,
+            wideSpreadCents: Number(options?.wideSpreadCents ?? 5),
+            forceMarketExitFromPeakPercent: Number(options?.forceMarketExitFromPeakPercent ?? 15),
+            enableHedgeComplete: (options as any)?.enableHedgeComplete ?? false,
+            oneLegTimeoutAction: (options?.oneLegTimeoutAction as any) || 'UNWIND_EXIT',
+            maxSpreadCentsForHedge: Number(options?.maxSpreadCentsForHedge ?? 5),
+            maxSlippageCents: Number(options?.maxSlippageCents ?? 2),
+        };
+        if (!settings.enableHedgeComplete) settings.oneLegTimeoutAction = 'UNWIND_EXIT';
+
+        const market = await withRetry(() => this.sdk.clobApi.getMarket(marketId), { maxRetries: 2 });
+        const tokens = market.tokens;
+        if (!tokens || tokens.length < 2) throw new Error("Invalid market tokens");
+
+        const getTokenId = (t: any): string | undefined => t?.token_id ?? t?.tokenId ?? t?.id;
+
+        const orderbooksMap = new Map<string, any>();
+        let totalAskSum = 0;
+        let canCalculate = true;
+
+        for (const token of tokens) {
+            try {
+                const tokenId = getTokenId(token);
+                if (!tokenId) { canCalculate = false; continue; }
+                const ob = await this.sdk.clobApi.getOrderbook(tokenId);
+                orderbooksMap.set(tokenId, ob);
+                const bestAsk = Number(ob.asks[0]?.price);
+                if (!bestAsk) canCalculate = false;
+                else totalAskSum += bestAsk;
+            } catch {
+                canCalculate = false;
+            }
+        }
+
+        if (!canCalculate || totalAskSum <= 0) throw new Error('Cannot calculate order prices (missing liquidity).');
+
+        const targetTotalCost = Math.max(0.01, 1 - (settings.targetProfitPercent / 100));
+        let scalingFactor = targetTotalCost / totalAskSum;
+        if (scalingFactor > 0.99) scalingFactor = 0.99;
+
+        const results: any[] = [];
+        for (const token of tokens) {
+            const tokenId = getTokenId(token);
+            if (!tokenId) continue;
+            const ob = orderbooksMap.get(tokenId);
+            const bestAsk = Number(ob?.asks?.[0]?.price);
+            if (!bestAsk) {
+                results.push({ tokenId, success: false, error: "No liquidity", outcome: token.outcome });
+                continue;
+            }
+
+            const targetPrice = Number((bestAsk * scalingFactor).toFixed(4));
+            let finalPrice = targetPrice;
+            if (finalPrice >= bestAsk) finalPrice = bestAsk - 0.0001;
+            if (finalPrice <= 0) finalPrice = 0.01;
+
+            const order = await this.tradingClient.createOrder({
+                tokenId,
+                price: finalPrice,
+                side: 'BUY',
+                size: shares,
+                orderType: 'GTC',
+            });
+
+            results.push({
+                tokenId,
+                outcome: token.outcome,
+                success: !!order.success,
+                orderId: order.orderId,
+                tx: order.transactionHashes?.[0],
+                error: order.success ? undefined : (order.errorMsg || order.rawStatus || 'Order rejected'),
+                price: finalPrice,
+                size: shares
+            });
+        }
+
+        await new Promise(r => setTimeout(r, 1000));
+        const openOrders = await this.tradingClient.getOpenOrders(marketId).catch(() => []);
+
+        const historyEntry = {
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            marketId,
+            marketQuestion: metaQuestion || market.question,
+            slug: metaSlug || undefined,
+            mode: 'semi',
+            shares,
+            settings,
+            results,
+            openOrdersCount: openOrders.length
+        };
+
+        this.orderHistory.unshift(historyEntry);
+        if (this.orderHistory.length > 50) this.orderHistory.pop();
+
+        const yes = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'yes' && r.orderId);
+        const no = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'no' && r.orderId);
+        if (yes?.orderId || no?.orderId) {
+            this.monitoredPositions.set(marketId, {
+                marketId,
+                createdAt: Date.now(),
+                mode: 'semi',
+                settings,
+                status: 'orders_live',
+                legs: {
+                    yes: { outcome: 'Yes', tokenId: yes?.tokenId, orderId: yes?.orderId, entryPrice: Number(yes?.price ?? 0), size: shares, filledSize: 0, peakMid: Number(yes?.price ?? 0), status: yes?.orderId ? 'live' : 'closed' },
+                    no: { outcome: 'No', tokenId: no?.tokenId, orderId: no?.orderId, entryPrice: Number(no?.price ?? 0), size: shares, filledSize: 0, peakMid: Number(no?.price ?? 0), status: no?.orderId ? 'live' : 'closed' },
+                }
+            });
+        }
 
         return { success: true, results, openOrders };
     }
@@ -2315,58 +3596,209 @@ export class GroupArbitrageScanner {
     // Monitoring Loop for Cut Loss / Trailing Stop
     private async startMonitoring() {
         setInterval(async () => {
-            if (this.monitoredTrades.size === 0) return;
+            if (this.monitoredPositions.size === 0) return;
 
-            console.log(`🔍 Monitoring ${this.monitoredTrades.size} active trades...`);
-            
-            for (const [marketId, trade] of this.monitoredTrades) {
-                if (trade.status === 'closed') {
-                    this.monitoredTrades.delete(marketId);
+            for (const [marketId, pos] of this.monitoredPositions) {
+                if (pos.status === 'exited') {
+                    this.monitoredPositions.delete(marketId);
                     continue;
                 }
 
+                const elapsedMinutes = (Date.now() - pos.createdAt) / (1000 * 60);
+
+                const updateLeg = async (leg: MonitoredLeg) => {
+                    try {
+                        if (!leg.orderId) return;
+                        const o = await this.tradingClient.getOrder(leg.orderId);
+                        const filled = Number(o?.filledSize ?? o?.sizeMatched ?? 0);
+                        leg.filledSize = Number.isFinite(filled) ? filled : leg.filledSize;
+                        const status = String(o?.status ?? '').toUpperCase();
+                        if (status === 'LIVE') leg.status = 'live';
+                        else if (leg.filledSize > 0) leg.status = 'filled';
+                        else leg.status = 'closed';
+                    } catch {
+                    }
+                };
+
+                await Promise.all([updateLeg(pos.legs.yes), updateLeg(pos.legs.no)]);
+
+                const yesFilled = pos.legs.yes.filledSize > 0;
+                const noFilled = pos.legs.no.filledSize > 0;
+
+                if (yesFilled && noFilled) {
+                    pos.status = 'both_legs_filled';
+                    continue;
+                }
+
+                if (!yesFilled && !noFilled) {
+                    pos.status = 'orders_live';
+                    if (pos.settings.enableOneLegTimeout && elapsedMinutes >= pos.settings.oneLegTimeoutMinutes && pos.settings.autoCancelUnfilledOnTimeout) {
+                        await Promise.allSettled([
+                            pos.legs.yes.orderId ? this.tradingClient.cancelOrder(pos.legs.yes.orderId) : Promise.resolve(),
+                            pos.legs.no.orderId ? this.tradingClient.cancelOrder(pos.legs.no.orderId) : Promise.resolve(),
+                        ]);
+                        pos.status = 'exited';
+                        this.orderHistory.unshift({
+                            id: Date.now(),
+                            timestamp: new Date().toISOString(),
+                            marketId,
+                            mode: 'auto',
+                            originMode: pos.mode,
+                            action: 'timeout_cancel',
+                            details: { oneLegTimeoutMinutes: pos.settings.oneLegTimeoutMinutes }
+                        });
+                        if (this.orderHistory.length > 50) this.orderHistory.pop();
+                        this.schedulePersistOrderHistory();
+                    }
+                    continue;
+                }
+
+                pos.status = 'one_leg_filled';
+                const filledLeg = yesFilled ? pos.legs.yes : pos.legs.no;
+                const otherLeg = yesFilled ? pos.legs.no : pos.legs.yes;
+
+                if (pos.settings.enableOneLegTimeout && elapsedMinutes >= pos.settings.oneLegTimeoutMinutes) {
+                    if (pos.settings.enableHedgeComplete && pos.settings.oneLegTimeoutAction === 'HEDGE_COMPLETE') {
+                        try {
+                            if (otherLeg.tokenId) {
+                                const ob = await this.sdk.clobApi.getOrderbook(otherLeg.tokenId);
+                                const bestAsk = Number(ob?.asks?.[0]?.price) || 0;
+                                const bestBid = Number(ob?.bids?.[0]?.price) || 0;
+                                const spreadCents = bestAsk > 0 && bestBid > 0 ? (bestAsk - bestBid) * 100 : 0;
+                                const slippageCents = otherLeg.entryPrice > 0 && bestAsk > 0 ? (bestAsk - otherLeg.entryPrice) * 100 : 0;
+
+                                if (bestAsk > 0 && spreadCents <= Number(pos.settings.maxSpreadCentsForHedge ?? 5) && slippageCents <= Number(pos.settings.maxSlippageCents ?? 2)) {
+                                    if (otherLeg.orderId) {
+                                        this.systemCanceledOrderIds.add(otherLeg.orderId);
+                                        await Promise.allSettled([this.tradingClient.cancelOrder(otherLeg.orderId)]);
+                                    }
+
+                                    const remainingShares = Math.max(0, Number(filledLeg.filledSize || filledLeg.size));
+                                    const amountDollars = Math.max(0.01, remainingShares * bestAsk);
+                                    const hedge = await this.tradingClient.createMarketOrder({
+                                        tokenId: otherLeg.tokenId,
+                                        side: 'BUY',
+                                        amount: amountDollars,
+                                        orderType: 'FAK',
+                                    });
+
+                                    this.orderHistory.unshift({
+                                        id: Date.now(),
+                                        timestamp: new Date().toISOString(),
+                                        marketId,
+                                        mode: 'auto',
+                                        originMode: pos.mode,
+                                        action: 'hedge_complete',
+                                        leg: otherLeg.outcome,
+                                        result: hedge
+                                    });
+                                    if (this.orderHistory.length > 50) this.orderHistory.pop();
+                                    this.schedulePersistOrderHistory();
+                                }
+                            }
+                        } catch {
+                        }
+                    } else if (pos.settings.autoCancelUnfilledOnTimeout) {
+                        if (otherLeg.status === 'live' && otherLeg.orderId) {
+                            this.systemCanceledOrderIds.add(otherLeg.orderId);
+                            await Promise.allSettled([this.tradingClient.cancelOrder(otherLeg.orderId)]);
+                            otherLeg.status = 'closed';
+                        }
+                    }
+                }
+
                 try {
-                    // Check time elapsed
-                    const hoursElapsed = (Date.now() - trade.entryTime) / (1000 * 60 * 60);
-                    
-                    if (hoursElapsed < 3) continue; // Only act after 3 hours as per requirement
+                    const ob = await this.sdk.clobApi.getOrderbook(filledLeg.tokenId);
+                    const bestBid = Number(ob?.bids?.[0]?.price) || 0;
+                    const bestAsk = Number(ob?.asks?.[0]?.price) || 0;
+                    const mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : (bestBid || bestAsk);
+                    if (!mid) continue;
 
-                    // Fetch current prices
-                    let currentTotalCost = 0;
-                    for (const tid of trade.tokenIds) {
-                        const ob = await this.sdk.clobApi.getOrderbook(tid);
-                        const bestAsk = Number(ob.asks[0]?.price) || 0;
-                        currentTotalCost += bestAsk;
+                    filledLeg.peakMid = Math.max(filledLeg.peakMid || mid, mid);
+
+                    const entry = filledLeg.entryPrice || mid;
+                    const cutLossTrigger = entry * (1 - pos.settings.cutLossPercent / 100);
+                    const trailingTrigger = filledLeg.peakMid * (1 - pos.settings.trailingStopPercent / 100);
+                    const forceTrigger = filledLeg.peakMid * (1 - pos.settings.forceMarketExitFromPeakPercent / 100);
+
+                    const spreadCents = bestBid > 0 && bestAsk > 0 ? (bestAsk - bestBid) * 100 : 0;
+
+                    const sellNow = async (reason: string) => {
+                        const cancelIfPresent = (orderId?: string) => {
+                            if (!orderId) return Promise.resolve();
+                            this.systemCanceledOrderIds.add(orderId);
+                            return this.tradingClient.cancelOrder(orderId);
+                        };
+
+                        await Promise.allSettled([
+                            cancelIfPresent(pos.legs.yes.orderId),
+                            cancelIfPresent(pos.legs.no.orderId),
+                        ]);
+
+                        const sizeToSell = Math.min(filledLeg.filledSize || filledLeg.size, filledLeg.size);
+                        const attempt1 = await this.tradingClient.createMarketOrder({
+                            tokenId: filledLeg.tokenId,
+                            side: 'SELL',
+                            amount: sizeToSell,
+                            orderType: 'FAK',
+                        });
+
+                        const attempt2 = attempt1?.success ? null : await this.tradingClient.createMarketOrder({
+                            tokenId: filledLeg.tokenId,
+                            side: 'SELL',
+                            amount: sizeToSell,
+                            price: bestBid > 0 ? bestBid : undefined,
+                            orderType: 'FAK',
+                        });
+
+                        const sell = attempt2 || attempt1;
+                        const fallbackLimit = sell?.success || !(bestBid > 0) ? null : await this.tradingClient.createOrder({
+                            tokenId: filledLeg.tokenId,
+                            side: 'SELL',
+                            price: bestBid,
+                            size: sizeToSell,
+                            orderType: 'GTC',
+                        });
+
+                        this.orderHistory.unshift({
+                            id: Date.now(),
+                            timestamp: new Date().toISOString(),
+                            marketId,
+                            mode: 'auto',
+                            originMode: pos.mode,
+                            action: 'exit_one_leg',
+                            reason,
+                            remark: 'risk_exit_aggressive_market',
+                            leg: filledLeg.outcome,
+                            entryPrice: entry,
+                            mid,
+                            peakMid: filledLeg.peakMid,
+                            spreadCents,
+                            result: fallbackLimit?.success ? { ...fallbackLimit, method: 'limit_best_bid' } : { ...sell, method: attempt1?.success ? 'market_fak' : 'market_fak_with_price', fallbackLimit }
+                        });
+                        if (this.orderHistory.length > 50) this.orderHistory.pop();
+                        this.schedulePersistOrderHistory();
+                        if (sell?.success || fallbackLimit?.success) {
+                            pos.status = 'exited';
+                        } else {
+                            pos.status = 'one_leg_filled';
+                        }
+                    };
+
+                    if (mid <= cutLossTrigger) {
+                        await sellNow('cut_loss');
+                    } else if (mid <= forceTrigger) {
+                        await sellNow('force_market_from_peak');
+                    } else if (mid <= trailingTrigger) {
+                        if (spreadCents > pos.settings.wideSpreadCents) {
+                            await sellNow('trailing_wide_spread');
+                        } else {
+                            await sellNow('trailing_stop');
+                        }
                     }
-
-                    if (currentTotalCost === 0) continue; // No liquidity to price
-
-                    // Update Peak Price
-                    if (currentTotalCost > trade.peakPrice) {
-                        trade.peakPrice = currentTotalCost;
-                    }
-
-                    // Rule 8: Cut Loss (Price Drop)
-                    if (currentTotalCost < trade.entryPrice) {
-                        console.log(`⚠️ CUT LOSS ALERT: Market ${marketId} dropped below entry after 3h.`);
-                        // Logic: Cancel orders and Sell (Placeholder for now)
-                        // await this.tradingClient.cancelAllOrders(marketId);
-                        // await this.sellAll(marketId);
-                        trade.status = 'closed';
-                    }
-
-                    // Rule 9: Trailing Stop (10% Drop from Peak)
-                    const dropFromPeak = (trade.peakPrice - currentTotalCost) / trade.peakPrice;
-                    if (currentTotalCost > trade.entryPrice && dropFromPeak >= 0.10) {
-                        console.log(`📉 TRAILING STOP ALERT: Market ${marketId} dropped 10% from peak.`);
-                        // Logic: Sell to secure profit
-                        trade.status = 'closed';
-                    }
-
-                } catch (e) {
-                    console.error(`Error monitoring market ${marketId}:`, e);
+                } catch {
                 }
             }
-        }, 60000); // Run every minute
+        }, 15000);
     }
 }

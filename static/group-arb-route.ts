@@ -131,6 +131,40 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.post('/execute-shares', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Execute Group Arbitrage (Shares Input)',
+            body: {
+                type: 'object',
+                properties: {
+                    marketId: { type: 'string' },
+                    shares: { type: 'number' },
+                    targetProfitPercent: { type: 'number' },
+                    cutLossPercent: { type: 'number' },
+                    trailingStopPercent: { type: 'number' },
+                    oneLegTimeoutMinutes: { type: 'number' },
+                    wideSpreadCents: { type: 'number' },
+                    forceMarketExitFromPeakPercent: { type: 'number' }
+                },
+                required: ['marketId', 'shares']
+            }
+        },
+        handler: async (request, reply) => {
+            const { marketId, shares, slug, question, ...settings } = request.body as any;
+            try {
+                const result = await scanner.executeByShares(
+                    String(marketId),
+                    Number(shares),
+                    { ...settings, slug, question }
+                );
+                return result;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.post('/execute', {
         schema: {
             tags: ['Group Arb'],
@@ -173,6 +207,45 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             try {
                 const orders = await scanner.getActiveOrders(marketId);
                 return { success: true, orders };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/diagnose', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Diagnose Market Orders/Trades (Open Orders + Recent Trades)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    identifier: { type: 'string' },
+                    marketId: { type: 'string' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            const q = request.query as any;
+            try {
+                const identifier = q.identifier ? String(q.identifier) : '';
+                const marketId = q.marketId ? String(q.marketId) : '';
+                const resolved = identifier ? await scanner.resolveIdentifier(identifier) : null;
+                const mid = resolved?.marketId || marketId;
+                if (!mid) return reply.status(400).send({ error: 'Missing identifier or marketId' });
+
+                const [openOrders, trades] = await Promise.all([
+                    scanner.getActiveOrders(mid),
+                    scanner.getTrades({ market: mid }).catch(() => []),
+                ]);
+
+                return {
+                    success: true,
+                    marketId: mid,
+                    resolved,
+                    openOrders,
+                    trades
+                };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
@@ -242,6 +315,44 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.get('/monitored', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get Monitored Positions Summary',
+        },
+        handler: async (request, reply) => {
+            try {
+                const positions = await scanner.getMonitoredPositionsSummary();
+                return { success: true, positions };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/portfolio-summary', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Portfolio summary (portfolio value, cash, positions)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    positionsLimit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const positionsLimit = q.positionsLimit != null ? Number(q.positionsLimit) : 50;
+                const summary = await scanner.getPortfolioSummary({ positionsLimit });
+                return { success: true, summary };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.post('/cancel-order', {
         schema: {
             tags: ['Group Arb'],
@@ -258,6 +369,29 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             const { orderId } = request.body as any;
             try {
                 const result = await scanner.cancelOrder(orderId);
+                return { success: true, result };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/exit-now', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Manual Exit Now (cancel related orders + attempt one-leg exit)',
+            body: {
+                type: 'object',
+                required: ['marketId'],
+                properties: {
+                    marketId: { type: 'string' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            const { marketId } = request.body as any;
+            try {
+                const result = await scanner.exitNow(String(marketId));
                 return { success: true, result };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
@@ -284,8 +418,6 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
-<<<<<<< HEAD
-=======
     fastify.get('/performance', {
         schema: {
             tags: ['Group Arb'],
@@ -700,7 +832,6 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
->>>>>>> 4a0b989 (Relayer key rotation + safer persistence)
     fastify.get('/history', {
         schema: {
             tags: ['Group Arb'],
@@ -708,8 +839,135 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const q = request.query as any;
+                const refresh = String(q.refresh || '') === '1' || String(q.refresh || '') === 'true';
+                const intervalMs = q.intervalMs != null ? Number(q.intervalMs) : 1000;
+                const maxEntries = q.maxEntries != null ? Number(q.maxEntries) : 20;
+
+                if (refresh) {
+                    await scanner.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries });
+                }
                 const history = scanner.getHistory();
                 return { success: true, history };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m/candidates', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'List 15m crypto candidates (Up/Down, >= minProb, expiring soon)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await scanner.getCrypto15mCandidates({
+                    minProb: q.minProb != null ? Number(q.minProb) : undefined,
+                    expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
+                    limit: q.limit != null ? Number(q.limit) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get 15m crypto auto trade status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = scanner.getCrypto15mStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/auto/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start 15m crypto auto trade',
+            body: {
+                type: 'object',
+                properties: {
+                    amountUsd: { type: 'number' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    pollMs: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = scanner.startCrypto15mAuto({
+                    enabled: true,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/auto/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop 15m crypto auto trade',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = scanner.stopCrypto15mAuto();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/order', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Place a single 15m crypto order (semi mode)',
+            body: {
+                type: 'object',
+                properties: {
+                    conditionId: { type: 'string' },
+                    outcomeIndex: { type: 'number' },
+                    amountUsd: { type: 'number' }
+                },
+                required: ['conditionId']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const r = await scanner.placeCrypto15mOrder({
+                    conditionId: String(b.conditionId),
+                    outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    source: 'semi',
+                });
+                return r;
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
