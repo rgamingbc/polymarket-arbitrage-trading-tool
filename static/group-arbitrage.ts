@@ -109,6 +109,8 @@ export class GroupArbitrageScanner {
     private relayerConfigPersistedAt: string | null = null;
     private relayerConfigPersistLastError: string | null = null;
     private relayerLastInitError: string | null = null;
+    private relayerKeys: Array<{ apiKey: string; secret: string; passphrase: string; label?: string; exhaustedUntil?: string | null; lastError?: string | null; lastUsedAt?: string | null }> = [];
+    private relayerActiveIndex = 0;
     private relayerWalletClient: any = null;
     private relayerSafeDeployed = false;
     private rpcUrls: string[] = [];
@@ -203,34 +205,194 @@ export class GroupArbitrageScanner {
             if (!fs.existsSync(this.relayerConfigPath)) return;
             const raw = fs.readFileSync(this.relayerConfigPath, 'utf8');
             const parsed = JSON.parse(String(raw || '{}'));
+            const relayerUrl = parsed?.relayerUrl != null ? String(parsed.relayerUrl) : undefined;
+            this.relayerConfigLoadedAt = new Date().toISOString();
+            if (Array.isArray(parsed?.keys)) {
+                const keys = parsed.keys
+                    .map((k: any) => ({
+                        apiKey: String(k?.apiKey || k?.key || '').trim(),
+                        secret: String(k?.secret || '').trim(),
+                        passphrase: String(k?.passphrase || '').trim(),
+                        label: k?.label != null ? String(k.label) : undefined,
+                        exhaustedUntil: k?.exhaustedUntil != null ? String(k.exhaustedUntil) : null,
+                        lastError: k?.lastError != null ? String(k.lastError) : null,
+                        lastUsedAt: k?.lastUsedAt != null ? String(k.lastUsedAt) : null,
+                    }))
+                    .filter((k: any) => !!k.apiKey && !!k.secret && !!k.passphrase);
+                const activeIndex = Number.isFinite(Number(parsed?.activeIndex)) ? Math.max(0, Math.floor(Number(parsed.activeIndex))) : 0;
+                if (!keys.length) return;
+                this.setRelayerKeys({ keys, relayerUrl, activeIndex, persist: false, reconfigure: true });
+                return;
+            }
+
             const apiKey = String(parsed?.apiKey || '').trim();
             const secret = String(parsed?.secret || '').trim();
             const passphrase = String(parsed?.passphrase || '').trim();
-            const relayerUrl = parsed?.relayerUrl != null ? String(parsed.relayerUrl) : undefined;
             if (!apiKey || !secret || !passphrase) return;
-            this.relayerConfigLoadedAt = new Date().toISOString();
-            this.configureRelayer({ apiKey, secret, passphrase, relayerUrl, persist: false });
+            this.setRelayerKeys({ keys: [{ apiKey, secret, passphrase }], relayerUrl, activeIndex: 0, persist: false, reconfigure: true });
         } catch {
         }
     }
 
-    private persistRelayerConfigToFile(options: { apiKey: string; secret: string; passphrase: string; relayerUrl: string }) {
+    private persistRelayerConfigToFile(options: { relayerUrl: string; keys: Array<{ apiKey: string; secret: string; passphrase: string; label?: string; exhaustedUntil?: string | null; lastError?: string | null; lastUsedAt?: string | null }>; activeIndex: number }) {
         if (!this.relayerConfigPath) return;
-        const dir = path.dirname(this.relayerConfigPath);
-        try {
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
             fs.mkdirSync(dir, { recursive: true });
-        } catch (e: any) {
-            this.relayerConfigPersistLastError = e?.message ? String(e.message) : 'Failed to create relayer config dir';
-            return;
-        }
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+
         try {
-            fs.writeFileSync(this.relayerConfigPath, JSON.stringify(options), { encoding: 'utf8', mode: 0o600 });
-            try { fs.chmodSync(this.relayerConfigPath, 0o600); } catch {}
+            const payload = JSON.stringify(options);
+            writeAtomic(this.relayerConfigPath, payload);
+            try {
+                const stablePath = path.join(os.homedir(), '.polymarket-tools', 'relayer.json');
+                writeAtomic(stablePath, payload);
+            } catch {
+            }
             this.relayerConfigPersistedAt = new Date().toISOString();
             this.relayerConfigPersistLastError = null;
         } catch (e: any) {
             this.relayerConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write relayer config file';
         }
+    }
+
+    private isRelayerKeyExhausted(k: { exhaustedUntil?: string | null }): boolean {
+        const until = k?.exhaustedUntil ? Date.parse(String(k.exhaustedUntil)) : NaN;
+        return Number.isFinite(until) ? until > Date.now() : false;
+    }
+
+    private parseRelayerQuotaResetAt(err: any): string | null {
+        const msg = String(err?.message || err || '');
+        const m = msg.match(/resets\s+in\s+(\d+)\s+seconds/i);
+        if (!m) return null;
+        const seconds = Number(m[1]);
+        if (!Number.isFinite(seconds) || seconds <= 0) return null;
+        return new Date(Date.now() + seconds * 1000).toISOString();
+    }
+
+    private isRelayerQuotaExceeded(err: any): boolean {
+        const msg = String(err?.message || err || '').toLowerCase();
+        return msg.includes('quota exceeded') || msg.includes('units remaining');
+    }
+
+    private maskApiKey(apiKey: string): string {
+        const k = String(apiKey || '');
+        if (k.length <= 8) return k;
+        return `${k.slice(0, 4)}…${k.slice(-4)}`;
+    }
+
+    private persistRelayerKeysSnapshot() {
+        if (!this.relayerConfigPath) return;
+        this.persistRelayerConfigToFile({ relayerUrl: this.relayerUrl, keys: this.relayerKeys, activeIndex: this.relayerActiveIndex });
+    }
+
+    private rotateRelayerKeyOnQuotaExceeded(err: any): boolean {
+        if (!this.relayerKeys.length) return false;
+        const cur = this.relayerKeys[this.relayerActiveIndex];
+        const resetAt = this.parseRelayerQuotaResetAt(err);
+        if (cur) {
+            cur.exhaustedUntil = resetAt || new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+            cur.lastError = String(err?.message || err || '');
+        }
+        this.persistRelayerKeysSnapshot();
+
+        if (this.relayerKeys.length <= 1) {
+            this.relayerConfigured = false;
+            this.relayerLastInitError = 'Builder quota exceeded';
+            return false;
+        }
+
+        const startIndex = this.relayerActiveIndex;
+        for (let step = 1; step <= this.relayerKeys.length; step++) {
+            const idx = (startIndex + step) % this.relayerKeys.length;
+            const k = this.relayerKeys[idx];
+            if (!k || this.isRelayerKeyExhausted(k)) continue;
+            this.relayerActiveIndex = idx;
+            const configured = this.configureRelayerFromActiveKey({ persist: true });
+            if (configured?.success) return true;
+        }
+
+        this.relayerConfigured = false;
+        this.relayerLastInitError = 'Builder quota exceeded';
+        return false;
+    }
+
+    private setRelayerKeys(options: { keys: Array<{ apiKey: string; secret: string; passphrase: string; label?: string; exhaustedUntil?: string | null; lastError?: string | null; lastUsedAt?: string | null }>; relayerUrl?: string; activeIndex?: number; persist?: boolean; reconfigure?: boolean }) {
+        const keys = (options.keys || [])
+            .map((k) => ({
+                apiKey: String(k.apiKey || '').trim(),
+                secret: String(k.secret || '').trim(),
+                passphrase: String(k.passphrase || '').trim(),
+                label: k.label != null ? String(k.label) : undefined,
+                exhaustedUntil: k.exhaustedUntil != null ? String(k.exhaustedUntil) : null,
+                lastError: k.lastError != null ? String(k.lastError) : null,
+                lastUsedAt: k.lastUsedAt != null ? String(k.lastUsedAt) : null,
+            }))
+            .filter((k) => !!k.apiKey && !!k.secret && !!k.passphrase);
+        if (!keys.length) {
+            this.relayerConfigured = false;
+            this.relayerLastInitError = 'Missing builder credentials';
+            this.relayerKeys = [];
+            this.relayerActiveIndex = 0;
+            return { success: false, relayerConfigured: false, error: this.relayerLastInitError };
+        }
+        const relayerUrl = String(options.relayerUrl || this.relayerUrl || 'https://relayer-v2.polymarket.com').trim();
+        const requestedIndex = options.activeIndex != null ? Math.max(0, Math.floor(Number(options.activeIndex))) : this.relayerActiveIndex;
+        this.relayerKeys = keys;
+        this.relayerActiveIndex = Math.min(requestedIndex, Math.max(0, keys.length - 1));
+        this.relayerUrl = relayerUrl;
+        if (options.persist !== false) {
+            this.persistRelayerConfigToFile({ relayerUrl, keys: this.relayerKeys, activeIndex: this.relayerActiveIndex });
+        }
+        if (options.reconfigure) {
+            return this.configureRelayerFromActiveKey({ persist: false });
+        }
+        return { success: true, relayerConfigured: this.relayerConfigured };
+    }
+
+    configureRelayerKeys(options: { keys: Array<{ apiKey: string; secret: string; passphrase: string; label?: string }>; relayerUrl?: string; activeIndex?: number; persist?: boolean }) {
+        return this.setRelayerKeys({ keys: options.keys, relayerUrl: options.relayerUrl, activeIndex: options.activeIndex, persist: options.persist, reconfigure: true });
+    }
+
+    setActiveRelayerKeyIndex(index: number, options?: { persist?: boolean }) {
+        if (!this.relayerKeys.length) {
+            this.relayerConfigured = false;
+            this.relayerLastInitError = 'Missing builder credentials';
+            return { success: false, relayerConfigured: false, error: this.relayerLastInitError };
+        }
+        const idx = Math.max(0, Math.floor(Number(index)));
+        this.relayerActiveIndex = Math.min(idx, Math.max(0, this.relayerKeys.length - 1));
+        const configured = this.configureRelayerFromActiveKey({ persist: false });
+        if (options?.persist !== false) this.persistRelayerKeysSnapshot();
+        return configured;
+    }
+
+    private configureRelayerFromActiveKey(options?: { persist?: boolean }) {
+        const key = this.relayerKeys[this.relayerActiveIndex];
+        if (!key) {
+            this.relayerConfigured = false;
+            this.relayerLastInitError = 'Missing builder credentials';
+            return { success: false, relayerConfigured: false, error: this.relayerLastInitError };
+        }
+        if (this.isRelayerKeyExhausted(key)) {
+            this.relayerConfigured = false;
+            this.relayerLastInitError = 'Builder quota exceeded';
+            return { success: false, relayerConfigured: false, error: this.relayerLastInitError };
+        }
+        return this.configureRelayer({ apiKey: key.apiKey, secret: key.secret, passphrase: key.passphrase, relayerUrl: this.relayerUrl, persist: options?.persist });
     }
 
     configureRelayer(options: { apiKey: string; secret: string; passphrase: string; relayerUrl?: string; persist?: boolean }) {
@@ -261,17 +423,29 @@ export class GroupArbitrageScanner {
             this.relayerSafeDeployed = false;
             this.relayerLastInitError = null;
             if (options.persist !== false) {
-                this.persistRelayerConfigToFile({ apiKey, secret, passphrase, relayerUrl });
+                if (!this.relayerKeys.length) {
+                    this.relayerKeys = [{ apiKey, secret, passphrase }];
+                    this.relayerActiveIndex = 0;
+                }
+                const k = this.relayerKeys[this.relayerActiveIndex];
+                if (k) {
+                    k.lastError = null;
+                    k.lastUsedAt = new Date().toISOString();
+                }
+                this.persistRelayerConfigToFile({ relayerUrl, keys: this.relayerKeys, activeIndex: this.relayerActiveIndex });
             }
             return { success: true, relayerConfigured: true };
         } catch (e: any) {
             this.relayerConfigured = false;
             this.relayerLastInitError = e?.message || String(e);
+            const k = this.relayerKeys[this.relayerActiveIndex];
+            if (k) k.lastError = this.relayerLastInitError;
             return { success: false, relayerConfigured: false, error: this.relayerLastInitError };
         }
     }
 
     getRelayerStatus() {
+        const active = this.relayerKeys[this.relayerActiveIndex];
         return {
             relayerConfigured: this.relayerConfigured,
             relayerUrl: this.relayerUrl,
@@ -281,7 +455,26 @@ export class GroupArbitrageScanner {
             configLoadedAt: this.relayerConfigLoadedAt,
             configPersistedAt: this.relayerConfigPersistedAt,
             configPersistLastError: this.relayerConfigPersistLastError,
+            activeIndex: this.relayerActiveIndex,
+            activeApiKey: active?.apiKey ? this.maskApiKey(active.apiKey) : null,
+            keys: this.relayerKeys.map((k, idx) => ({
+                index: idx,
+                label: k.label || null,
+                apiKey: this.maskApiKey(k.apiKey),
+                exhaustedUntil: k.exhaustedUntil || null,
+                exhausted: this.isRelayerKeyExhausted(k),
+                lastError: k.lastError || null,
+                lastUsedAt: k.lastUsedAt || null,
+            })),
         };
+    }
+
+    simulateRelayerQuotaExceeded(options?: { resetsInSeconds?: number }) {
+        const seconds = Number(options?.resetsInSeconds ?? 3600);
+        const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 3600;
+        const err = new Error(`quota exceeded: 0 units remaining, resets in ${safeSeconds} seconds`);
+        const rotated = this.rotateRelayerKeyOnQuotaExceeded(err);
+        return { rotated, status: this.getRelayerStatus() };
     }
 
     private async loadPnlSnapshots() {
@@ -398,6 +591,8 @@ export class GroupArbitrageScanner {
         this.relayerSafe = null;
         this.relayerProxy = null;
         this.relayerSafeDeployed = false;
+        this.relayerKeys = [];
+        this.relayerActiveIndex = 0;
         if (options?.deleteFile && this.relayerConfigPath) {
             try {
                 if (fs.existsSync(this.relayerConfigPath)) fs.unlinkSync(this.relayerConfigPath);
@@ -441,6 +636,10 @@ export class GroupArbitrageScanner {
                 return await tryClient(this.relayerProxy, 'PROXY');
             } catch (e: any) {
                 proxyErr = e;
+                if (this.isRelayerQuotaExceeded(e)) {
+                    const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                    if (rotated) return await this.redeemViaRelayer(conditionId);
+                }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer proxy auth failed: ${e?.message || String(e)}`);
             }
         }
@@ -451,6 +650,10 @@ export class GroupArbitrageScanner {
                 return await tryClient(this.relayerSafe, 'SAFE');
             } catch (e: any) {
                 safeErr = e;
+                if (this.isRelayerQuotaExceeded(e)) {
+                    const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                    if (rotated) return await this.redeemViaRelayer(conditionId);
+                }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer safe auth failed: ${e?.message || String(e)}`);
             }
         }
@@ -460,6 +663,10 @@ export class GroupArbitrageScanner {
                 return await tryClient(this.relayerProxy, 'PROXY');
             } catch (e: any) {
                 proxyErr = e;
+                if (this.isRelayerQuotaExceeded(e)) {
+                    const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                    if (rotated) return await this.redeemViaRelayer(conditionId);
+                }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer proxy auth failed: ${e?.message || String(e)}`);
             }
         }
@@ -1352,6 +1559,11 @@ export class GroupArbitrageScanner {
             try {
                 return await submit(this.relayerProxy, 'PROXY');
             } catch (e: any) {
+                if (this.isRelayerQuotaExceeded(e)) {
+                    const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId);
+                    throw e;
+                }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer proxy auth failed: ${e?.message || String(e)}`);
             }
         }
@@ -1359,6 +1571,11 @@ export class GroupArbitrageScanner {
             try {
                 return await submit(this.relayerSafe, 'SAFE');
             } catch (e: any) {
+                if (this.isRelayerQuotaExceeded(e)) {
+                    const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                    if (rotated) return await this.redeemViaRelayerSubmit(conditionId);
+                    throw e;
+                }
                 if (this.isRelayerAuthError(e)) throw new Error(`Relayer safe auth failed: ${e?.message || String(e)}`);
                 throw e;
             }
@@ -1434,9 +1651,14 @@ export class GroupArbitrageScanner {
                             this.redeemDrainLast.remaining = redeemables.length - submitted;
                         }
                     } catch (e: any) {
+                        const quotaExceeded = this.isRelayerQuotaExceeded(e);
+                        if (quotaExceeded) {
+                            const rotated = this.rotateRelayerKeyOnQuotaExceeded(e);
+                            if (rotated) continue;
+                        }
                         errors += 1;
                         this.redeemDrainLast.errors = errors;
-                        this.autoRedeemLastError = e?.message || String(e);
+                        this.autoRedeemLastError = this.summarizeErrorMessage(e) || (e?.message || String(e));
                         const error = e?.message || String(e);
                         const submittedAt = new Date().toISOString();
                         this.redeemInFlight.set(conditionId, { conditionId, submittedAt, method: 'redeem_failed', status: 'failed', error });
@@ -1453,8 +1675,9 @@ export class GroupArbitrageScanner {
                             error,
                             errorSummary: this.summarizeErrorMessage(error),
                         });
-                        if (source === 'auto' && String(error).toLowerCase().includes('quota exceeded')) {
-                            this.setAutoRedeemConfig({ enabled: false, persist: true });
+                        if (source === 'auto' && quotaExceeded) {
+                            const anyAvailable = this.relayerKeys.some((k) => !this.isRelayerKeyExhausted(k));
+                            if (!anyAvailable) this.setAutoRedeemConfig({ enabled: false, persist: true });
                         }
                         if (errors >= 3) break;
                     }

@@ -632,11 +632,25 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             summary: 'Configure builder relayer credentials (persisted to disk)',
             body: {
                 type: 'object',
-                required: ['apiKey', 'secret', 'passphrase'],
                 properties: {
                     apiKey: { type: 'string' },
                     secret: { type: 'string' },
                     passphrase: { type: 'string' },
+                    label: { type: 'string' },
+                    keys: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                apiKey: { type: 'string' },
+                                secret: { type: 'string' },
+                                passphrase: { type: 'string' },
+                                label: { type: 'string' },
+                            },
+                            required: ['apiKey', 'secret', 'passphrase'],
+                        }
+                    },
+                    activeIndex: { type: 'number' },
                     relayerUrl: { type: 'string' },
                     persist: { type: 'boolean' },
                     testRedeem: { type: 'boolean' },
@@ -647,14 +661,31 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             try {
                 const b = (request.body || {}) as any;
-                const result = scanner.configureRelayer({
-                    apiKey: String(b.apiKey || ''),
-                    secret: String(b.secret || ''),
-                    passphrase: String(b.passphrase || ''),
-                    relayerUrl: b.relayerUrl != null ? String(b.relayerUrl) : undefined,
-                    persist: b.persist !== false,
-                });
-                const testRedeem = b.testRedeem !== false;
+                const persist = b.persist !== false;
+                const relayerUrl = b.relayerUrl != null ? String(b.relayerUrl) : undefined;
+                let result: any = null;
+                if (Array.isArray(b.keys) && b.keys.length) {
+                    const keys = b.keys.map((k: any) => ({
+                        apiKey: String(k.apiKey || ''),
+                        secret: String(k.secret || ''),
+                        passphrase: String(k.passphrase || ''),
+                        label: k.label != null ? String(k.label) : undefined,
+                    }));
+                    const activeIndex = b.activeIndex != null ? Number(b.activeIndex) : undefined;
+                    result = scanner.configureRelayerKeys({ keys, relayerUrl, activeIndex, persist });
+                } else if (b.activeIndex != null && !b.apiKey) {
+                    result = scanner.setActiveRelayerKeyIndex(Number(b.activeIndex), { persist });
+                } else {
+                    result = scanner.configureRelayer({
+                        apiKey: String(b.apiKey || ''),
+                        secret: String(b.secret || ''),
+                        passphrase: String(b.passphrase || ''),
+                        relayerUrl,
+                        persist,
+                    });
+                }
+
+                const testRedeem = b.testRedeem === true;
                 const testMax = b.testMax != null ? Number(b.testMax) : 1;
                 const test = testRedeem && result?.success ? await scanner.redeemNow({ max: testMax, source: 'manual' }) : null;
                 const results: any[] = Array.isArray(test?.results) ? test.results : [];
@@ -664,6 +695,53 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     scanner.clearRelayerConfig({ deleteFile: true });
                 }
                 return { success: true, result, status: scanner.getRelayerStatus(), testRedeemResult: test };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/relayer/active', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Set active builder key index',
+            body: {
+                type: 'object',
+                required: ['activeIndex'],
+                properties: {
+                    activeIndex: { type: 'number' },
+                    persist: { type: 'boolean' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const persist = b.persist !== false;
+                const result = scanner.setActiveRelayerKeyIndex(Number(b.activeIndex), { persist });
+                return { success: true, result, status: scanner.getRelayerStatus() };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/relayer/simulate-quota', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Simulate relayer quota exceeded (dev helper)',
+            body: {
+                type: 'object',
+                properties: {
+                    resetsInSeconds: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const result = scanner.simulateRelayerQuotaExceeded({ resetsInSeconds: b.resetsInSeconds != null ? Number(b.resetsInSeconds) : undefined });
+                return { success: true, result };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
