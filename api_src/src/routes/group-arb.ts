@@ -779,6 +779,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 type: 'object',
                 properties: {
                     source: { type: 'string' },
+                    force: { type: 'boolean' },
                     items: {
                         type: 'array',
                         items: {
@@ -801,7 +802,8 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 const b = request.body as any;
                 const items = Array.isArray(b?.items) ? b.items : [];
                 const source = String(b?.source || 'manual') === 'auto' ? 'auto' : 'manual';
-                const r = await scanner.redeemByConditions(items, { source });
+                const force = b?.force === true;
+                const r = await scanner.redeemByConditions(items, { source, force });
                 return r;
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
@@ -849,6 +851,144 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 }
                 const history = scanner.getHistory();
                 return { success: true, history };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m/candidates', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'List 15m crypto candidates (Up/Down, >= minProb, expiring soon)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await scanner.getCrypto15mCandidates({
+                    minProb: q.minProb != null ? Number(q.minProb) : undefined,
+                    expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
+                    limit: q.limit != null ? Number(q.limit) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get 15m crypto auto trade status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = scanner.getCrypto15mStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/auto/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start 15m crypto auto trade',
+            body: {
+                type: 'object',
+                properties: {
+                    amountUsd: { type: 'number' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    pollMs: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = scanner.startCrypto15mAuto({
+                    enabled: true,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/auto/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop 15m crypto auto trade',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = scanner.stopCrypto15mAuto();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/active/reset', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Reset 15m crypto active order state',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = scanner.resetCrypto15mActive();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/order', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Place a single 15m crypto order (semi mode)',
+            body: {
+                type: 'object',
+                properties: {
+                    conditionId: { type: 'string' },
+                    outcomeIndex: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    minPrice: { type: 'number' },
+                    force: { type: 'boolean' }
+                },
+                required: ['conditionId']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const r = await scanner.placeCrypto15mOrder({
+                    conditionId: String(b.conditionId),
+                    outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    force: b.force === true,
+                    source: 'semi',
+                });
+                return r;
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
