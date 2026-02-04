@@ -11,6 +11,7 @@ import TopWhaleDiscovery from './pages/TopWhaleDiscovery';
 import WatchedWhales from './pages/WatchedWhales';
 import Advanced from './pages/Advanced'; // Advanced Strategy
 import Crypto15m from './pages/Crypto15m';
+import CryptoAll from './pages/CryptoAll';
 
 const { Content } = Layout;
 
@@ -33,6 +34,7 @@ function App() {
                             <Route path="/watched-whales" element={<WatchedWhales />} />
                             <Route path="/advanced" element={<Advanced />} />
                             <Route path="/crypto-15m" element={<Crypto15m />} />
+                            <Route path="/crypto-all" element={<CryptoAll />} />
                         </Routes>
                     </Content>
                 </Layout>

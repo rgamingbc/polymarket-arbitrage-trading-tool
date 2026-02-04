@@ -29,6 +29,21 @@ export class TradingClientOverride {
   private initialized = false;
   private proxyAddress: string | undefined;
 
+  private normalizeErrorMsg(raw: any): string {
+    const s =
+      raw == null ? ''
+      : typeof raw === 'string' ? raw
+      : raw instanceof Error ? raw.message
+      : typeof raw?.message === 'string' ? raw.message
+      : (() => {
+          try { return JSON.stringify(raw); } catch { return String(raw); }
+        })();
+    const t = String(s || '').trim();
+    if (!t) return 'unknown_error';
+    if (t.length > 500) return `${t.slice(0, 500)}…`;
+    return t;
+  }
+
   constructor(
     private rateLimiter: RateLimiter,
     private config: TradingClientConfig
@@ -169,25 +184,31 @@ export class TradingClientOverride {
       const orderType = params.orderType === 'GTD' ? ClobOrderType.GTD : ClobOrderType.GTC;
       price = this.normalizePrice(price, tickSize);
 
-      const result = await this.clobClient!.createAndPostOrder(
-          {
-            tokenID: tokenId,
-            side: params.side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
-            price: price,
-            size: size,
-            expiration: params.expiration || 0,
-          },
-          { tickSize, negRisk },
-          orderType
-        );
-        
-        return {
-          success: !!(result?.orderID),
-          orderId: result?.orderID,
-          transactionHashes: result?.transactionsHashes,
-          errorMsg: result?.errorMsg || (!result?.orderID ? 'Order rejected or not accepted' : undefined),
-          rawStatus: result?.status
-        };
+      try {
+        const result = await this.clobClient!.createAndPostOrder(
+            {
+              tokenID: tokenId,
+              side: params.side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
+              price: price,
+              size: size,
+              expiration: params.expiration || 0,
+            },
+            { tickSize, negRisk },
+            orderType
+          );
+          
+          const ok = !!(result?.orderID);
+          const errorMsg = result?.errorMsg != null ? this.normalizeErrorMsg(result?.errorMsg) : (!ok ? 'order_rejected' : undefined);
+          return {
+            success: ok,
+            orderId: result?.orderID,
+            transactionHashes: result?.transactionsHashes,
+            errorMsg,
+            rawStatus: result?.status
+          };
+      } catch (e: any) {
+        return { success: false, errorMsg: this.normalizeErrorMsg(e) };
+      }
   }
 
   async createMarketOrder(params: any): Promise<any> {
@@ -221,23 +242,29 @@ export class TradingClientOverride {
         // ignore
       }
 
-      const result = await this.clobClient!.createAndPostMarketOrder(
-        {
-          tokenID: tokenId,
-          side,
-          amount,
-          price: params.price != null ? this.normalizePrice(Number(params.price), tickSize) : undefined,
-        },
-        { tickSize, negRisk },
-        orderType
-      );
+      try {
+        const result = await this.clobClient!.createAndPostMarketOrder(
+          {
+            tokenID: tokenId,
+            side,
+            amount,
+            price: params.price != null ? this.normalizePrice(Number(params.price), tickSize) : undefined,
+          },
+          { tickSize, negRisk },
+          orderType
+        );
 
-      return {
-        success: result.success || (!!result.orderID),
-        orderId: result.orderID,
-        transactionHashes: result.transactionsHashes,
-        errorMsg: result.errorMsg
-      };
+        const ok = !!(result?.success) || !!(result?.orderID);
+        const errorMsg = result?.errorMsg != null ? this.normalizeErrorMsg(result?.errorMsg) : (!ok ? 'order_rejected' : undefined);
+        return {
+          success: ok,
+          orderId: result?.orderID,
+          transactionHashes: result?.transactionsHashes,
+          errorMsg
+        };
+      } catch (e: any) {
+        return { success: false, errorMsg: this.normalizeErrorMsg(e) };
+      }
   }
 
   async getOrder(orderId: string): Promise<any> {

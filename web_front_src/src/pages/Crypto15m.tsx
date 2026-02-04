@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Button, Card, InputNumber, Table, Tag, Typography, Space, Alert, Tooltip } from 'antd';
+import { Button, Card, InputNumber, Select, Table, Tag, Typography, Space, Alert, Tooltip } from 'antd';
 import { PlayCircleOutlined, PauseCircleOutlined, ReloadOutlined, ShoppingCartOutlined, SafetyCertificateOutlined, DeleteOutlined } from '@ant-design/icons';
 import axios from 'axios';
 
@@ -17,6 +17,7 @@ function Crypto15m() {
     const [watchdog, setWatchdog] = useState<any>(null);
     const [health, setHealth] = useState<any>(null);
     const [history, setHistory] = useState<any[]>([]);
+    const [historyStrategy, setHistoryStrategy] = useState<'crypto15m' | 'cryptoall' | 'all'>('crypto15m');
     const [autoRefresh, setAutoRefresh] = useState(true);
     const [showPendingOnly, setShowPendingOnly] = useState(false);
     const [editing, setEditing] = useState(false);
@@ -27,6 +28,7 @@ function Crypto15m() {
     const [btcMinDelta, setBtcMinDelta] = useState<number>(600);
     const [ethMinDelta, setEthMinDelta] = useState<number>(30);
     const [solMinDelta, setSolMinDelta] = useState<number>(0.8);
+    const [xrpMinDelta, setXrpMinDelta] = useState<number>(0.0065);
     const [historySummary, setHistorySummary] = useState<any>(null);
     const [startLoading, setStartLoading] = useState(false);
     const [stopLoading, setStopLoading] = useState(false);
@@ -81,16 +83,17 @@ function Crypto15m() {
             if (parsed?.btcMinDelta != null) setBtcMinDelta(Number(parsed.btcMinDelta));
             if (parsed?.ethMinDelta != null) setEthMinDelta(Number(parsed.ethMinDelta));
             if (parsed?.solMinDelta != null) setSolMinDelta(Number(parsed.solMinDelta));
+            if (parsed?.xrpMinDelta != null) setXrpMinDelta(Number(parsed.xrpMinDelta));
         } catch {
         }
     }, []);
 
     useEffect(() => {
         try {
-            localStorage.setItem('crypto15m_settings_v1', JSON.stringify({ minProb, expiresWithinSec, amountUsd, pollMs, btcMinDelta, ethMinDelta, solMinDelta }));
+            localStorage.setItem('crypto15m_settings_v1', JSON.stringify({ minProb, expiresWithinSec, amountUsd, pollMs, btcMinDelta, ethMinDelta, solMinDelta, xrpMinDelta }));
         } catch {
         }
-    }, [minProb, expiresWithinSec, amountUsd, pollMs, btcMinDelta, ethMinDelta, solMinDelta]);
+    }, [minProb, expiresWithinSec, amountUsd, pollMs, btcMinDelta, ethMinDelta, solMinDelta, xrpMinDelta]);
 
     const fetchStatus = async () => {
         const res = await api.get('/group-arb/crypto15m/status');
@@ -122,10 +125,45 @@ function Crypto15m() {
     };
 
     const fetchHistory = async () => {
-        const res = await api.get('/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
-        const h = Array.isArray(res.data?.history) ? res.data.history : [];
-        setHistory(h);
-        setHistorySummary(res.data?.summary || null);
+        if (historyStrategy === 'crypto15m') {
+            const res = await api.get('/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
+            const h = Array.isArray(res.data?.history) ? res.data.history : [];
+            setHistory(h.map((x: any) => ({ ...x, strategy: 'crypto15m' })));
+            setHistorySummary(res.data?.summary || null);
+            return;
+        }
+        if (historyStrategy === 'cryptoall') {
+            const res = await api.get('/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
+            const h = Array.isArray(res.data?.history) ? res.data.history : [];
+            setHistory(h.map((x: any) => ({ ...x, strategy: 'cryptoall' })));
+            setHistorySummary(res.data?.summary || null);
+            return;
+        }
+        const [r15, rAll] = await Promise.all([
+            api.get('/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
+            api.get('/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
+        ]);
+        const h15 = (Array.isArray(r15.data?.history) ? r15.data.history : []).map((x: any) => ({ ...x, strategy: 'crypto15m' }));
+        const hAll = (Array.isArray(rAll.data?.history) ? rAll.data.history : []).map((x: any) => ({ ...x, strategy: 'cryptoall' }));
+        const merged = h15.concat(hAll).sort((a: any, b: any) => {
+            const ta = Date.parse(String(a?.timestamp || '')) || 0;
+            const tb = Date.parse(String(b?.timestamp || '')) || 0;
+            return tb - ta;
+        }).slice(0, 80);
+        const s15 = r15.data?.summary || {};
+        const sAll = rAll.data?.summary || {};
+        const sum = {
+            count: Number(s15.count || 0) + Number(sAll.count || 0),
+            totalStakeUsd: Number(s15.totalStakeUsd || 0) + Number(sAll.totalStakeUsd || 0),
+            pnlTotalUsdc: Number(s15.pnlTotalUsdc || 0) + Number(sAll.pnlTotalUsdc || 0),
+            winCount: Number(s15.winCount || 0) + Number(sAll.winCount || 0),
+            lossCount: Number(s15.lossCount || 0) + Number(sAll.lossCount || 0),
+            openCount: Number(s15.openCount || 0) + Number(sAll.openCount || 0),
+            redeemableCount: Number(s15.redeemableCount || 0) + Number(sAll.redeemableCount || 0),
+            redeemedCount: Number(s15.redeemedCount || 0) + Number(sAll.redeemedCount || 0),
+        };
+        setHistory(merged);
+        setHistorySummary(sum);
     };
 
     const fetchHealth = async () => {
@@ -152,6 +190,7 @@ function Crypto15m() {
             if (t?.btcMinDelta != null) setBtcMinDelta(Number(t.btcMinDelta));
             if (t?.ethMinDelta != null) setEthMinDelta(Number(t.ethMinDelta));
             if (t?.solMinDelta != null) setSolMinDelta(Number(t.solMinDelta));
+            if (t?.xrpMinDelta != null) setXrpMinDelta(Number(t.xrpMinDelta));
         } finally {
             setThresholdsLoading(false);
         }
@@ -160,7 +199,7 @@ function Crypto15m() {
     const saveThresholds = async () => {
         setThresholdsSaving(true);
         try {
-            await api.post('/group-arb/crypto15m/delta-thresholds', { btcMinDelta, ethMinDelta, solMinDelta });
+            await api.post('/group-arb/crypto15m/delta-thresholds', { btcMinDelta, ethMinDelta, solMinDelta, xrpMinDelta });
         } finally {
             setThresholdsSaving(false);
         }
@@ -204,7 +243,11 @@ function Crypto15m() {
         return () => {
             if (timerHistoryRef.current) clearInterval(timerHistoryRef.current);
         };
-    }, [autoRefresh, editing]);
+    }, [autoRefresh, editing, historyStrategy]);
+
+    useEffect(() => {
+        fetchHistory().catch(() => {});
+    }, [historyStrategy]);
 
     useEffect(() => {
         if (!autoRefresh) {
@@ -422,7 +465,19 @@ function Crypto15m() {
 
     const historyColumns = useMemo(() => {
         return [
+            {
+                title: 'Strat',
+                dataIndex: 'strategy',
+                key: 'strategy',
+                width: 90,
+                render: (v: any) => {
+                    const s = String(v || '');
+                    const label = s === 'cryptoall' ? 'ALL' : s === 'crypto15m' ? '15M' : s || '-';
+                    return <Tag color={s === 'cryptoall' ? 'purple' : 'blue'}>{label}</Tag>;
+                }
+            },
             { title: 'Time', dataIndex: 'timestamp', key: 'timestamp', width: 190, render: (v: any) => String(v || '').replace('T', ' ').replace('Z', '') },
+            { title: 'TF', dataIndex: 'timeframe', key: 'timeframe', width: 70, render: (v: any) => v ? <Tag>{String(v).toUpperCase()}</Tag> : '-' },
             { title: 'Symbol', dataIndex: 'symbol', key: 'symbol', width: 90, render: (v: any) => <Tag color="blue">{String(v || '').toUpperCase()}</Tag> },
             { title: 'Market', dataIndex: 'title', key: 'title', render: (v: any, r: any) => {
                 const slug = String(r?.slug || '').trim();
@@ -431,14 +486,17 @@ function Crypto15m() {
                 const href = `https://polymarket.com/event/${encodeURIComponent(slug)}`;
                 return <a href={href} target="_blank" rel="noreferrer">{text}</a>;
             } },
-            { title: 'Outcome', dataIndex: 'outcome', key: 'outcome', width: 90, render: (v: any) => String(v || '') },
+            { title: 'Pick', dataIndex: 'outcome', key: 'outcome', width: 90, render: (v: any) => String(v || '') },
             { title: 'Amount', dataIndex: 'amountUsd', key: 'amountUsd', width: 90, render: (v: any) => (v != null ? `$${Number(v).toFixed(0)}` : '-') },
             { title: <Tooltip title="下單前從 CLOB /books 讀到的最低賣價（你買入的參考價）"><span>BestAsk</span></Tooltip>, dataIndex: 'bestAsk', key: 'bestAsk', width: 90, render: (v: any) => (v != null ? toCents(v) : '-') },
             { title: <Tooltip title="送單的最高買入價上限（FAK：能成交就成交，剩下直接取消）"><span>Limit</span></Tooltip>, dataIndex: 'limitPrice', key: 'limitPrice', width: 90, render: (v: any) => (v != null ? toCents(v) : '-') },
             { title: 'Order', dataIndex: 'orderStatus', key: 'orderStatus', width: 90, render: (v: any) => (v ? <Tag>{String(v)}</Tag> : '-') },
             { title: 'Filled', dataIndex: 'filledSize', key: 'filledSize', width: 80, render: (v: any) => (v != null ? Number(v).toFixed(2) : '-') },
             { title: 'Result', dataIndex: 'result', key: 'result', width: 90, render: (v: any) => <Tag color={String(v) === 'WIN' ? 'green' : String(v) === 'LOSS' ? 'red' : 'default'}>{String(v || '-')}</Tag> },
-            { title: <Tooltip title="Data API 的 cashPnl（USDC）。OPEN 時多半是未實現損益/手續費/四捨五入造成的小數偏差，非最終結果"><span>PnL</span></Tooltip>, dataIndex: 'cashPnl', key: 'cashPnl', width: 90, render: (v: any) => (v != null ? Number(v).toFixed(4) : '-') },
+            { title: <Tooltip title="優先顯示本策略的 realizedPnL（已 redeem 才有）；否則 fallback 到 Data API 的 cashPnl。"><span>PnL</span></Tooltip>, dataIndex: 'cashPnl', key: 'cashPnl', width: 90, render: (v: any, r: any) => {
+                const x = r?.realizedPnlUsdc != null ? r.realizedPnlUsdc : v;
+                return x != null ? Number(x).toFixed(4) : '-';
+            } },
             {
                 title: <Tooltip title="部位/兌付流程狀態：open=仍持倉且未結算；redeemable=可領；✅=已領且有回款；loss=已領但 0 回款"><span>State</span></Tooltip>,
                 key: 'state',
@@ -486,6 +544,8 @@ function Crypto15m() {
                     <InputNumber min={0} step={1} value={ethMinDelta} onChange={(v) => setEthMinDelta(Math.max(0, Number(v)))} />
                     <span style={{ color: '#ddd' }}>Δ SOL</span>
                     <InputNumber min={0} step={0.1} value={solMinDelta} onChange={(v) => setSolMinDelta(Math.max(0, Number(v)))} />
+                    <span style={{ color: '#ddd' }}>Δ XRP</span>
+                    <InputNumber min={0} step={0.0001} value={xrpMinDelta} onChange={(v) => setXrpMinDelta(Math.max(0, Number(v)))} />
                     <Button onClick={saveThresholds} loading={thresholdsSaving} disabled={thresholdsLoading}>
                         Confirm
                     </Button>
@@ -533,6 +593,16 @@ function Crypto15m() {
                     <Button onClick={() => setShowPendingOnly((v) => !v)} type={showPendingOnly ? 'primary' : 'default'}>
                         {showPendingOnly ? 'History: Pending' : 'History: All'}
                     </Button>
+                    <Select
+                        value={historyStrategy}
+                        style={{ width: 180 }}
+                        onChange={(v) => setHistoryStrategy(v)}
+                        options={[
+                            { label: 'History: Crypto15m', value: 'crypto15m' },
+                            { label: 'History: CryptoAll', value: 'cryptoall' },
+                            { label: 'History: All', value: 'all' },
+                        ]}
+                    />
                     <Button
                         icon={<SafetyCertificateOutlined />}
                         onClick={async () => {

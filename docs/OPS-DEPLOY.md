@@ -14,8 +14,11 @@
 ## 健康檢查（雲端）
 
     curl -I http://56.68.6.71/crypto-15m | head
+    curl -I http://56.68.6.71/crypto-all | head
     curl -sS http://56.68.6.71/api/group-arb/crypto15m/status | head
     curl -sS http://56.68.6.71/api/group-arb/crypto15m/diag | head
+    curl -sS http://56.68.6.71/api/group-arb/cryptoall/status | head
+    curl -sS http://56.68.6.71/api/group-arb/cryptoall/candidates | head
     curl -sS http://56.68.6.71/api/group-arb/history | head
 
 ## 雲端部署（建議：部署 tag）
@@ -51,6 +54,8 @@
 
     curl -I http://56.68.6.71/crypto-15m | head
     curl -sS http://56.68.6.71/api/group-arb/crypto15m/diag | head
+    curl -I http://56.68.6.71/crypto-all | head
+    curl -sS http://56.68.6.71/api/group-arb/cryptoall/status | head
 
 ## 回滾（rollback 到上一個 tag）
 
@@ -107,4 +112,3 @@
     sudo mkswap /swapfile
     sudo swapon /swapfile
     free -m
-

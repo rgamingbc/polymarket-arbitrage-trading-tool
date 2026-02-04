@@ -11,7 +11,7 @@ dotenv.config({ path: path.resolve(process.cwd(), '.env') });
 
 export const config = {
     // ===== 服务器配置 =====
-    port: parseInt(process.env.API_PORT || '3000'),     // 服务端口，环境变量: API_PORT
+    port: parseInt(process.env.API_PORT || '3001'),     // 服务端口，环境变量: API_PORT
     host: process.env.API_HOST || '0.0.0.0',            // 服务地址，环境变量: API_HOST
 
     // ===== CORS 配置 =====

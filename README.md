@@ -7,6 +7,26 @@
 
 Polymarket 统一 TypeScript SDK - 预测市场交易、套利检测、聪明钱分析和完整市场数据。
 
+## FKPolyTools（Auto Trade UI）
+
+如果你係要用本 repo 入面嘅自動交易 UI（例如 Crypto15m / CryptoAll），入口係：
+
+- 后端：`FKPolyTools_Repo/api_src`
+- 前端：`FKPolyTools_Repo/web_front_src`
+- 指引：`FKPolyTools_Repo/docs/HANDOFF.md`、`FKPolyTools_Repo/docs/backup-reinstall-plan.md`
+
+最小啟動：
+
+```bash
+cd FKPolyTools_Repo/api_src
+npm ci
+API_PORT=3001 npm run dev
+
+cd ../web_front_src
+npm ci
+API_PORT=3001 npm run dev
+```
+
 **开发者**: [@hhhx402](https://x.com/hhhx402) | **项目**: [Catalyst.fun](https://x.com/catalystdotfun)
 
 ## 核心功能
@@ -619,4 +639,3 @@ pnpm dev    # 启动: http://localhost:5173
 ## 许可
 
 MIT
-

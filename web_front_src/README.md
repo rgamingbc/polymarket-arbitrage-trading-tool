@@ -5,33 +5,33 @@ Polymarket Web 仪表盘，基于 React + Vite + Ant Design 构建。
 ## 快速开始
 
 ```bash
-# 安装依赖
-pnpm install
+# 安装依赖（推荐：可复现）
+npm ci
 
 # 开发模式
-pnpm dev
+API_PORT=3001 npm run dev
 
 # 构建
-pnpm build
+npm run build
 
 # 预览构建
-pnpm preview
+npm run preview
 ```
 
 ## 启动说明
 
-**注意：** 前端需要 API 后端服务运行在 `localhost:3000`。
+**注意：** 前端通过 Vite proxy 转发 `/api` 到后端，默认后端端口是 `API_PORT=3001`（可改环境变量）。
 
 ```bash
 # 1. 先启动 API 服务
 cd ../api_src
-pnpm install
-pnpm dev
+npm ci
+API_PORT=3001 npm run dev
 
 # 2. 再启动前端
 cd ../web_front_src
-pnpm install
-pnpm dev
+npm ci
+API_PORT=3001 npm run dev
 ```
 
 访问 http://localhost:5173
