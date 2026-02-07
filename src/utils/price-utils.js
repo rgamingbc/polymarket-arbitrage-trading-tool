@@ -184,21 +184,37 @@ export function checkArbitrage(yesAsk, noAsk, yesBid, noBid) {
     // Long arbitrage: Buy complete set (YES + NO) cheaper than $1
     const effectiveLongCost = effective.effectiveBuyYes + effective.effectiveBuyNo;
     const longProfit = 1 - effectiveLongCost;
-    if (longProfit > 0) {
+    // Short arbitrage: Sell complete set (YES + NO) for more than $1
+    const effectiveShortRevenue = effective.effectiveSellYes + effective.effectiveSellNo;
+    const shortProfit = effectiveShortRevenue - 1;
+    const naiveLongProfit = 1 - (yesAsk + noAsk);
+    const naiveShortProfit = (yesBid + noBid) - 1;
+    if (naiveLongProfit > 0 || naiveShortProfit > 0) {
+        if (naiveShortProfit > naiveLongProfit) {
+            return {
+                type: 'short',
+                profit: shortProfit,
+                description: `Split $1, Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)}`,
+            };
+        }
         return {
             type: 'long',
             profit: longProfit,
             description: `Buy YES @ ${effective.effectiveBuyYes.toFixed(4)} + NO @ ${effective.effectiveBuyNo.toFixed(4)}, Merge for $1`,
         };
     }
-    // Short arbitrage: Sell complete set (YES + NO) for more than $1
-    const effectiveShortRevenue = effective.effectiveSellYes + effective.effectiveSellNo;
-    const shortProfit = effectiveShortRevenue - 1;
-    if (shortProfit > 0) {
+    if (longProfit > 0 || shortProfit > 0) {
+        if (shortProfit > longProfit) {
+            return {
+                type: 'short',
+                profit: shortProfit,
+                description: `Split $1, Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)}`,
+            };
+        }
         return {
-            type: 'short',
-            profit: shortProfit,
-            description: `Split $1, Sell YES @ ${effective.effectiveSellYes.toFixed(4)} + NO @ ${effective.effectiveSellNo.toFixed(4)}`,
+            type: 'long',
+            profit: longProfit,
+            description: `Buy YES @ ${effective.effectiveBuyYes.toFixed(4)} + NO @ ${effective.effectiveBuyNo.toFixed(4)}, Merge for $1`,
         };
     }
     return null;
