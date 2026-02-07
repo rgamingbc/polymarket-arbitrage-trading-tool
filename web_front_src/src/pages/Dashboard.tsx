@@ -52,6 +52,12 @@ export default function Dashboard() {
     const [autoRedeemEnabled, setAutoRedeemEnabled] = useState(false);
     const [autoRedeemMaxPerCycle, setAutoRedeemMaxPerCycle] = useState(20);
     const [relayerStatus, setRelayerStatus] = useState<any>(null);
+    const [setupStatus, setSetupStatus] = useState<any>(null);
+    const [setupPrivateKey, setSetupPrivateKey] = useState('');
+    const [setupProxyAddress, setSetupProxyAddress] = useState('');
+    const [setupSaveLoading, setSetupSaveLoading] = useState(false);
+    const [setupSaveError, setSetupSaveError] = useState<string | null>(null);
+    const [setupSaveSuccess, setSetupSaveSuccess] = useState<string | null>(null);
     const [builderKeys, setBuilderKeys] = useState<any[]>(() => {
         try {
             const raw = localStorage.getItem('builder_relayer_keys_v1');
@@ -188,6 +194,34 @@ export default function Dashboard() {
         }
     };
 
+    const fetchSetupStatus = async () => {
+        try {
+            const res = await api.get('/group-arb/setup/status');
+            const st = res.data?.status || null;
+            setSetupStatus(st);
+            if (st?.proxyAddress != null) setSetupProxyAddress(String(st.proxyAddress || ''));
+        } catch {
+            setSetupStatus(null);
+        }
+    };
+
+    const saveSetup = async () => {
+        setSetupSaveLoading(true);
+        setSetupSaveError(null);
+        setSetupSaveSuccess(null);
+        try {
+            const res = await api.post('/group-arb/setup/config', { privateKey: setupPrivateKey || undefined, proxyAddress: setupProxyAddress || undefined });
+            setSetupStatus(res.data?.status || null);
+            setSetupPrivateKey('');
+            setSetupSaveSuccess('Saved and applied.');
+            await Promise.all([fetchSetupStatus(), fetchPortfolio(), fetchRedeemStatus(), fetchHistory()]);
+        } catch (e: any) {
+            setSetupSaveError(e?.response?.data?.error || e?.message || String(e));
+        } finally {
+            setSetupSaveLoading(false);
+        }
+    };
+
     const saveRelayerKeys = async () => {
         setRelayerSaveLoading(true);
         setRelayerSaveError(null);
@@ -265,7 +299,7 @@ export default function Dashboard() {
     };
 
     const refreshAll = async () => {
-        await Promise.all([fetchPortfolio(), fetchHistory(), fetchOpenOrders(), fetchTrades(), fetchRedeemStatus(), fetchRelayerStatus()]);
+        await Promise.all([fetchPortfolio(), fetchHistory(), fetchOpenOrders(), fetchTrades(), fetchRedeemStatus(), fetchRelayerStatus(), fetchSetupStatus()]);
         if (pnlMode === 'portfolio') await fetchPnl(range);
         else await fetchCashflow(range);
     };
@@ -278,6 +312,7 @@ export default function Dashboard() {
             fetchTrades();
             fetchRedeemStatus();
             fetchRelayerStatus();
+            fetchSetupStatus();
         }, 15000);
         return () => clearInterval(t);
     }, []);
@@ -504,6 +539,43 @@ export default function Dashboard() {
                         {redeemInfo.lastError ? (
                             <Alert style={{ marginBottom: 8 }} message="Last auto redeem error" description={String(redeemInfo.lastError)} type="warning" showIcon />
                         ) : null}
+                        <div style={{ marginBottom: 10, padding: 12, border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8 }}>
+                            <div style={{ fontSize: 12, color: '#9CA3AF', marginBottom: 8 }}>
+                                Trading Setup (PrivateKey → EOA address is derived automatically; no need to fill EOA).
+                            </div>
+                            {setupSaveError ? (
+                                <Alert style={{ marginBottom: 8 }} message="Setup save failed" description={setupSaveError} type="error" showIcon />
+                            ) : null}
+                            {setupSaveSuccess ? (
+                                <Alert style={{ marginBottom: 8 }} message="Setup saved" description={setupSaveSuccess} type="success" showIcon />
+                            ) : null}
+                            <Space size={8} wrap>
+                                <Input.Password
+                                    placeholder="PrivateKey (0x...)"
+                                    value={setupPrivateKey}
+                                    onChange={(e) => setSetupPrivateKey(e.target.value)}
+                                    style={{ width: 360 }}
+                                />
+                                <Input
+                                    placeholder="Funder / Proxy Address (optional, 0x...)"
+                                    value={setupProxyAddress}
+                                    onChange={(e) => setSetupProxyAddress(e.target.value)}
+                                    style={{ width: 360 }}
+                                />
+                                <Button type="primary" loading={setupSaveLoading} disabled={!setupPrivateKey && !setupProxyAddress} onClick={saveSetup}>
+                                    Save & Apply
+                                </Button>
+                                <Button loading={setupSaveLoading} onClick={() => fetchSetupStatus()}>
+                                    Refresh
+                                </Button>
+                            </Space>
+                            <div style={{ marginTop: 8, fontSize: 12, color: '#9CA3AF' }}>
+                                EOA: <Tag>{String(setupStatus?.eoaAddress || '-')}</Tag>
+                                Funder: <Tag>{String(setupStatus?.funderAddress || '-')}</Tag>
+                                Proxy: <Tag>{String(setupStatus?.proxyAddress || '-')}</Tag>
+                                Key: <Tag color={setupStatus?.hasPrivateKey ? 'green' : 'default'}>{setupStatus?.hasPrivateKey ? 'configured' : 'missing'}</Tag>
+                            </div>
+                        </div>
                         <div style={{ marginBottom: 10, padding: 12, border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8 }}>
                             <div style={{ fontSize: 12, color: '#9CA3AF', marginBottom: 8 }}>
                                 Relayer Setup (Builder credentials). Stored on disk. Add multiple keys to avoid daily quota stops.

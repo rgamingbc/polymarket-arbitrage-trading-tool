@@ -1,10 +1,121 @@
 import { FastifyPluginAsync } from 'fastify';
 import { GroupArbitrageScanner } from '../services/group-arbitrage.js';
 import { config } from '../config.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
-    const scanner = new GroupArbitrageScanner(config.polymarket.privateKey);
+    const setupConfigPath = process.env.POLY_SETUP_CONFIG_PATH
+        ? String(process.env.POLY_SETUP_CONFIG_PATH)
+        : path.join(os.tmpdir(), 'polymarket-tools', 'setup.json');
+
+    const normalizeProxyAddress = (raw: unknown): string | undefined => {
+        const s = raw != null ? String(raw).trim() : '';
+        if (!s) return undefined;
+        const head = s.includes('-') ? s.split('-')[0] : s;
+        if (/^0x[a-fA-F0-9]{40}$/.test(head)) return head;
+        const m2 = s.match(/^(0x[a-fA-F0-9]{40})/);
+        if (m2 && m2[1]) return m2[1];
+        return undefined;
+    };
+
+    const loadSetupConfig = (): { privateKey?: string; proxyAddress?: string } => {
+        try {
+            if (!fs.existsSync(setupConfigPath)) return {};
+            const raw = fs.readFileSync(setupConfigPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const privateKey = parsed?.privateKey != null ? String(parsed.privateKey).trim() : undefined;
+            const proxyAddress = normalizeProxyAddress(parsed?.proxyAddress);
+            return { privateKey: privateKey || undefined, proxyAddress };
+        } catch {
+            return {};
+        }
+    };
+
+    const persistSetupConfig = (cfg: { privateKey?: string; proxyAddress?: string }) => {
+        const dir = path.dirname(setupConfigPath);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(setupConfigPath, JSON.stringify({ privateKey: cfg.privateKey || null, proxyAddress: cfg.proxyAddress || null }), { encoding: 'utf8', mode: 0o600 });
+        try { fs.chmodSync(setupConfigPath, 0o600); } catch {}
+    };
+
+    const applyProxyEnv = (proxyAddress?: string) => {
+        const v = proxyAddress != null ? String(proxyAddress).trim() : '';
+        if (v) process.env.POLY_PROXY_ADDRESS = v;
+        else delete (process.env as any).POLY_PROXY_ADDRESS;
+    };
+
+    const setup = loadSetupConfig();
+    applyProxyEnv(setup.proxyAddress);
+    const effectiveKey = (config.polymarket.privateKey && String(config.polymarket.privateKey).trim()) ? String(config.polymarket.privateKey).trim() : setup.privateKey;
+
+    let scanner = new GroupArbitrageScanner(effectiveKey);
     scanner.start();
+
+    const getSetupStatus = () => {
+        return {
+            hasPrivateKey: (scanner as any).hasPrivateKey ? (scanner as any).hasPrivateKey() : false,
+            eoaAddress: (scanner as any).getEoaAddress ? (scanner as any).getEoaAddress() : null,
+            funderAddress: (scanner as any).getFunderAddress ? (scanner as any).getFunderAddress() : null,
+            proxyAddress: process.env.POLY_PROXY_ADDRESS || null,
+            trading: (scanner as any).getTradingInitStatus ? (scanner as any).getTradingInitStatus() : null,
+            setupConfigPath,
+            setupConfigFilePresent: fs.existsSync(setupConfigPath),
+        };
+    };
+
+    fastify.get('/setup/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get local setup status (PrivateKey/EOA/Funder)',
+        },
+        handler: async (_request, reply) => {
+            try {
+                return { success: true, status: getSetupStatus() };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/setup/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Persist local setup config and hot-reload scanner',
+            body: {
+                type: 'object',
+                properties: {
+                    privateKey: { type: 'string' },
+                    proxyAddress: { type: 'string' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const rawPriv = b.privateKey != null ? String(b.privateKey).trim() : '';
+                const rawProxy = b.proxyAddress != null ? String(b.proxyAddress).trim() : '';
+                const proxyAddress = rawProxy ? normalizeProxyAddress(rawProxy) : undefined;
+                if (rawProxy && !proxyAddress) {
+                    throw new Error('Invalid proxyAddress (expected 0x + 40 hex chars)');
+                }
+                const next = {
+                    privateKey: rawPriv || undefined,
+                    proxyAddress,
+                };
+                persistSetupConfig(next);
+                applyProxyEnv(next.proxyAddress);
+                if ((scanner as any).shutdown) (scanner as any).shutdown();
+                const key = next.privateKey || (config.polymarket.privateKey ? String(config.polymarket.privateKey).trim() : undefined);
+                scanner = new GroupArbitrageScanner(key);
+                scanner.start();
+                return { success: true, status: getSetupStatus() };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
 
     fastify.get('/scan', {
         schema: {
@@ -900,6 +1011,30 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.get('/crypto15m/stoploss/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get stoploss sell events (for Crypto15m UI)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    maxEntries: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = (scanner as any).getCrypto15mStoplossHistory({
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.get('/crypto15m/diag', {
         schema: {
             tags: ['Group Arb'],
@@ -961,7 +1096,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
     fastify.get('/crypto15m/delta-thresholds', {
         schema: {
             tags: ['Group Arb'],
-            summary: 'Get crypto15m min delta thresholds (BTC/ETH/SOL)',
+            summary: 'Get crypto15m min delta thresholds (BTC/ETH/SOL/XRP)',
         },
         handler: async (_request, reply) => {
             try {
@@ -983,6 +1118,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     btcMinDelta: { type: 'number' },
                     ethMinDelta: { type: 'number' },
                     solMinDelta: { type: 'number' },
+                    xrpMinDelta: { type: 'number' },
                 }
             }
         },
@@ -993,9 +1129,66 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     btcMinDelta: b.btcMinDelta != null ? Number(b.btcMinDelta) : undefined,
                     ethMinDelta: b.ethMinDelta != null ? Number(b.ethMinDelta) : undefined,
                     solMinDelta: b.solMinDelta != null ? Number(b.solMinDelta) : undefined,
+                    xrpMinDelta: b.xrpMinDelta != null ? Number(b.xrpMinDelta) : undefined,
                     persist: true,
                 });
                 return { success: true, thresholds };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Persist crypto15m settings (no auto start/stop)',
+            body: {
+                type: 'object',
+                properties: {
+                    amountUsd: { type: 'number' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    pollMs: { type: 'number' },
+                    buySizingMode: { type: 'string' },
+                    trendEnabled: { type: 'boolean' },
+                    trendMinutes: { type: 'number' },
+                    staleMsThreshold: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).updateCrypto15mConfig({
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    buySizingMode: b.buySizingMode != null ? String(b.buySizingMode) : undefined,
+                    trendEnabled: b.trendEnabled != null ? !!b.trendEnabled : undefined,
+                    trendMinutes: b.trendMinutes != null ? Number(b.trendMinutes) : undefined,
+                    staleMsThreshold: b.staleMsThreshold != null ? Number(b.staleMsThreshold) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                });
+                return { success: true, status };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
@@ -1040,7 +1233,19 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     minProb: { type: 'number' },
                     expiresWithinSec: { type: 'number' },
                     pollMs: { type: 'number' },
-                    staleMsThreshold: { type: 'number' }
+                    buySizingMode: { type: 'string' },
+                    trendEnabled: { type: 'boolean' },
+                    trendMinutes: { type: 'number' },
+                    staleMsThreshold: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' }
                 }
             }
         },
@@ -1053,7 +1258,17 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     minProb: b.minProb != null ? Number(b.minProb) : undefined,
                     expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
                     pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    buySizingMode: b.buySizingMode != null ? String(b.buySizingMode) : undefined,
                     staleMsThreshold: b.staleMsThreshold != null ? Number(b.staleMsThreshold) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
                 });
                 return { success: true, status };
             } catch (err: any) {
@@ -1260,6 +1475,12 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     outcomeIndex: { type: 'number' },
                     amountUsd: { type: 'number' },
                     minPrice: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
                     force: { type: 'boolean' }
                 },
                 required: ['conditionId']
@@ -1273,8 +1494,901 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
                     amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
                     minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
                     force: b.force === true,
                     source: 'semi',
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall2/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get CryptoAll2 status (crypto15m-clone base)',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).getCryptoAll2Status();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall2/delta-thresholds', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get CryptoAll2 delta thresholds',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const thresholds = (scanner as any).getCryptoAll2DeltaThresholds();
+                return { success: true, thresholds };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall2/delta-thresholds', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Set CryptoAll2 delta thresholds',
+            body: {
+                type: 'object',
+                properties: {
+                    btcMinDelta: { type: 'number' },
+                    ethMinDelta: { type: 'number' },
+                    solMinDelta: { type: 'number' },
+                    xrpMinDelta: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const thresholds = (scanner as any).setCryptoAll2DeltaThresholds({
+                    btcMinDelta: b.btcMinDelta != null ? Number(b.btcMinDelta) : undefined,
+                    ethMinDelta: b.ethMinDelta != null ? Number(b.ethMinDelta) : undefined,
+                    solMinDelta: b.solMinDelta != null ? Number(b.solMinDelta) : undefined,
+                    xrpMinDelta: b.xrpMinDelta != null ? Number(b.xrpMinDelta) : undefined,
+                });
+                return { success: true, thresholds };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall2/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Persist CryptoAll2 settings (no auto start/stop)',
+            body: {
+                type: 'object',
+                properties: {
+                    pollMs: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    minProb: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    symbols: { type: 'array', items: { type: 'string' } },
+                    dojiGuardEnabled: { type: 'boolean' },
+                    riskSkipScore: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    splitBuyTrendEnabled: { type: 'boolean' },
+                    splitBuyTrendMinutes3m: { type: 'number' },
+                    splitBuyTrendMinutes2m: { type: 'number' },
+                    splitBuyTrendMinutes1m: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).updateCryptoAll2Config({
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x || '').toUpperCase()).filter(Boolean) : undefined,
+                    dojiGuardEnabled: b.dojiGuardEnabled != null ? !!b.dojiGuardEnabled : undefined,
+                    riskSkipScore: b.riskSkipScore != null ? Number(b.riskSkipScore) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    splitBuyTrendEnabled: b.splitBuyTrendEnabled != null ? !!b.splitBuyTrendEnabled : undefined,
+                    splitBuyTrendMinutes3m: b.splitBuyTrendMinutes3m != null ? Number(b.splitBuyTrendMinutes3m) : undefined,
+                    splitBuyTrendMinutes2m: b.splitBuyTrendMinutes2m != null ? Number(b.splitBuyTrendMinutes2m) : undefined,
+                    splitBuyTrendMinutes1m: b.splitBuyTrendMinutes1m != null ? Number(b.splitBuyTrendMinutes1m) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall2/auto/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start CryptoAll2 auto (15m-only, crypto15m base)',
+            body: {
+                type: 'object',
+                properties: {
+                    pollMs: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    minProb: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    symbols: { type: 'array', items: { type: 'string' } },
+                    dojiGuardEnabled: { type: 'boolean' },
+                    riskSkipScore: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    splitBuyTrendEnabled: { type: 'boolean' },
+                    splitBuyTrendMinutes3m: { type: 'number' },
+                    splitBuyTrendMinutes2m: { type: 'number' },
+                    splitBuyTrendMinutes1m: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).startCryptoAll2Auto({
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x || '').toUpperCase()).filter(Boolean) : undefined,
+                    dojiGuardEnabled: b.dojiGuardEnabled != null ? !!b.dojiGuardEnabled : undefined,
+                    riskSkipScore: b.riskSkipScore != null ? Number(b.riskSkipScore) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    splitBuyTrendEnabled: b.splitBuyTrendEnabled != null ? !!b.splitBuyTrendEnabled : undefined,
+                    splitBuyTrendMinutes3m: b.splitBuyTrendMinutes3m != null ? Number(b.splitBuyTrendMinutes3m) : undefined,
+                    splitBuyTrendMinutes2m: b.splitBuyTrendMinutes2m != null ? Number(b.splitBuyTrendMinutes2m) : undefined,
+                    splitBuyTrendMinutes1m: b.splitBuyTrendMinutes1m != null ? Number(b.splitBuyTrendMinutes1m) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall2/auto/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop CryptoAll2 auto',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).stopCryptoAll2Auto();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall2/candidates', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'List CryptoAll2 candidates (15m Up/Down, crypto15m base)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    symbols: { type: 'string' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await (scanner as any).getCryptoAll2Candidates({
+                    symbols: q.symbols != null ? String(q.symbols) : undefined,
+                    minProb: q.minProb != null ? Number(q.minProb) : undefined,
+                    expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
+                    limit: q.limit != null ? Number(q.limit) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall2/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get cryptoall2 strategy history (investor view)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    refresh: { type: 'boolean' },
+                    intervalMs: { type: 'number' },
+                    maxEntries: { type: 'number' },
+                    includeSkipped: { type: 'boolean' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await (scanner as any).getCryptoAll2History({
+                    refresh: String(q.refresh || '') === '1' || String(q.refresh || '') === 'true',
+                    intervalMs: q.intervalMs != null ? Number(q.intervalMs) : undefined,
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                    includeSkipped: String(q.includeSkipped || '') === '1' || String(q.includeSkipped || '') === 'true',
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall2/stoploss/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get stoploss sell events (for CryptoAll2 UI)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    maxEntries: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = (scanner as any).getCryptoAll2StoplossHistory({
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall2/order', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Place a single CryptoAll2 order (semi mode)',
+            body: {
+                type: 'object',
+                properties: {
+                    conditionId: { type: 'string' },
+                    outcomeIndex: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    minPrice: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    force: { type: 'boolean' }
+                },
+                required: ['conditionId']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const r = await (scanner as any).placeCryptoAll2Order({
+                    conditionId: String(b.conditionId),
+                    outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    force: b.force === true,
+                    source: 'semi',
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get Crypto All auto trade status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).getCryptoAllStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/watchdog/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start cryptoall watchdog (12h monitor + auto stop on issues)',
+            body: {
+                type: 'object',
+                properties: {
+                    durationHours: { type: 'number' },
+                    pollMs: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).startCryptoAllWatchdog({
+                    durationHours: b.durationHours != null ? Number(b.durationHours) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/watchdog/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop cryptoall watchdog (and generate report)',
+            body: {
+                type: 'object',
+                properties: {
+                    reason: { type: 'string' },
+                    stopAuto: { type: 'boolean' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).stopCryptoAllWatchdog({
+                    reason: b.reason != null ? String(b.reason) : undefined,
+                    stopAuto: b.stopAuto != null ? !!b.stopAuto : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/watchdog/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get cryptoall watchdog status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).getCryptoAllWatchdogStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/watchdog/report/latest', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get latest cryptoall watchdog report',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const report = (scanner as any).getCryptoAllWatchdogReportLatest();
+                return report;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/diag', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'CryptoAll diagnostics (sources + risk cache)',
+        },
+        handler: async (_request, reply) => {
+            try {
+                return (scanner as any).getCryptoAllDiag();
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/ws', {
+        websocket: true,
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'CryptoAll realtime snapshot feed (websocket)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    symbols: { type: 'string' },
+                    timeframes: { type: 'string' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    limit: { type: 'number' },
+                }
+            }
+        },
+    }, async (connection: any, request) => {
+        const sock = (connection as any)?.socket ?? connection;
+        const q = (request.query || {}) as any;
+        (scanner as any).addCryptoAllWsClient(sock, {
+            symbols: q.symbols != null ? String(q.symbols) : undefined,
+            timeframes: q.timeframes != null ? String(q.timeframes) : undefined,
+            minProb: q.minProb != null ? Number(q.minProb) : undefined,
+            expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
+            limit: q.limit != null ? Number(q.limit) : undefined,
+        });
+        sock.on('close', () => {
+            try { (scanner as any).removeCryptoAllWsClient(sock); } catch {}
+        });
+    });
+
+    fastify.get('/cryptoall/candidates', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'List Crypto All candidates (timeframes + symbols)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    symbols: { type: 'string' },
+                    timeframes: { type: 'string' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    limit: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await (scanner as any).getCryptoAllCandidates({
+                    symbols: q.symbols != null ? String(q.symbols) : undefined,
+                    timeframes: q.timeframes != null ? String(q.timeframes) : undefined,
+                    minProb: q.minProb != null ? Number(q.minProb) : undefined,
+                    expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
+                    limit: q.limit != null ? Number(q.limit) : undefined,
+                });
+                return { success: true, candidates: r };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get cryptoall strategy history (investor view)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    refresh: { type: 'boolean' },
+                    intervalMs: { type: 'number' },
+                    maxEntries: { type: 'number' },
+                    includeSkipped: { type: 'boolean' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await (scanner as any).getCryptoAllHistory({
+                    refresh: String(q.refresh || '') === '1' || String(q.refresh || '') === 'true',
+                    intervalMs: q.intervalMs != null ? Number(q.intervalMs) : undefined,
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                    includeSkipped: String(q.includeSkipped || '') === '1' || String(q.includeSkipped || '') === 'true',
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/stoploss/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get stoploss sell events (for CryptoAll UI)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    maxEntries: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = (scanner as any).getCryptoAllStoplossHistory({
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Persist CryptoAll settings (no auto start/stop)',
+            body: {
+                type: 'object',
+                properties: {
+                    pollMs: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    minProb: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    symbols: { type: 'array', items: { type: 'string' } },
+                    dojiGuardEnabled: { type: 'boolean' },
+                    riskSkipScore: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    splitBuyTrendEnabled: { type: 'boolean' },
+                    splitBuyTrendMinutes3m: { type: 'number' },
+                    splitBuyTrendMinutes2m: { type: 'number' },
+                    splitBuyTrendMinutes1m: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                (scanner as any).updateCryptoAllConfig({
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x || '').toUpperCase()).filter(Boolean) : undefined,
+                    dojiGuardEnabled: b.dojiGuardEnabled != null ? !!b.dojiGuardEnabled : undefined,
+                    riskSkipScore: b.riskSkipScore != null ? Number(b.riskSkipScore) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    splitBuyTrendEnabled: b.splitBuyTrendEnabled != null ? !!b.splitBuyTrendEnabled : undefined,
+                    splitBuyTrendMinutes3m: b.splitBuyTrendMinutes3m != null ? Number(b.splitBuyTrendMinutes3m) : undefined,
+                    splitBuyTrendMinutes2m: b.splitBuyTrendMinutes2m != null ? Number(b.splitBuyTrendMinutes2m) : undefined,
+                    splitBuyTrendMinutes1m: b.splitBuyTrendMinutes1m != null ? Number(b.splitBuyTrendMinutes1m) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                });
+                return { success: true, status: (scanner as any).getCryptoAllStatus() };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/cryptoall/delta-thresholds', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get cryptoall min delta thresholds (BTC/ETH/SOL/XRP)',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const thresholds = (scanner as any).getCryptoAllDeltaThresholds();
+                return { success: true, thresholds };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/delta-thresholds', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Update cryptoall min delta thresholds (persisted)',
+            body: {
+                type: 'object',
+                properties: {
+                    btcMinDelta: { type: 'number' },
+                    ethMinDelta: { type: 'number' },
+                    solMinDelta: { type: 'number' },
+                    xrpMinDelta: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const thresholds = (scanner as any).setCryptoAllDeltaThresholds({
+                    btcMinDelta: b.btcMinDelta != null ? Number(b.btcMinDelta) : undefined,
+                    ethMinDelta: b.ethMinDelta != null ? Number(b.ethMinDelta) : undefined,
+                    solMinDelta: b.solMinDelta != null ? Number(b.solMinDelta) : undefined,
+                    xrpMinDelta: b.xrpMinDelta != null ? Number(b.xrpMinDelta) : undefined,
+                    persist: true,
+                });
+                return { success: true, thresholds };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/auto/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start Crypto All auto trade',
+            body: {
+                type: 'object',
+                properties: {
+                    amountUsd: { type: 'number' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    pollMs: { type: 'number' },
+                    symbols: { type: 'array', items: { type: 'string' } },
+                    timeframes: { type: 'array', items: { type: 'string' } },
+                    dojiGuardEnabled: { type: 'boolean' },
+                    riskSkipScore: { type: 'number' },
+                    riskAddOnBlockScore: { type: 'number' },
+                    addOnEnabled: { type: 'boolean' },
+                    addOnMultiplierA: { type: 'number' },
+                    addOnMultiplierB: { type: 'number' },
+                    addOnMultiplierC: { type: 'number' },
+                    addOnAccelEnabled: { type: 'boolean' },
+                    addOnTrendEnabled: { type: 'boolean' },
+                    addOnTrendMinutesA: { type: 'number' },
+                    addOnTrendMinutesB: { type: 'number' },
+                    addOnTrendMinutesC: { type: 'number' },
+                    addOnMaxTotalStakeUsdPerPosition: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossSpreadGuardCents: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    splitBuyTrendEnabled: { type: 'boolean' },
+                    splitBuyTrendMinutes3m: { type: 'number' },
+                    splitBuyTrendMinutes2m: { type: 'number' },
+                    splitBuyTrendMinutes1m: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).startCryptoAllAuto({
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x)) : undefined,
+                    timeframes: Array.isArray(b.timeframes) ? b.timeframes.map((x: any) => String(x)) : undefined,
+                    dojiGuardEnabled: b.dojiGuardEnabled != null ? !!b.dojiGuardEnabled : undefined,
+                    riskSkipScore: b.riskSkipScore != null ? Number(b.riskSkipScore) : undefined,
+                    riskAddOnBlockScore: b.riskAddOnBlockScore != null ? Number(b.riskAddOnBlockScore) : undefined,
+                    addOnEnabled: b.addOnEnabled != null ? !!b.addOnEnabled : undefined,
+                    addOnMultiplierA: b.addOnMultiplierA != null ? Number(b.addOnMultiplierA) : undefined,
+                    addOnMultiplierB: b.addOnMultiplierB != null ? Number(b.addOnMultiplierB) : undefined,
+                    addOnMultiplierC: b.addOnMultiplierC != null ? Number(b.addOnMultiplierC) : undefined,
+                    addOnAccelEnabled: b.addOnAccelEnabled != null ? !!b.addOnAccelEnabled : undefined,
+                    addOnTrendEnabled: b.addOnTrendEnabled != null ? !!b.addOnTrendEnabled : undefined,
+                    addOnTrendMinutesA: b.addOnTrendMinutesA != null ? Number(b.addOnTrendMinutesA) : undefined,
+                    addOnTrendMinutesB: b.addOnTrendMinutesB != null ? Number(b.addOnTrendMinutesB) : undefined,
+                    addOnTrendMinutesC: b.addOnTrendMinutesC != null ? Number(b.addOnTrendMinutesC) : undefined,
+                    addOnMaxTotalStakeUsdPerPosition: b.addOnMaxTotalStakeUsdPerPosition != null ? Number(b.addOnMaxTotalStakeUsdPerPosition) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossSpreadGuardCents: b.stoplossSpreadGuardCents != null ? Number(b.stoplossSpreadGuardCents) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    splitBuyTrendEnabled: b.splitBuyTrendEnabled != null ? !!b.splitBuyTrendEnabled : undefined,
+                    splitBuyTrendMinutes3m: b.splitBuyTrendMinutes3m != null ? Number(b.splitBuyTrendMinutes3m) : undefined,
+                    splitBuyTrendMinutes2m: b.splitBuyTrendMinutes2m != null ? Number(b.splitBuyTrendMinutes2m) : undefined,
+                    splitBuyTrendMinutes1m: b.splitBuyTrendMinutes1m != null ? Number(b.splitBuyTrendMinutes1m) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/auto/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop Crypto All auto trade',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).stopCryptoAllAuto();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/active/reset', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Reset Crypto All active order state',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).resetCryptoAllActive();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/order', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Place a single Crypto All order (semi mode)',
+            body: {
+                type: 'object',
+                properties: {
+                    conditionId: { type: 'string' },
+                    outcomeIndex: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    minPrice: { type: 'number' },
+                    splitBuyEnabled: { type: 'boolean' },
+                    splitBuyPct3m: { type: 'number' },
+                    splitBuyPct2m: { type: 'number' },
+                    splitBuyPct1m: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    adaptiveDeltaEnabled: { type: 'boolean' },
+                    adaptiveDeltaBigMoveMultiplier: { type: 'number' },
+                    adaptiveDeltaRevertNoBuyCount: { type: 'number' },
+                    force: { type: 'boolean' },
+                    symbol: { type: 'string' },
+                    timeframe: { type: 'string' }
+                },
+                required: ['conditionId']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const r = await (scanner as any).placeCryptoAllOrder({
+                    conditionId: String(b.conditionId),
+                    outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    splitBuyEnabled: b.splitBuyEnabled != null ? !!b.splitBuyEnabled : undefined,
+                    splitBuyPct3m: b.splitBuyPct3m != null ? Number(b.splitBuyPct3m) : undefined,
+                    splitBuyPct2m: b.splitBuyPct2m != null ? Number(b.splitBuyPct2m) : undefined,
+                    splitBuyPct1m: b.splitBuyPct1m != null ? Number(b.splitBuyPct1m) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    adaptiveDeltaEnabled: b.adaptiveDeltaEnabled != null ? !!b.adaptiveDeltaEnabled : undefined,
+                    adaptiveDeltaBigMoveMultiplier: b.adaptiveDeltaBigMoveMultiplier != null ? Number(b.adaptiveDeltaBigMoveMultiplier) : undefined,
+                    adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
+                    force: b.force === true,
+                    source: 'semi',
+                    symbol: b.symbol != null ? String(b.symbol) : undefined,
+                    timeframe: b.timeframe != null ? String(b.timeframe) : undefined,
                 });
                 return r;
             } catch (err: any) {

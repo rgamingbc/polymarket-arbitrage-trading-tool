@@ -307,6 +307,7 @@ export class ArbitrageService extends EventEmitter {
       maxUsdcRatio: config.maxUsdcRatio ?? 0.8,
       targetUsdcRatio: config.targetUsdcRatio ?? 0.5,
       imbalanceThreshold: config.imbalanceThreshold ?? 5,
+      imbalanceStrategy: config.imbalanceStrategy ?? 'dump',
       rebalanceIntervalMs: config.rebalanceInterval ?? 10000,
       rebalanceCooldown: config.rebalanceCooldown ?? 30000,
       // Execution safety

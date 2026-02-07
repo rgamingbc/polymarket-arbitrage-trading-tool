@@ -96,6 +96,9 @@ export class GroupArbitrageScanner {
     private pnlTimer: any = null;
     private pnlPersistencePath: string;
     private pnlWriteTimer: any = null;
+    private tradingInitTimer: any = null;
+    private tradingInitBackoffMs = 5_000;
+    private tradingInitNextAllowedAtMs = 0;
     private autoRedeemConfig: { enabled: boolean; intervalMs: number; maxPerCycle: number } = { enabled: false, intervalMs: 5_000, maxPerCycle: 20 };
     private autoRedeemTimer: any = null;
     private autoRedeemLast: any = null;
@@ -108,19 +111,74 @@ export class GroupArbitrageScanner {
     private crypto15mAutoEnabled = false;
     private crypto15mAutoTimer: any = null;
     private crypto15mAutoInFlight = false;
-    private crypto15mAutoConfig: { pollMs: number; expiresWithinSec: number; minProb: number; amountUsd: number; staleMsThreshold: number } = { pollMs: 2_000, expiresWithinSec: 180, minProb: 0.9, amountUsd: 1, staleMsThreshold: 2500 };
+    private crypto15mAutoConfigPath: string | null = null;
+    private crypto15mAutoConfigLoadedAt: string | null = null;
+    private crypto15mAutoConfigPersistedAt: string | null = null;
+    private crypto15mAutoConfigPersistLastError: string | null = null;
+    private crypto15mAutoConfig: {
+        pollMs: number;
+        expiresWithinSec: number;
+        minProb: number;
+        amountUsd: number;
+        buySizingMode: 'fixed' | 'orderbook_max' | 'all_capital';
+        trendEnabled: boolean;
+        trendMinutes: number;
+        staleMsThreshold: number;
+        stoplossEnabled: boolean;
+        stoplossCut1DropCents: number;
+        stoplossCut1SellPct: number;
+        stoplossCut2DropCents: number;
+        stoplossCut2SellPct: number;
+        stoplossMinSecToExit: number;
+        adaptiveDeltaEnabled: boolean;
+        adaptiveDeltaBigMoveMultiplier: number;
+        adaptiveDeltaRevertNoBuyCount: number;
+    } = {
+        pollMs: 2_000,
+        expiresWithinSec: 180,
+        minProb: 0.9,
+        amountUsd: 1,
+        buySizingMode: 'fixed',
+        trendEnabled: true,
+        trendMinutes: 1,
+        staleMsThreshold: 5_000,
+        stoplossEnabled: false,
+        stoplossCut1DropCents: 1,
+        stoplossCut1SellPct: 50,
+        stoplossCut2DropCents: 2,
+        stoplossCut2SellPct: 100,
+        stoplossMinSecToExit: 25,
+        adaptiveDeltaEnabled: true,
+        adaptiveDeltaBigMoveMultiplier: 2,
+        adaptiveDeltaRevertNoBuyCount: 4,
+    };
     private crypto15mLastScanAt: string | null = null;
     private crypto15mLastError: string | null = null;
+    private crypto15mLastDecision: any = null;
+    private crypto15mLastCandidateStats: any = null;
+    private crypto15mLastOrderAttempt: any = null;
     private crypto15mOrderLocks: Map<string, { atMs: number; symbol: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
     private crypto15mDeltaThresholdsPath: string | null = null;
-    private crypto15mDeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
+    private crypto15mDeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
         btcMinDelta: 600,
         ethMinDelta: 30,
         solMinDelta: 0.8,
+        xrpMinDelta: 0.0065,
         updatedAt: null,
         loadedAt: null,
         persistLastError: null,
     };
+    private cryptoAll2DeltaThresholdsPath: string | null = null;
+    private cryptoAll2DeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
+        btcMinDelta: 600,
+        ethMinDelta: 30,
+        solMinDelta: 0.8,
+        xrpMinDelta: 0.0065,
+        updatedAt: null,
+        loadedAt: null,
+        persistLastError: null,
+    };
+    private crypto15mAdaptiveDeltaBySymbol: Map<string, { overrideDelta: number | null; noBuyCount: number; lastBigMoveAt: string | null; lastBigMoveDelta: number | null }> = new Map();
     private crypto15mWatchdogTimer: any = null;
     private crypto15mWatchdog: {
         running: boolean;
@@ -187,6 +245,293 @@ export class GroupArbitrageScanner {
     private crypto15mBooksNextAllowedAtMs = 0;
     private crypto15mWsClients: Map<any, { minProb: number; expiresWithinSec: number; limit: number }> = new Map();
     private crypto15mWsTimer: any = null;
+    private cryptoAll2LastError: string | null = null;
+    private cryptoAll2LastDecision: any = null;
+    private cryptoAll2LastCandidateStats: any = null;
+    private cryptoAll2LastOrderAttempt: any = null;
+    private cryptoAll2LastSplitLegAttempt: any = null;
+    private cryptoAll2OrderLocks: Map<string, { atMs: number; symbol: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
+    private cryptoAll2ActivesBySymbol: Map<string, any> = new Map();
+    private cryptoAll2TrackedByCondition: Map<string, any> = new Map();
+    private cryptoAll2AutoEnabled = false;
+    private cryptoAll2AutoTimer: any = null;
+    private cryptoAll2AutoInFlight = false;
+    private cryptoAll2LastScanAt: string | null = null;
+    private cryptoAll2NextScanAllowedAtMs = 0;
+    private cryptoAll2AutoConfigPath: string | null = null;
+    private cryptoAll2AutoConfigLoadedAt: string | null = null;
+    private cryptoAll2AutoConfigPersistedAt: string | null = null;
+    private cryptoAll2AutoConfigPersistLastError: string | null = null;
+    private cryptoAll2AutoConfig: {
+        pollMs: number;
+        expiresWithinSec: number;
+        minProb: number;
+        amountUsd: number;
+        symbols: string[];
+        dojiGuardEnabled: boolean;
+        riskSkipScore: number;
+        splitBuyEnabled: boolean;
+        splitBuyPct3m: number;
+        splitBuyPct2m: number;
+        splitBuyPct1m: number;
+        splitBuyTrendEnabled: boolean;
+        splitBuyTrendMinutes3m: number;
+        splitBuyTrendMinutes2m: number;
+        splitBuyTrendMinutes1m: number;
+        stoplossEnabled: boolean;
+        stoplossCut1DropCents: number;
+        stoplossCut1SellPct: number;
+        stoplossCut2DropCents: number;
+        stoplossCut2SellPct: number;
+        stoplossMinSecToExit: number;
+        adaptiveDeltaEnabled: boolean;
+        adaptiveDeltaBigMoveMultiplier: number;
+        adaptiveDeltaRevertNoBuyCount: number;
+    } = {
+        pollMs: 2_000,
+        expiresWithinSec: 180,
+        minProb: 0.9,
+        amountUsd: 1,
+        symbols: ['BTC', 'ETH', 'SOL', 'XRP'],
+        dojiGuardEnabled: true,
+        riskSkipScore: 70,
+        splitBuyEnabled: false,
+        splitBuyPct3m: 34,
+        splitBuyPct2m: 33,
+        splitBuyPct1m: 33,
+        splitBuyTrendEnabled: true,
+        splitBuyTrendMinutes3m: 3,
+        splitBuyTrendMinutes2m: 2,
+        splitBuyTrendMinutes1m: 1,
+        stoplossEnabled: false,
+        stoplossCut1DropCents: 1,
+        stoplossCut1SellPct: 50,
+        stoplossCut2DropCents: 2,
+        stoplossCut2SellPct: 100,
+        stoplossMinSecToExit: 25,
+        adaptiveDeltaEnabled: true,
+        adaptiveDeltaBigMoveMultiplier: 2,
+        adaptiveDeltaRevertNoBuyCount: 4,
+    };
+    private cryptoAll2AdaptiveDeltaBySymbol: Map<string, { overrideDelta: number | null; noBuyCount: number; lastBigMoveAt: string | null; lastBigMoveDelta: number | null }> = new Map();
+    private cryptoAll2SplitBuyState: Map<string, any> = new Map();
+    private cryptoAll2SplitBuyTimer: any = null;
+    private cryptoAllAutoEnabled = false;
+    private cryptoAllAutoTimer: any = null;
+    private cryptoAllAutoInFlight = false;
+    private cryptoAllStoplossTimer: any = null;
+    private cryptoAllLastScanSummary: any = null;
+    private cryptoAllSplitBuyState: Map<string, any> = new Map();
+    private cryptoAllSplitBuyTimer: any = null;
+    private cryptoAllAdaptiveDeltaBySymbol: Map<string, { overrideDelta: number | null; noBuyCount: number; lastBigMoveAt: string | null; lastBigMoveDelta: number | null }> = new Map();
+    private cryptoAllAutoConfigPath: string | null = null;
+    private cryptoAllAutoConfigLoadedAt: string | null = null;
+    private cryptoAllAutoConfigPersistedAt: string | null = null;
+    private cryptoAllAutoConfigPersistLastError: string | null = null;
+    private cryptoAllAutoConfig: {
+        pollMs: number;
+        expiresWithinSec: number;
+        minProb: number;
+        amountUsd: number;
+        symbols: string[];
+        timeframes: Array<'15m' | '1h' | '4h' | '1d'>;
+        dojiGuard: { enabled: boolean; riskSkipScore: number; riskAddOnBlockScore: number };
+        addOn: {
+            enabled: boolean;
+            windowA: { minSec: number; maxSec: number };
+            windowB: { minSec: number; maxSec: number };
+            windowC: { minSec: number; maxSec: number };
+            accelEnabled: boolean;
+            multiplierA: number;
+            multiplierB: number;
+            multiplierC: number;
+            trendEnabled: boolean;
+            trendMinutesA: number;
+            trendMinutesB: number;
+            trendMinutesC: number;
+            maxTotalStakeUsdPerPosition: number;
+            minAttemptIntervalMs: number;
+        };
+        stoploss: {
+            enabled: boolean;
+            cut1DropCents: number;
+            cut1SellPct: number;
+            cut2DropCents: number;
+            cut2SellPct: number;
+            spreadGuardCents: number;
+            minSecToExit: number;
+        };
+        dojiGuardEnabled: boolean;
+        riskSkipScore: number;
+        splitBuyEnabled: boolean;
+        splitBuyPct3m: number;
+        splitBuyPct2m: number;
+        splitBuyPct1m: number;
+        splitBuyTrendEnabled: boolean;
+        splitBuyTrendMinutes3m: number;
+        splitBuyTrendMinutes2m: number;
+        splitBuyTrendMinutes1m: number;
+        stoplossEnabled: boolean;
+        stoplossCut1DropCents: number;
+        stoplossCut1SellPct: number;
+        stoplossCut2DropCents: number;
+        stoplossCut2SellPct: number;
+        stoplossMinSecToExit: number;
+        adaptiveDeltaEnabled: boolean;
+        adaptiveDeltaBigMoveMultiplier: number;
+        adaptiveDeltaRevertNoBuyCount: number;
+    } = {
+        pollMs: 2_000,
+        expiresWithinSec: 180,
+        minProb: 0.9,
+        amountUsd: 1,
+        symbols: ['BTC', 'ETH', 'SOL', 'XRP'],
+        timeframes: ['15m'],
+        dojiGuard: { enabled: true, riskSkipScore: 70, riskAddOnBlockScore: 50 },
+        addOn: {
+            enabled: false,
+            windowA: { minSec: 121, maxSec: 180 },
+            windowB: { minSec: 61, maxSec: 120 },
+            windowC: { minSec: 1, maxSec: 60 },
+            accelEnabled: true,
+            multiplierA: 1.0,
+            multiplierB: 1.3,
+            multiplierC: 1.7,
+            trendEnabled: true,
+            trendMinutesA: 3,
+            trendMinutesB: 2,
+            trendMinutesC: 1,
+            maxTotalStakeUsdPerPosition: 50,
+            minAttemptIntervalMs: 1200,
+        },
+        stoploss: {
+            enabled: false,
+            cut1DropCents: 1,
+            cut1SellPct: 50,
+            cut2DropCents: 2,
+            cut2SellPct: 100,
+            spreadGuardCents: 2,
+            minSecToExit: 25,
+        },
+        dojiGuardEnabled: true,
+        riskSkipScore: 70,
+        splitBuyEnabled: false,
+        splitBuyPct3m: 34,
+        splitBuyPct2m: 33,
+        splitBuyPct1m: 33,
+        splitBuyTrendEnabled: true,
+        splitBuyTrendMinutes3m: 3,
+        splitBuyTrendMinutes2m: 2,
+        splitBuyTrendMinutes1m: 1,
+        stoplossEnabled: false,
+        stoplossCut1DropCents: 1,
+        stoplossCut1SellPct: 50,
+        stoplossCut2DropCents: 2,
+        stoplossCut2SellPct: 100,
+        stoplossMinSecToExit: 25,
+        adaptiveDeltaEnabled: true,
+        adaptiveDeltaBigMoveMultiplier: 2,
+        adaptiveDeltaRevertNoBuyCount: 4,
+    };
+    private cryptoAllLastScanAt: string | null = null;
+    private cryptoAllNextScanAllowedAtMs = 0;
+    private cryptoAllLastError: string | null = null;
+    private cryptoAllOrderLocks: Map<string, { atMs: number; symbol?: string; key?: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
+    private cryptoAllDeltaThresholdsPath: string | null = null;
+    private cryptoAllDeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
+        btcMinDelta: 600,
+        ethMinDelta: 30,
+        solMinDelta: 0.8,
+        xrpMinDelta: 0.0065,
+        updatedAt: null,
+        loadedAt: null,
+        persistLastError: null,
+    };
+    private cryptoAllWatchdogTimer: any = null;
+    private cryptoAllWatchdog: {
+        running: boolean;
+        pollMs: number;
+        startedAtMs: number;
+        endsAtMs: number;
+        lastTickAtMs: number;
+        lastError: string | null;
+        stopReason: string | null;
+        thresholds: {
+            consecutiveDataStops: number;
+            deltaErrorRateThreshold: number;
+            redeemSubmittedTimeoutMs: number;
+            redeemFailedStops: number;
+            orderFailedStops: number;
+        };
+        counters: {
+            consecutiveDataError: number;
+            redeemFailed: number;
+            orderFailed: number;
+        };
+        issues: Array<{ at: string; type: string; message: string; meta?: any }>;
+        reportPaths: { json?: string; md?: string };
+    } = {
+        running: false,
+        pollMs: 30_000,
+        startedAtMs: 0,
+        endsAtMs: 0,
+        lastTickAtMs: 0,
+        lastError: null,
+        stopReason: null,
+        thresholds: {
+            consecutiveDataStops: 5,
+            deltaErrorRateThreshold: 0.7,
+            redeemSubmittedTimeoutMs: 20 * 60_000,
+            redeemFailedStops: 1,
+            orderFailedStops: 2,
+        },
+        counters: {
+            consecutiveDataError: 0,
+            redeemFailed: 0,
+            orderFailed: 0,
+        },
+        issues: [],
+        reportPaths: {},
+    };
+    private cryptoAllActivesByKey: Map<string, any> = new Map();
+    private cryptoAllTrackedByCondition: Map<string, any> = new Map();
+    private cryptoAllAddOnState: Map<string, { positionKey: string; conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; placedA: boolean; placedB: boolean; placedC: boolean; totalStakeUsd: number; lastAttemptAtMs: number }> = new Map();
+    private cryptoAllStoplossState: Map<string, {
+        positionKey: string;
+        strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall';
+        conditionId: string;
+        tokenId: string;
+        symbol: string;
+        timeframe: '15m' | '1h' | '4h' | '1d';
+        endMs: number;
+        entryPrice: number;
+        totalSize: number;
+        soldSize: number;
+        soldCut1: boolean;
+        soldCut2: boolean;
+        lastAttemptAtMs: number;
+        lastCancelAtMs: number;
+        openOrderIds: string[];
+        openOrderPlacedAtMs: number;
+        lastBestBid: number;
+        stoploss: { cut1DropCents: number; cut1SellPct: number; cut2DropCents: number; cut2SellPct: number; minSecToExit: number };
+    }> = new Map();
+    private cryptoAllBeatCache: Map<string, { atMs: number; priceToBeat: number | null; currentPrice: number | null; deltaAbs: number | null; error: string | null }> = new Map();
+    private cryptoAllBinanceCandleCache: Map<string, { atMs: number; startMs: number; open: number | null; high: number | null; low: number | null; close: number | null; closes1m: number[]; error: string | null }> = new Map();
+    private cryptoAllBinanceSpotCache: Map<string, { atMs: number; price: number | null; error: string | null }> = new Map();
+    private cryptoAllMarketSnapshot: { atMs: number; markets: any[]; lastError: string | null; lastAttemptAtMs: number; lastAttemptError: string | null } = { atMs: 0, markets: [], lastError: null, lastAttemptAtMs: 0, lastAttemptError: null };
+    private cryptoAllBooksSnapshot: { atMs: number; byTokenId: Record<string, any>; lastError: string | null; lastAttemptAtMs: number; lastAttemptError: string | null } = { atMs: 0, byTokenId: {}, lastError: null, lastAttemptAtMs: 0, lastAttemptError: null };
+    private cryptoAllMarketInFlight: Promise<void> | null = null;
+    private cryptoAllBooksInFlight: Promise<void> | null = null;
+    private cryptoAllMarketBackoffMs = 0;
+    private cryptoAllMarketNextAllowedAtMs = 0;
+    private cryptoAllBooksBackoffMs = 0;
+    private cryptoAllBooksNextAllowedAtMs = 0;
+    private cryptoAllWsClients: Map<any, { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; limit: number; includeCandidates: boolean }> = new Map();
+    private cryptoAllWsTimer: any = null;
+    private cryptoAllSnapshotTimer: any = null;
+    private globalOrderLocks: Map<string, { atMs: number; strategy: 'crypto15m' | 'cryptoall' | 'other'; status: 'placing' | 'done' | 'failed'; expiresAtMs: number }> = new Map();
+    private globalOrderPlaceInFlight = false;
     private redeemDrainRunning = false;
     private redeemDrainLast: any = null;
     private redeemInFlight: Map<string, { conditionId: string; submittedAt: string; method: string; txHash?: string; transactionId?: string; status: 'submitted' | 'confirmed' | 'failed'; error?: string; txStatus?: number | null; payoutUsdc?: number; payoutReceivedUsdc?: number; payoutSentUsdc?: number; payoutNetUsdc?: number; payoutRecipients?: string[]; paid?: boolean; payoutComputedAt?: string; usdcTransfers?: Array<{ token: string; from: string; to: string; amount: number }> }> = new Map();
@@ -239,6 +584,21 @@ export class GroupArbitrageScanner {
             this.crypto15mDeltaThresholdsPath = process.env.POLY_CRYPTO15M_DELTA_THRESHOLDS_PATH
                 ? String(process.env.POLY_CRYPTO15M_DELTA_THRESHOLDS_PATH)
                 : path.join(os.tmpdir(), 'polymarket-tools', 'crypto15m-delta-thresholds.json');
+            this.crypto15mAutoConfigPath = process.env.POLY_CRYPTO15M_CONFIG_PATH
+                ? String(process.env.POLY_CRYPTO15M_CONFIG_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto15m-config.json');
+            this.cryptoAll2DeltaThresholdsPath = process.env.POLY_CRYPTOALL2_DELTA_THRESHOLDS_PATH
+                ? String(process.env.POLY_CRYPTOALL2_DELTA_THRESHOLDS_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall2-delta-thresholds.json');
+            this.cryptoAll2AutoConfigPath = process.env.POLY_CRYPTOALL2_CONFIG_PATH
+                ? String(process.env.POLY_CRYPTOALL2_CONFIG_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto_all_2.json');
+            this.cryptoAllAutoConfigPath = process.env.POLY_CRYPTOALL_CONFIG_PATH
+                ? String(process.env.POLY_CRYPTOALL_CONFIG_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto_all_v2.json');
+            this.cryptoAllDeltaThresholdsPath = process.env.POLY_CRYPTOALL_DELTA_THRESHOLDS_PATH
+                ? String(process.env.POLY_CRYPTOALL_DELTA_THRESHOLDS_PATH)
+                : path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall-delta-thresholds.json');
             const envList = process.env.POLY_RPC_URLS || process.env.POLY_CTF_RPC_URLS || process.env.POLY_RPC_FALLBACK_URLS;
             const urls = (envList ? String(envList).split(',') : [
                 process.env.POLY_CTF_RPC_URL,
@@ -267,14 +627,18 @@ export class GroupArbitrageScanner {
             this.loadAutoRedeemConfigFromFile();
             this.loadOrderHistoryFromFile();
             this.loadCrypto15mDeltaThresholdsFromFile();
+            this.loadCryptoAll2DeltaThresholdsFromFile();
+            this.loadCryptoAllDeltaThresholdsFromFile();
+            this.loadCrypto15mAutoConfigFromFile();
+            this.loadCryptoAll2AutoConfigFromFile();
+            this.loadCryptoAllAutoConfigFromFile();
         }
 
         this.pnlPersistencePath = process.env.POLY_PNL_SNAPSHOT_PATH
             ? String(process.env.POLY_PNL_SNAPSHOT_PATH)
             : path.join(os.tmpdir(), 'polymarket-tools', 'pnl-snapshots.json');
         
-        // Initialize async
-        this.tradingClient.initialize().catch((e: any) => console.error('Failed to init trading client:', e));
+        this.startTradingInitRetry();
         
         // Start monitoring loop for cut-loss/trailing stop
         this.startMonitoring();
@@ -282,6 +646,36 @@ export class GroupArbitrageScanner {
         if (this.hasValidKey) {
             this.loadPnlSnapshots().finally(() => this.startPnlSnapshots());
         }
+    }
+
+    private cleanupGlobalOrderLocks() {
+        const now = Date.now();
+        for (const [k, v] of this.globalOrderLocks.entries()) {
+            if (!v) { this.globalOrderLocks.delete(k); continue; }
+            if (v.expiresAtMs != null && Number.isFinite(Number(v.expiresAtMs)) && now > Number(v.expiresAtMs)) {
+                this.globalOrderLocks.delete(k);
+            }
+        }
+    }
+
+    private tryAcquireGlobalOrderLock(key: string, strategy: 'crypto15m' | 'cryptoall' | 'other') {
+        this.cleanupGlobalOrderLocks();
+        const k = String(key || '').trim().toLowerCase();
+        if (!k) return false;
+        const now = Date.now();
+        const existing = this.globalOrderLocks.get(k);
+        if (existing && now < Number(existing.expiresAtMs || 0)) return false;
+        this.globalOrderLocks.set(k, { atMs: now, strategy, status: 'placing', expiresAtMs: now + 10 * 60_000 });
+        return true;
+    }
+
+    private markGlobalOrderLockDone(key: string, ok: boolean) {
+        const k = String(key || '').trim().toLowerCase();
+        if (!k) return;
+        const v = this.globalOrderLocks.get(k);
+        if (!v) return;
+        const now = Date.now();
+        this.globalOrderLocks.set(k, { ...v, status: ok ? 'done' : 'failed', expiresAtMs: now + 10 * 60_000 });
     }
 
     private configureRelayerFromEnv() {
@@ -1153,6 +1547,49 @@ export class GroupArbitrageScanner {
         return this.tradingClient.getFunderAddress();
     }
 
+    getEoaAddress(): string {
+        return this.tradingClient.getSignerAddress();
+    }
+
+    hasPrivateKey(): boolean {
+        return this.hasValidKey;
+    }
+
+    getTradingInitStatus(): any {
+        return (this.tradingClient as any).getInitStatus ? (this.tradingClient as any).getInitStatus() : { initialized: false, hasCredentials: false, lastInitError: 'unsupported', signatureType: 0, signer: this.getEoaAddress(), funder: this.getFunderAddress() };
+    }
+
+    private startTradingInitRetry() {
+        if (this.tradingInitTimer) return;
+        const tick = () => {
+            this.tryInitTradingClient().catch(() => {});
+        };
+        tick();
+        this.tradingInitTimer = setInterval(tick, 5_000);
+    }
+
+    private async tryInitTradingClient() {
+        const st = this.getTradingInitStatus();
+        if (st?.initialized === true) {
+            if (this.tradingInitTimer) {
+                clearInterval(this.tradingInitTimer);
+                this.tradingInitTimer = null;
+            }
+            return;
+        }
+        const now = Date.now();
+        if (now < this.tradingInitNextAllowedAtMs) return;
+        try {
+            await this.tradingClient.initialize();
+            this.tradingInitBackoffMs = 5_000;
+            this.tradingInitNextAllowedAtMs = now + 60_000;
+        } catch {
+            const next = Math.min(120_000, Math.max(5_000, Math.floor(this.tradingInitBackoffMs * 1.7)));
+            this.tradingInitBackoffMs = next;
+            this.tradingInitNextAllowedAtMs = now + next;
+        }
+    }
+
     async getAllOpenOrders(): Promise<any[]> {
         const orders = await this.tradingClient.getOpenOrders();
         const list = orders || [];
@@ -1168,6 +1605,29 @@ export class GroupArbitrageScanner {
             return { ...o, status, strategy: strategy || 'external', source, marketQuestion: meta.title, slug: meta.slug, eventSlug: meta.eventSlug };
         }));
         return enriched;
+    }
+
+    shutdown() {
+        this.isRunning = false;
+        this.crypto15mAutoEnabled = false;
+        this.cryptoAll2AutoEnabled = false;
+        this.cryptoAllAutoEnabled = false;
+        if (this.tradingInitTimer) { clearInterval(this.tradingInitTimer); this.tradingInitTimer = null; }
+        if (this.crypto15mAutoTimer) { clearInterval(this.crypto15mAutoTimer); this.crypto15mAutoTimer = null; }
+        if (this.crypto15mWatchdogTimer) { clearInterval(this.crypto15mWatchdogTimer); this.crypto15mWatchdogTimer = null; }
+        if (this.crypto15mWsTimer) { clearInterval(this.crypto15mWsTimer); this.crypto15mWsTimer = null; }
+        if (this.cryptoAll2AutoTimer) { clearInterval(this.cryptoAll2AutoTimer); this.cryptoAll2AutoTimer = null; }
+        if (this.cryptoAll2SplitBuyTimer) { clearInterval(this.cryptoAll2SplitBuyTimer); this.cryptoAll2SplitBuyTimer = null; }
+        this.cryptoAll2SplitBuyState.clear();
+        if (this.cryptoAllAutoTimer) { clearInterval(this.cryptoAllAutoTimer); this.cryptoAllAutoTimer = null; }
+        if (this.cryptoAllStoplossTimer) { clearInterval(this.cryptoAllStoplossTimer); this.cryptoAllStoplossTimer = null; }
+        if (this.cryptoAllWatchdogTimer) { clearInterval(this.cryptoAllWatchdogTimer); this.cryptoAllWatchdogTimer = null; }
+        if (this.cryptoAllWsTimer) { clearInterval(this.cryptoAllWsTimer); this.cryptoAllWsTimer = null; }
+        if (this.cryptoAllSnapshotTimer) { clearInterval(this.cryptoAllSnapshotTimer); this.cryptoAllSnapshotTimer = null; }
+        if (this.autoRedeemTimer) { clearInterval(this.autoRedeemTimer); this.autoRedeemTimer = null; }
+        if (this.orderHistoryPersistTimer) { clearInterval(this.orderHistoryPersistTimer); this.orderHistoryPersistTimer = null; }
+        if (this.pnlTimer) { clearInterval(this.pnlTimer); this.pnlTimer = null; }
+        if (this.pnlWriteTimer) { clearInterval(this.pnlWriteTimer); this.pnlWriteTimer = null; }
     }
 
     async getTrades(params?: any): Promise<any[]> {
@@ -1411,15 +1871,15 @@ export class GroupArbitrageScanner {
                 const percentPnl = pos?.percentPnl != null ? Number(pos.percentPnl) : null;
                 const txHash = res0?.txHash ?? redeem0?.txHash ?? inflight?.txHash ?? null;
                 const normalizedRedeemStatus =
-                    redeemStatus === 'failed' && txHash && txStatus !== 0 && payoutNetUsdc != null && payoutNetUsdc <= 0 && paid === false
+                    redeemStatus === 'failed' && txHash && txStatus != null && txStatus !== 0 && payoutNetUsdc != null && payoutNetUsdc <= 0 && paid === false
                         ? 'confirmed'
                         : redeemStatus;
                 const redeemConfirmed = normalizedRedeemStatus === 'confirmed';
                 const result =
                     redeemConfirmed && paid === true ? 'WIN'
                     : redeemConfirmed && paid === false ? 'LOSS'
-                    : curPrice === 1 ? 'WIN'
-                    : curPrice === 0 ? 'LOSS'
+                    : curPrice != null && curPrice >= 0.999 ? 'WIN'
+                    : curPrice != null && curPrice <= 0.001 ? 'LOSS'
                     : pos ? 'OPEN'
                     : 'UNKNOWN';
                 const state =
@@ -1430,9 +1890,157 @@ export class GroupArbitrageScanner {
                     : redeemable ? 'redeemable'
                     : pos ? 'open'
                     : 'position_missing';
+                const stakeUsd = Number(e?.amountUsd) || 0;
+                const realizedPnlUsdc =
+                    redeemConfirmed
+                        ? (payoutNetUsdc != null ? Number(payoutNetUsdc) - stakeUsd : (paid === false ? 0 - stakeUsd : null))
+                        : null;
                 return {
                     id: e?.id,
                     timestamp: e?.timestamp,
+                    symbol: e?.symbol,
+                    slug: e?.slug,
+                    title: e?.marketQuestion,
+                    conditionId,
+                    outcome: e?.outcome,
+                    amountUsd: e?.amountUsd,
+                    bestAsk: e?.bestAsk ?? e?.price ?? null,
+                    limitPrice: e?.limitPrice ?? null,
+                    orderId: res0?.orderId ?? res0?.id ?? e?.orderId ?? null,
+                    orderStatus: res0?.orderStatus ?? (res0?.success === false ? `failed:${String(res0?.errorMsg || 'order_failed').slice(0, 160)}` : null),
+                    filledSize: res0?.filledSize ?? null,
+                    result,
+                    state,
+                    curPrice,
+                    cashPnl,
+                    percentPnl,
+                    redeemable,
+                    redeemStatus: normalizedRedeemStatus,
+                    paid,
+                    payoutNetUsdc,
+                    realizedPnlUsdc,
+                    txHash,
+                };
+            });
+
+        const configEvents = this.orderHistory
+            .filter((e: any) => {
+                const a = String(e?.action || '');
+                return a === 'crypto15m_config_start' || a === 'crypto15m_config_stop' || a === 'crypto15m_config_update';
+            })
+            .slice(0, Math.max(20, maxEntries))
+            .map((e: any) => ({
+                id: e?.id,
+                timestamp: e?.timestamp,
+                action: e?.action,
+                enabled: e?.config?.enabled ?? null,
+                config: e?.config ?? null,
+            }));
+
+        const summary = {
+            count: items.length,
+            totalStakeUsd: items.reduce((s: number, x: any) => s + (Number(x?.amountUsd) || 0), 0),
+            pnlTotalUsdc: items.reduce((s: number, x: any) => s + (Number(x?.realizedPnlUsdc) || 0), 0),
+            winCount: items.filter((x: any) => x.result === 'WIN').length,
+            lossCount: items.filter((x: any) => x.result === 'LOSS').length,
+            openCount: items.filter((x: any) => x.result === 'OPEN').length,
+            redeemableCount: items.filter((x: any) => x.redeemable === true).length,
+            redeemedCount: items.filter((x: any) => x.redeemStatus === 'confirmed' && x.paid === true).length,
+        };
+
+        return { success: true, summary, history: items, configEvents, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    async getCryptoAll2History(options?: { refresh?: boolean; intervalMs?: number; maxEntries?: number; includeSkipped?: boolean }) {
+        const refresh = options?.refresh === true;
+        const intervalMs = options?.intervalMs != null ? Number(options.intervalMs) : 1000;
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.floor(Number(options.maxEntries))) : 50;
+        const includeSkipped = options?.includeSkipped === true;
+        if (refresh) {
+            await this.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries: Math.max(50, maxEntries) });
+        }
+        const funder = this.getFunderAddress();
+        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
+        const byCondition = new Map(
+            (Array.isArray(positions) ? positions : [])
+                .map((p: any) => [String(p?.conditionId || '').trim().toLowerCase(), p] as const)
+                .filter(([k]) => !!k)
+        );
+
+        const latestRedeemByCondition = new Map<string, any>();
+        for (const e of this.orderHistory) {
+            if (!e || String(e?.action || '') !== 'redeem') continue;
+            const ts = e?.timestamp ? Date.parse(String(e.timestamp)) : NaN;
+            const results = Array.isArray(e?.results) ? e.results : [];
+            for (const r of results) {
+                const cid = String(r?.conditionId || '').trim();
+                if (!cid) continue;
+                const key = cid.toLowerCase();
+                const prev = latestRedeemByCondition.get(key);
+                const prevTs = prev?.__ts != null ? Number(prev.__ts) : NaN;
+                const curTs = Number.isFinite(ts) ? ts : Date.now();
+                if (!prev || (Number.isFinite(curTs) && (!Number.isFinite(prevTs) || curTs >= prevTs))) {
+                    latestRedeemByCondition.set(key, { ...r, __ts: curTs });
+                }
+            }
+        }
+
+        const items = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'cryptoall2_order')
+            .filter((e: any) => {
+                if (includeSkipped) return true;
+                const res0 = Array.isArray(e?.results) ? e.results[0] : null;
+                const orderStatus = String(res0?.orderStatus || '').toLowerCase();
+                if (orderStatus.startsWith('skipped:')) return false;
+                const ok = res0?.success === true;
+                const orderId = res0?.orderId != null ? String(res0.orderId) : '';
+                return ok || !!orderId;
+            })
+            .slice(0, maxEntries)
+            .map((e: any) => {
+                const conditionId = String(e?.marketId || '').trim();
+                const res0 = Array.isArray(e?.results) ? e.results[0] : null;
+                const redeem0 = conditionId ? latestRedeemByCondition.get(conditionId.toLowerCase()) : null;
+                const inflight = conditionId ? this.redeemInFlight.get(conditionId) : null;
+                const pos = conditionId ? byCondition.get(conditionId.toLowerCase()) : null;
+                const curPrice = pos?.curPrice != null ? Number(pos.curPrice) : null;
+                const redeemable = pos?.redeemable === true;
+                const redeemStatus = String(res0?.redeemStatus || redeem0?.redeemStatus || inflight?.status || '').toLowerCase() || null;
+                const paid = (res0?.paid ?? redeem0?.paid ?? inflight?.paid) === true;
+                const payoutNetUsdc = (res0?.payoutNetUsdc ?? redeem0?.payoutNetUsdc ?? inflight?.payoutNetUsdc) != null ? Number(res0?.payoutNetUsdc ?? redeem0?.payoutNetUsdc ?? inflight?.payoutNetUsdc) : null;
+                const txStatus = (res0?.txStatus ?? redeem0?.txStatus ?? inflight?.txStatus) != null ? Number(res0?.txStatus ?? redeem0?.txStatus ?? inflight?.txStatus) : null;
+                const cashPnl = pos?.cashPnl != null ? Number(pos.cashPnl) : null;
+                const percentPnl = pos?.percentPnl != null ? Number(pos.percentPnl) : null;
+                const txHash = res0?.txHash ?? redeem0?.txHash ?? inflight?.txHash ?? null;
+                const normalizedRedeemStatus =
+                    redeemStatus === 'failed' && txHash && txStatus != null && txStatus !== 0 && payoutNetUsdc != null && payoutNetUsdc <= 0 && paid === false
+                        ? 'confirmed'
+                        : redeemStatus;
+                const redeemConfirmed = normalizedRedeemStatus === 'confirmed';
+                const result =
+                    redeemConfirmed && paid === true ? 'WIN'
+                    : redeemConfirmed && paid === false ? 'LOSS'
+                    : curPrice != null && curPrice >= 0.999 ? 'WIN'
+                    : curPrice != null && curPrice <= 0.001 ? 'LOSS'
+                    : pos ? 'OPEN'
+                    : 'UNKNOWN';
+                const state =
+                    redeemConfirmed && paid === true ? 'confirmed_paid'
+                    : redeemConfirmed && paid === false ? 'confirmed_no_payout'
+                    : normalizedRedeemStatus === 'submitted' ? 'redeem_submitted'
+                    : normalizedRedeemStatus === 'failed' ? 'redeem_failed'
+                    : redeemable ? 'redeemable'
+                    : pos ? 'open'
+                    : 'position_missing';
+                const stakeUsd = Number(e?.amountUsd) || 0;
+                const realizedPnlUsdc =
+                    redeemConfirmed
+                        ? (payoutNetUsdc != null ? Number(payoutNetUsdc) - stakeUsd : (paid === false ? 0 - stakeUsd : null))
+                        : null;
+                return {
+                    id: e?.id,
+                    timestamp: e?.timestamp,
+                    timeframe: '15m',
                     symbol: e?.symbol,
                     slug: e?.slug,
                     title: e?.marketQuestion,
@@ -1453,14 +2061,29 @@ export class GroupArbitrageScanner {
                     redeemStatus: normalizedRedeemStatus,
                     paid,
                     payoutNetUsdc,
+                    realizedPnlUsdc,
                     txHash,
                 };
             });
 
+        const configEvents = this.orderHistory
+            .filter((e: any) => {
+                const a = String(e?.action || '');
+                return a === 'cryptoall2_config_start' || a === 'cryptoall2_config_stop' || a === 'cryptoall2_config_update';
+            })
+            .slice(0, Math.max(20, maxEntries))
+            .map((e: any) => ({
+                id: e?.id,
+                timestamp: e?.timestamp,
+                action: e?.action,
+                enabled: e?.config?.enabled ?? null,
+                config: e?.config ?? null,
+            }));
+
         const summary = {
             count: items.length,
             totalStakeUsd: items.reduce((s: number, x: any) => s + (Number(x?.amountUsd) || 0), 0),
-            pnlTotalUsdc: items.reduce((s: number, x: any) => s + (Number(x?.cashPnl) || 0), 0),
+            pnlTotalUsdc: items.reduce((s: number, x: any) => s + (Number(x?.realizedPnlUsdc) || 0), 0),
             winCount: items.filter((x: any) => x.result === 'WIN').length,
             lossCount: items.filter((x: any) => x.result === 'LOSS').length,
             openCount: items.filter((x: any) => x.result === 'OPEN').length,
@@ -1468,7 +2091,250 @@ export class GroupArbitrageScanner {
             redeemedCount: items.filter((x: any) => x.redeemStatus === 'confirmed' && x.paid === true).length,
         };
 
-        return { success: true, summary, history: items };
+        return { success: true, summary, history: items, configEvents, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    getCryptoAll2StoplossHistory(options?: { maxEntries?: number }) {
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.floor(Number(options.maxEntries))) : 100;
+        const items = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'cryptoall2_stoploss_sell')
+            .slice(0, maxEntries)
+            .map((e: any) => {
+                const r: any = e?.result || null;
+                return {
+                    id: e?.id,
+                    timestamp: e?.timestamp,
+                    symbol: e?.symbol,
+                    timeframe: e?.timeframe || '15m',
+                    conditionId: e?.marketId,
+                    tokenId: e?.tokenId,
+                    reason: e?.reason,
+                    targetPct: e?.targetPct,
+                    remainingToSellTarget: e?.remainingToSellTarget ?? null,
+                    sellAmount: e?.sellAmount ?? null,
+                    secondsToExpire: e?.secondsToExpire ?? null,
+                    entryPrice: e?.entryPrice ?? null,
+                    currentBid: e?.currentBid ?? null,
+                    currentAsk: e?.currentAsk ?? null,
+                    success: r?.success === true,
+                    skipped: r?.skipped === true,
+                    error: r?.error ?? null,
+                    method: r?.method ?? null,
+                    orderId: r?.orderId ?? r?.id ?? null,
+                };
+            });
+        const summary = {
+            count: items.length,
+            successCount: items.filter((x: any) => x.success === true).length,
+            skippedCount: items.filter((x: any) => x.skipped === true).length,
+            failedCount: items.filter((x: any) => x.success !== true && x.skipped !== true).length,
+        };
+        return { success: true, summary, history: items, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    getCryptoAllStoplossHistory(options?: { maxEntries?: number }) {
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.floor(Number(options.maxEntries))) : 100;
+        const items = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'cryptoall_stoploss_sell')
+            .slice(0, maxEntries)
+            .map((e: any) => {
+                const r: any = e?.result || null;
+                return {
+                    id: e?.id,
+                    timestamp: e?.timestamp,
+                    symbol: e?.symbol,
+                    timeframe: e?.timeframe || '15m',
+                    conditionId: e?.marketId,
+                    tokenId: e?.tokenId,
+                    reason: e?.reason,
+                    targetPct: e?.targetPct,
+                    remainingToSellTarget: e?.remainingToSellTarget ?? null,
+                    sellAmount: e?.sellAmount ?? null,
+                    secondsToExpire: e?.secondsToExpire ?? null,
+                    entryPrice: e?.entryPrice ?? null,
+                    currentBid: e?.currentBid ?? null,
+                    currentAsk: e?.currentAsk ?? null,
+                    success: r?.success === true,
+                    skipped: r?.skipped === true,
+                    error: r?.error ?? null,
+                    method: r?.method ?? null,
+                    orderId: r?.orderId ?? r?.id ?? null,
+                };
+            });
+        const summary = {
+            count: items.length,
+            successCount: items.filter((x: any) => x.success === true).length,
+            skippedCount: items.filter((x: any) => x.skipped === true).length,
+            failedCount: items.filter((x: any) => x.success !== true && x.skipped !== true).length,
+        };
+        return { success: true, summary, history: items, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    getCrypto15mStoplossHistory(options?: { maxEntries?: number }) {
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.floor(Number(options.maxEntries))) : 100;
+        const items = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'crypto15m_stoploss_sell')
+            .slice(0, maxEntries)
+            .map((e: any) => {
+                const r: any = e?.result || null;
+                return {
+                    id: e?.id,
+                    timestamp: e?.timestamp,
+                    symbol: e?.symbol,
+                    timeframe: e?.timeframe || '15m',
+                    conditionId: e?.marketId,
+                    tokenId: e?.tokenId,
+                    reason: e?.reason,
+                    targetPct: e?.targetPct,
+                    remainingToSellTarget: e?.remainingToSellTarget ?? null,
+                    sellAmount: e?.sellAmount ?? null,
+                    secondsToExpire: e?.secondsToExpire ?? null,
+                    entryPrice: e?.entryPrice ?? null,
+                    currentBid: e?.currentBid ?? null,
+                    currentAsk: e?.currentAsk ?? null,
+                    success: r?.success === true,
+                    skipped: r?.skipped === true,
+                    error: r?.error ?? null,
+                    method: r?.method ?? null,
+                    orderId: r?.orderId ?? r?.id ?? null,
+                };
+            });
+        const summary = {
+            count: items.length,
+            successCount: items.filter((x: any) => x.success === true).length,
+            skippedCount: items.filter((x: any) => x.skipped === true).length,
+            failedCount: items.filter((x: any) => x.success !== true && x.skipped !== true).length,
+        };
+        return { success: true, summary, history: items, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    async getCryptoAllHistory(options?: { refresh?: boolean; intervalMs?: number; maxEntries?: number; includeSkipped?: boolean }) {
+        const refresh = options?.refresh === true;
+        const intervalMs = options?.intervalMs != null ? Number(options.intervalMs) : 1000;
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.floor(Number(options.maxEntries))) : 50;
+        const includeSkipped = options?.includeSkipped === true;
+        if (refresh) {
+            await this.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries: Math.max(50, maxEntries) });
+        }
+        const funder = this.getFunderAddress();
+        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
+        const byCondition = new Map(
+            (Array.isArray(positions) ? positions : [])
+                .map((p: any) => [String(p?.conditionId || '').trim().toLowerCase(), p] as const)
+                .filter(([k]) => !!k)
+        );
+
+        const latestRedeemByCondition = new Map<string, any>();
+        for (const e of this.orderHistory) {
+            if (!e || String(e?.action || '') !== 'redeem') continue;
+            const ts = e?.timestamp ? Date.parse(String(e.timestamp)) : NaN;
+            const results = Array.isArray(e?.results) ? e.results : [];
+            for (const r of results) {
+                const cid = String(r?.conditionId || '').trim();
+                if (!cid) continue;
+                const key = cid.toLowerCase();
+                const prev = latestRedeemByCondition.get(key);
+                const prevTs = prev?.__ts != null ? Number(prev.__ts) : NaN;
+                const curTs = Number.isFinite(ts) ? ts : Date.now();
+                if (!prev || (Number.isFinite(curTs) && (!Number.isFinite(prevTs) || curTs >= prevTs))) {
+                    latestRedeemByCondition.set(key, { ...r, __ts: curTs });
+                }
+            }
+        }
+
+        const items = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'cryptoall_order')
+            .filter((e: any) => {
+                if (includeSkipped) return true;
+                const res0 = Array.isArray(e?.results) ? e.results[0] : null;
+                const orderStatus = String(res0?.orderStatus || '').toLowerCase();
+                if (orderStatus.startsWith('skipped:')) return false;
+                const ok = res0?.success === true;
+                const orderId = res0?.orderId != null ? String(res0.orderId) : '';
+                return ok || !!orderId;
+            })
+            .slice(0, maxEntries)
+            .map((e: any) => {
+                const conditionId = String(e?.marketId || '').trim();
+                const res0 = Array.isArray(e?.results) ? e.results[0] : null;
+                const redeem0 = conditionId ? latestRedeemByCondition.get(conditionId.toLowerCase()) : null;
+                const inflight = conditionId ? this.redeemInFlight.get(conditionId) : null;
+                const pos = conditionId ? byCondition.get(conditionId.toLowerCase()) : null;
+                const curPrice = pos?.curPrice != null ? Number(pos.curPrice) : null;
+                const redeemable = pos?.redeemable === true;
+                const redeemStatus = String(res0?.redeemStatus || redeem0?.redeemStatus || inflight?.status || '').toLowerCase() || null;
+                const paid = (res0?.paid ?? redeem0?.paid ?? inflight?.paid) === true;
+                const payoutNetUsdc = (res0?.payoutNetUsdc ?? redeem0?.payoutNetUsdc ?? inflight?.payoutNetUsdc) != null ? Number(res0?.payoutNetUsdc ?? redeem0?.payoutNetUsdc ?? inflight?.payoutNetUsdc) : null;
+                const txStatus = (res0?.txStatus ?? redeem0?.txStatus ?? inflight?.txStatus) != null ? Number(res0?.txStatus ?? redeem0?.txStatus ?? inflight?.txStatus) : null;
+                const cashPnl = pos?.cashPnl != null ? Number(pos.cashPnl) : null;
+                const percentPnl = pos?.percentPnl != null ? Number(pos.percentPnl) : null;
+                const txHash = res0?.txHash ?? redeem0?.txHash ?? inflight?.txHash ?? null;
+                const normalizedRedeemStatus =
+                    redeemStatus === 'failed' && txHash && txStatus != null && txStatus !== 0 && payoutNetUsdc != null && payoutNetUsdc <= 0 && paid === false
+                        ? 'confirmed'
+                        : redeemStatus;
+                const redeemConfirmed = normalizedRedeemStatus === 'confirmed';
+                const result =
+                    redeemConfirmed && paid === true ? 'WIN'
+                    : redeemConfirmed && paid === false ? 'LOSS'
+                    : curPrice != null && curPrice >= 0.999 ? 'WIN'
+                    : curPrice != null && curPrice <= 0.001 ? 'LOSS'
+                    : pos ? 'OPEN'
+                    : 'UNKNOWN';
+                const state =
+                    redeemConfirmed && paid === true ? 'confirmed_paid'
+                    : redeemConfirmed && paid === false ? 'confirmed_no_payout'
+                    : normalizedRedeemStatus === 'submitted' ? 'redeem_submitted'
+                    : normalizedRedeemStatus === 'failed' ? 'redeem_failed'
+                    : redeemable ? 'redeemable'
+                    : pos ? 'open'
+                    : 'position_missing';
+                const stakeUsd = Number(e?.amountUsd) || 0;
+                const realizedPnlUsdc =
+                    redeemConfirmed
+                        ? (payoutNetUsdc != null ? Number(payoutNetUsdc) - stakeUsd : (paid === false ? 0 - stakeUsd : null))
+                        : null;
+                return {
+                    id: e?.id,
+                    timestamp: e?.timestamp,
+                    symbol: e?.symbol,
+                    timeframe: e?.timeframe,
+                    slug: e?.slug,
+                    title: e?.marketQuestion,
+                    conditionId,
+                    outcome: e?.outcome,
+                    amountUsd: e?.amountUsd,
+                    bestAsk: e?.bestAsk ?? e?.price ?? null,
+                    limitPrice: e?.limitPrice ?? null,
+                    orderId: res0?.orderId ?? res0?.id ?? e?.orderId ?? null,
+                    orderStatus: res0?.orderStatus ?? null,
+                    filledSize: res0?.filledSize ?? null,
+                    result,
+                    state,
+                    curPrice,
+                    cashPnl,
+                    percentPnl,
+                    redeemable,
+                    redeemStatus: normalizedRedeemStatus,
+                    paid,
+                    payoutNetUsdc,
+                    realizedPnlUsdc,
+                    txHash,
+                };
+            });
+
+        const summary = {
+            count: items.length,
+            totalStakeUsd: items.reduce((s: number, x: any) => s + (Number(x?.amountUsd) || 0), 0),
+            pnlTotalUsdc: items.reduce((s: number, x: any) => s + (Number(x?.realizedPnlUsdc) || 0), 0),
+            winCount: items.filter((x: any) => x.result === 'WIN').length,
+            lossCount: items.filter((x: any) => x.result === 'LOSS').length,
+            openCount: items.filter((x: any) => x.result === 'OPEN').length,
+            redeemableCount: items.filter((x: any) => x.redeemable === true).length,
+            redeemedCount: items.filter((x: any) => x.redeemStatus === 'confirmed' && x.paid === true).length,
+        };
+
+        return { success: true, summary, history: items, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
     }
 
     private loadOrderHistoryFromFile() {
@@ -1521,6 +2387,366 @@ export class GroupArbitrageScanner {
             this.orderHistoryPersistTimer = null;
             this.persistOrderHistoryToFile();
         }, 250);
+    }
+
+    private recordAutoConfigEvent(strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall', event: 'start' | 'stop', config: any) {
+        const action = `${strategy}_config_${event}`;
+        this.orderHistory.unshift({
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            mode: 'config',
+            action,
+            strategy,
+            config,
+        });
+        if (this.orderHistory.length > 300) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+    }
+
+    private recordConfigUpdateEvent(strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall', payload: any) {
+        const action = `${strategy}_config_update`;
+        this.orderHistory.unshift({
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            mode: 'config',
+            action,
+            strategy,
+            config: payload,
+        });
+        if (this.orderHistory.length > 300) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+    }
+
+    private loadCrypto15mAutoConfigFromFile() {
+        if (!this.crypto15mAutoConfigPath) return;
+        try {
+            if (!fs.existsSync(this.crypto15mAutoConfigPath)) return;
+            const raw = fs.readFileSync(this.crypto15mAutoConfigPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const next = {
+                pollMs: parsed?.pollMs != null ? Number(parsed.pollMs) : this.crypto15mAutoConfig.pollMs,
+                expiresWithinSec: parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec,
+                minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.crypto15mAutoConfig.minProb,
+                amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.crypto15mAutoConfig.amountUsd,
+                buySizingMode: parsed?.buySizingMode != null ? String(parsed.buySizingMode) : this.crypto15mAutoConfig.buySizingMode,
+                trendEnabled: parsed?.trendEnabled != null ? !!parsed.trendEnabled : this.crypto15mAutoConfig.trendEnabled,
+                trendMinutes: parsed?.trendMinutes != null ? Number(parsed.trendMinutes) : this.crypto15mAutoConfig.trendMinutes,
+                staleMsThreshold: parsed?.staleMsThreshold != null ? Number(parsed.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold,
+                stoplossEnabled: parsed?.stoplossEnabled != null ? !!parsed.stoplossEnabled : this.crypto15mAutoConfig.stoplossEnabled,
+                stoplossCut1DropCents: parsed?.stoplossCut1DropCents != null ? Number(parsed.stoplossCut1DropCents) : this.crypto15mAutoConfig.stoplossCut1DropCents,
+                stoplossCut1SellPct: parsed?.stoplossCut1SellPct != null ? Number(parsed.stoplossCut1SellPct) : this.crypto15mAutoConfig.stoplossCut1SellPct,
+                stoplossCut2DropCents: parsed?.stoplossCut2DropCents != null ? Number(parsed.stoplossCut2DropCents) : this.crypto15mAutoConfig.stoplossCut2DropCents,
+                stoplossCut2SellPct: parsed?.stoplossCut2SellPct != null ? Number(parsed.stoplossCut2SellPct) : this.crypto15mAutoConfig.stoplossCut2SellPct,
+                stoplossMinSecToExit: parsed?.stoplossMinSecToExit != null ? Number(parsed.stoplossMinSecToExit) : this.crypto15mAutoConfig.stoplossMinSecToExit,
+                adaptiveDeltaEnabled: parsed?.adaptiveDeltaEnabled != null ? !!parsed.adaptiveDeltaEnabled : this.crypto15mAutoConfig.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: parsed?.adaptiveDeltaBigMoveMultiplier != null ? Number(parsed.adaptiveDeltaBigMoveMultiplier) : this.crypto15mAutoConfig.adaptiveDeltaBigMoveMultiplier,
+                adaptiveDeltaRevertNoBuyCount: parsed?.adaptiveDeltaRevertNoBuyCount != null ? Number(parsed.adaptiveDeltaRevertNoBuyCount) : this.crypto15mAutoConfig.adaptiveDeltaRevertNoBuyCount,
+            };
+            this.crypto15mAutoConfig = {
+                pollMs: Math.max(500, Math.floor(Number.isFinite(next.pollMs) ? next.pollMs : 2_000)),
+                expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(next.expiresWithinSec) ? next.expiresWithinSec : 180)),
+                minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0.9)),
+                amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
+                buySizingMode: next.buySizingMode === 'orderbook_max' ? 'orderbook_max' : next.buySizingMode === 'all_capital' ? 'all_capital' : 'fixed',
+                trendEnabled: next.trendEnabled,
+                trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.trendMinutes) ? next.trendMinutes : 1))),
+                staleMsThreshold: Math.max(500, Math.floor(Number.isFinite(next.staleMsThreshold) ? next.staleMsThreshold : 5_000)),
+                stoplossEnabled: next.stoplossEnabled,
+                stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut1DropCents) ? next.stoplossCut1DropCents : 1))),
+                stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut1SellPct) ? next.stoplossCut1SellPct : 50))),
+                stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut2DropCents) ? next.stoplossCut2DropCents : 2))),
+                stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut2SellPct) ? next.stoplossCut2SellPct : 100))),
+                stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(next.stoplossMinSecToExit) ? next.stoplossMinSecToExit : 25))),
+                adaptiveDeltaEnabled: next.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(next.adaptiveDeltaBigMoveMultiplier) ? next.adaptiveDeltaBigMoveMultiplier : 2)),
+                adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(next.adaptiveDeltaRevertNoBuyCount) ? next.adaptiveDeltaRevertNoBuyCount : 4))),
+            };
+            this.crypto15mAutoConfigLoadedAt = new Date().toISOString();
+            this.crypto15mAutoConfigPersistLastError = null;
+        } catch {
+        }
+    }
+
+    private persistCrypto15mAutoConfigToFile() {
+        if (!this.crypto15mAutoConfigPath) return;
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
+            fs.mkdirSync(dir, { recursive: true });
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+        try {
+            writeAtomic(this.crypto15mAutoConfigPath, JSON.stringify({ ...this.crypto15mAutoConfig }));
+            this.crypto15mAutoConfigPersistedAt = new Date().toISOString();
+            this.crypto15mAutoConfigPersistLastError = null;
+        } catch (e: any) {
+            this.crypto15mAutoConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write crypto15m config file';
+        }
+    }
+
+    private loadCryptoAll2AutoConfigFromFile() {
+        if (!this.cryptoAll2AutoConfigPath) return;
+        try {
+            if (!fs.existsSync(this.cryptoAll2AutoConfigPath)) {
+                const legacyPath = path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall2-config.json');
+                if (fs.existsSync(legacyPath)) {
+                    this.cryptoAll2AutoConfigPath = legacyPath;
+                } else {
+                    return;
+                }
+            }
+            const raw = fs.readFileSync(this.cryptoAll2AutoConfigPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const symInput: any[] = Array.isArray(parsed?.symbols) ? (parsed.symbols as any[]) : [];
+            const symbols: string[] = symInput.length
+                ? Array.from(new Set(symInput.map((s: any) => String(s || '').toUpperCase()).filter((x: any): x is string => !!x)))
+                : this.cryptoAll2AutoConfig.symbols;
+            const next = {
+                pollMs: parsed?.pollMs != null ? Number(parsed.pollMs) : this.cryptoAll2AutoConfig.pollMs,
+                expiresWithinSec: parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.cryptoAll2AutoConfig.expiresWithinSec,
+                minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.cryptoAll2AutoConfig.minProb,
+                amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.cryptoAll2AutoConfig.amountUsd,
+                symbols,
+                dojiGuardEnabled: parsed?.dojiGuardEnabled != null ? !!parsed.dojiGuardEnabled : this.cryptoAll2AutoConfig.dojiGuardEnabled,
+                riskSkipScore: parsed?.riskSkipScore != null ? Number(parsed.riskSkipScore) : this.cryptoAll2AutoConfig.riskSkipScore,
+                splitBuyEnabled: parsed?.splitBuyEnabled != null ? !!parsed.splitBuyEnabled : this.cryptoAll2AutoConfig.splitBuyEnabled,
+                splitBuyPct3m: parsed?.splitBuyPct3m != null ? Number(parsed.splitBuyPct3m) : this.cryptoAll2AutoConfig.splitBuyPct3m,
+                splitBuyPct2m: parsed?.splitBuyPct2m != null ? Number(parsed.splitBuyPct2m) : this.cryptoAll2AutoConfig.splitBuyPct2m,
+                splitBuyPct1m: parsed?.splitBuyPct1m != null ? Number(parsed.splitBuyPct1m) : this.cryptoAll2AutoConfig.splitBuyPct1m,
+                splitBuyTrendEnabled: parsed?.splitBuyTrendEnabled != null ? !!parsed.splitBuyTrendEnabled : this.cryptoAll2AutoConfig.splitBuyTrendEnabled,
+                splitBuyTrendMinutes3m: parsed?.splitBuyTrendMinutes3m != null ? Number(parsed.splitBuyTrendMinutes3m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m,
+                splitBuyTrendMinutes2m: parsed?.splitBuyTrendMinutes2m != null ? Number(parsed.splitBuyTrendMinutes2m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m,
+                splitBuyTrendMinutes1m: parsed?.splitBuyTrendMinutes1m != null ? Number(parsed.splitBuyTrendMinutes1m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m,
+                stoplossEnabled: parsed?.stoplossEnabled != null ? !!parsed.stoplossEnabled : this.cryptoAll2AutoConfig.stoplossEnabled,
+                stoplossCut1DropCents: parsed?.stoplossCut1DropCents != null ? Number(parsed.stoplossCut1DropCents) : this.cryptoAll2AutoConfig.stoplossCut1DropCents,
+                stoplossCut1SellPct: parsed?.stoplossCut1SellPct != null ? Number(parsed.stoplossCut1SellPct) : this.cryptoAll2AutoConfig.stoplossCut1SellPct,
+                stoplossCut2DropCents: parsed?.stoplossCut2DropCents != null ? Number(parsed.stoplossCut2DropCents) : this.cryptoAll2AutoConfig.stoplossCut2DropCents,
+                stoplossCut2SellPct: parsed?.stoplossCut2SellPct != null ? Number(parsed.stoplossCut2SellPct) : this.cryptoAll2AutoConfig.stoplossCut2SellPct,
+                stoplossMinSecToExit: parsed?.stoplossMinSecToExit != null ? Number(parsed.stoplossMinSecToExit) : this.cryptoAll2AutoConfig.stoplossMinSecToExit,
+                adaptiveDeltaEnabled: parsed?.adaptiveDeltaEnabled != null ? !!parsed.adaptiveDeltaEnabled : this.cryptoAll2AutoConfig.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: parsed?.adaptiveDeltaBigMoveMultiplier != null ? Number(parsed.adaptiveDeltaBigMoveMultiplier) : this.cryptoAll2AutoConfig.adaptiveDeltaBigMoveMultiplier,
+                adaptiveDeltaRevertNoBuyCount: parsed?.adaptiveDeltaRevertNoBuyCount != null ? Number(parsed.adaptiveDeltaRevertNoBuyCount) : this.cryptoAll2AutoConfig.adaptiveDeltaRevertNoBuyCount,
+            };
+            this.cryptoAll2AutoConfig = {
+                pollMs: Math.max(500, Math.floor(Number.isFinite(next.pollMs) ? next.pollMs : 2_000)),
+                expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(next.expiresWithinSec) ? next.expiresWithinSec : 180)),
+                minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0.9)),
+                amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
+                symbols,
+                dojiGuardEnabled: next.dojiGuardEnabled,
+                riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.riskSkipScore) ? next.riskSkipScore : 70))),
+                splitBuyEnabled: next.splitBuyEnabled,
+                splitBuyPct3m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct3m) ? next.splitBuyPct3m : 34))),
+                splitBuyPct2m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct2m) ? next.splitBuyPct2m : 33))),
+                splitBuyPct1m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct1m) ? next.splitBuyPct1m : 33))),
+                splitBuyTrendEnabled: next.splitBuyTrendEnabled,
+                splitBuyTrendMinutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes3m) ? next.splitBuyTrendMinutes3m : 3))),
+                splitBuyTrendMinutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes2m) ? next.splitBuyTrendMinutes2m : 2))),
+                splitBuyTrendMinutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes1m) ? next.splitBuyTrendMinutes1m : 1))),
+                stoplossEnabled: next.stoplossEnabled,
+                stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut1DropCents) ? next.stoplossCut1DropCents : 1))),
+                stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut1SellPct) ? next.stoplossCut1SellPct : 50))),
+                stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut2DropCents) ? next.stoplossCut2DropCents : 2))),
+                stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut2SellPct) ? next.stoplossCut2SellPct : 100))),
+                stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(next.stoplossMinSecToExit) ? next.stoplossMinSecToExit : 25))),
+                adaptiveDeltaEnabled: next.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(next.adaptiveDeltaBigMoveMultiplier) ? next.adaptiveDeltaBigMoveMultiplier : 2)),
+                adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(next.adaptiveDeltaRevertNoBuyCount) ? next.adaptiveDeltaRevertNoBuyCount : 4))),
+            };
+            this.cryptoAll2AutoConfigLoadedAt = new Date().toISOString();
+            this.cryptoAll2AutoConfigPersistLastError = null;
+        } catch {
+        }
+    }
+
+    private loadCryptoAllAutoConfigFromFile() {
+        if (!this.cryptoAllAutoConfigPath) return;
+        try {
+            if (!fs.existsSync(this.cryptoAllAutoConfigPath)) {
+                const legacyPath = path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall-config.json');
+                if (fs.existsSync(legacyPath)) {
+                    this.cryptoAllAutoConfigPath = legacyPath;
+                } else {
+                    return;
+                }
+            }
+            const raw = fs.readFileSync(this.cryptoAllAutoConfigPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const symInput: any[] = Array.isArray(parsed?.symbols) ? (parsed.symbols as any[]) : [];
+            const symbols: string[] = symInput.length
+                ? Array.from(new Set(symInput.map((s: any) => String(s || '').toUpperCase()).filter((x: any): x is string => !!x)))
+                : this.cryptoAllAutoConfig.symbols;
+            const tfInput: any[] = Array.isArray(parsed?.timeframes) ? (parsed.timeframes as any[]) : [];
+            const timeframesRaw = tfInput.length
+                ? tfInput.map((x: any) => String(x || '').toLowerCase()).filter(Boolean)
+                : Array.isArray(this.cryptoAllAutoConfig.timeframes) && this.cryptoAllAutoConfig.timeframes.length ? this.cryptoAllAutoConfig.timeframes : ['15m'];
+            const timeframes = Array.from(new Set(timeframesRaw)).filter((t) => ['15m', '1h', '4h', '1d'].includes(String(t))) as Array<'15m' | '1h' | '4h' | '1d'>;
+            const dojiGuardEnabledRaw =
+                parsed?.dojiGuardEnabled != null ? !!parsed.dojiGuardEnabled
+                : parsed?.dojiGuard?.enabled != null ? !!parsed.dojiGuard.enabled
+                : this.cryptoAllAutoConfig.dojiGuardEnabled;
+            const riskSkipScoreRaw =
+                parsed?.riskSkipScore != null ? Number(parsed.riskSkipScore)
+                : parsed?.dojiGuard?.riskSkipScore != null ? Number(parsed.dojiGuard.riskSkipScore)
+                : this.cryptoAllAutoConfig.riskSkipScore;
+            const riskAddOnBlockScoreRaw =
+                parsed?.riskAddOnBlockScore != null ? Number(parsed.riskAddOnBlockScore)
+                : parsed?.dojiGuard?.riskAddOnBlockScore != null ? Number(parsed.dojiGuard.riskAddOnBlockScore)
+                : this.cryptoAllAutoConfig.dojiGuard.riskAddOnBlockScore;
+            const addOnEnabledRaw =
+                parsed?.addOnEnabled != null ? !!parsed.addOnEnabled
+                : parsed?.addOn?.enabled != null ? !!parsed.addOn.enabled
+                : this.cryptoAllAutoConfig.addOn.enabled;
+            const stoplossEnabledRaw =
+                parsed?.stoplossEnabled != null ? !!parsed.stoplossEnabled
+                : parsed?.stoploss?.enabled != null ? !!parsed.stoploss.enabled
+                : this.cryptoAllAutoConfig.stoploss.enabled;
+            const next = {
+                pollMs: parsed?.pollMs != null ? Number(parsed.pollMs) : this.cryptoAllAutoConfig.pollMs,
+                expiresWithinSec: parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec,
+                minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.cryptoAllAutoConfig.minProb,
+                amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.cryptoAllAutoConfig.amountUsd,
+                symbols,
+                timeframes,
+                dojiGuardEnabled: dojiGuardEnabledRaw,
+                riskSkipScore: riskSkipScoreRaw,
+                riskAddOnBlockScore: riskAddOnBlockScoreRaw,
+                addOnEnabled: addOnEnabledRaw,
+                splitBuyEnabled: parsed?.splitBuyEnabled != null ? !!parsed.splitBuyEnabled : this.cryptoAllAutoConfig.splitBuyEnabled,
+                splitBuyPct3m: parsed?.splitBuyPct3m != null ? Number(parsed.splitBuyPct3m) : this.cryptoAllAutoConfig.splitBuyPct3m,
+                splitBuyPct2m: parsed?.splitBuyPct2m != null ? Number(parsed.splitBuyPct2m) : this.cryptoAllAutoConfig.splitBuyPct2m,
+                splitBuyPct1m: parsed?.splitBuyPct1m != null ? Number(parsed.splitBuyPct1m) : this.cryptoAllAutoConfig.splitBuyPct1m,
+                splitBuyTrendEnabled: parsed?.splitBuyTrendEnabled != null ? !!parsed.splitBuyTrendEnabled : this.cryptoAllAutoConfig.splitBuyTrendEnabled,
+                splitBuyTrendMinutes3m: parsed?.splitBuyTrendMinutes3m != null ? Number(parsed.splitBuyTrendMinutes3m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes3m,
+                splitBuyTrendMinutes2m: parsed?.splitBuyTrendMinutes2m != null ? Number(parsed.splitBuyTrendMinutes2m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes2m,
+                splitBuyTrendMinutes1m: parsed?.splitBuyTrendMinutes1m != null ? Number(parsed.splitBuyTrendMinutes1m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes1m,
+                stoplossEnabled: stoplossEnabledRaw,
+                stoplossCut1DropCents: parsed?.stoplossCut1DropCents != null ? Number(parsed.stoplossCut1DropCents) : (parsed?.stoploss?.cut1DropCents != null ? Number(parsed.stoploss.cut1DropCents) : this.cryptoAllAutoConfig.stoplossCut1DropCents),
+                stoplossCut1SellPct: parsed?.stoplossCut1SellPct != null ? Number(parsed.stoplossCut1SellPct) : (parsed?.stoploss?.cut1SellPct != null ? Number(parsed.stoploss.cut1SellPct) : this.cryptoAllAutoConfig.stoplossCut1SellPct),
+                stoplossCut2DropCents: parsed?.stoplossCut2DropCents != null ? Number(parsed.stoplossCut2DropCents) : (parsed?.stoploss?.cut2DropCents != null ? Number(parsed.stoploss.cut2DropCents) : this.cryptoAllAutoConfig.stoplossCut2DropCents),
+                stoplossCut2SellPct: parsed?.stoplossCut2SellPct != null ? Number(parsed.stoplossCut2SellPct) : (parsed?.stoploss?.cut2SellPct != null ? Number(parsed.stoploss.cut2SellPct) : this.cryptoAllAutoConfig.stoplossCut2SellPct),
+                stoplossSpreadGuardCents: parsed?.stoplossSpreadGuardCents != null ? Number(parsed.stoplossSpreadGuardCents) : (parsed?.stoploss?.spreadGuardCents != null ? Number(parsed.stoploss.spreadGuardCents) : this.cryptoAllAutoConfig.stoploss.spreadGuardCents),
+                stoplossMinSecToExit: parsed?.stoplossMinSecToExit != null ? Number(parsed.stoplossMinSecToExit) : (parsed?.stoploss?.minSecToExit != null ? Number(parsed.stoploss.minSecToExit) : this.cryptoAllAutoConfig.stoplossMinSecToExit),
+                adaptiveDeltaEnabled: parsed?.adaptiveDeltaEnabled != null ? !!parsed.adaptiveDeltaEnabled : this.cryptoAllAutoConfig.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: parsed?.adaptiveDeltaBigMoveMultiplier != null ? Number(parsed.adaptiveDeltaBigMoveMultiplier) : this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier,
+                adaptiveDeltaRevertNoBuyCount: parsed?.adaptiveDeltaRevertNoBuyCount != null ? Number(parsed.adaptiveDeltaRevertNoBuyCount) : this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount,
+            };
+            this.cryptoAllAutoConfig = {
+                pollMs: Math.max(500, Math.floor(Number.isFinite(next.pollMs) ? next.pollMs : 2_000)),
+                expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(next.expiresWithinSec) ? next.expiresWithinSec : 180)),
+                minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0.9)),
+                amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
+                symbols,
+                timeframes: timeframes.length ? timeframes : ['15m'],
+                dojiGuard: {
+                    enabled: next.dojiGuardEnabled,
+                    riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.riskSkipScore) ? next.riskSkipScore : 70))),
+                    riskAddOnBlockScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.riskAddOnBlockScore) ? next.riskAddOnBlockScore : 50))),
+                },
+                addOn: {
+                    ...this.cryptoAllAutoConfig.addOn,
+                    enabled: next.addOnEnabled,
+                },
+                stoploss: {
+                    enabled: next.stoplossEnabled,
+                    cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut1DropCents) ? next.stoplossCut1DropCents : 1))),
+                    cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut1SellPct) ? next.stoplossCut1SellPct : 50))),
+                    cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut2DropCents) ? next.stoplossCut2DropCents : 2))),
+                    cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut2SellPct) ? next.stoplossCut2SellPct : 100))),
+                    spreadGuardCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossSpreadGuardCents) ? next.stoplossSpreadGuardCents : 2))),
+                    minSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(next.stoplossMinSecToExit) ? next.stoplossMinSecToExit : 25))),
+                },
+                dojiGuardEnabled: next.dojiGuardEnabled,
+                riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.riskSkipScore) ? next.riskSkipScore : 70))),
+                splitBuyEnabled: next.splitBuyEnabled,
+                splitBuyPct3m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct3m) ? next.splitBuyPct3m : 34))),
+                splitBuyPct2m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct2m) ? next.splitBuyPct2m : 33))),
+                splitBuyPct1m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(next.splitBuyPct1m) ? next.splitBuyPct1m : 33))),
+                splitBuyTrendEnabled: next.splitBuyTrendEnabled,
+                splitBuyTrendMinutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes3m) ? next.splitBuyTrendMinutes3m : 3))),
+                splitBuyTrendMinutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes2m) ? next.splitBuyTrendMinutes2m : 2))),
+                splitBuyTrendMinutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.splitBuyTrendMinutes1m) ? next.splitBuyTrendMinutes1m : 1))),
+                stoplossEnabled: next.stoplossEnabled,
+                stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut1DropCents) ? next.stoplossCut1DropCents : 1))),
+                stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut1SellPct) ? next.stoplossCut1SellPct : 50))),
+                stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.stoplossCut2DropCents) ? next.stoplossCut2DropCents : 2))),
+                stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.stoplossCut2SellPct) ? next.stoplossCut2SellPct : 100))),
+                stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(next.stoplossMinSecToExit) ? next.stoplossMinSecToExit : 25))),
+                adaptiveDeltaEnabled: next.adaptiveDeltaEnabled,
+                adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(next.adaptiveDeltaBigMoveMultiplier) ? next.adaptiveDeltaBigMoveMultiplier : 2)),
+                adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(next.adaptiveDeltaRevertNoBuyCount) ? next.adaptiveDeltaRevertNoBuyCount : 4))),
+            };
+            this.cryptoAllAutoConfigLoadedAt = new Date().toISOString();
+            this.cryptoAllAutoConfigPersistLastError = null;
+        } catch {
+        }
+    }
+
+    private persistCryptoAll2AutoConfigToFile() {
+        if (!this.cryptoAll2AutoConfigPath) return;
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
+            fs.mkdirSync(dir, { recursive: true });
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+        try {
+            writeAtomic(this.cryptoAll2AutoConfigPath, JSON.stringify({ ...this.cryptoAll2AutoConfig }));
+            this.cryptoAll2AutoConfigPersistedAt = new Date().toISOString();
+            this.cryptoAll2AutoConfigPersistLastError = null;
+        } catch (e: any) {
+            this.cryptoAll2AutoConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write cryptoall2 config file';
+        }
+    }
+
+    private persistCryptoAllAutoConfigToFile() {
+        if (!this.cryptoAllAutoConfigPath) return;
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
+            fs.mkdirSync(dir, { recursive: true });
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+        try {
+            writeAtomic(this.cryptoAllAutoConfigPath, JSON.stringify({ ...this.cryptoAllAutoConfig }));
+            this.cryptoAllAutoConfigPersistedAt = new Date().toISOString();
+            this.cryptoAllAutoConfigPersistLastError = null;
+        } catch (e: any) {
+            this.cryptoAllAutoConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write cryptoall config file';
+        }
     }
 
     async getMonitoredPositionsSummary(): Promise<any[]> {
@@ -2032,6 +3258,7 @@ export class GroupArbitrageScanner {
             btcMinDelta: this.crypto15mDeltaThresholds.btcMinDelta,
             ethMinDelta: this.crypto15mDeltaThresholds.ethMinDelta,
             solMinDelta: this.crypto15mDeltaThresholds.solMinDelta,
+            xrpMinDelta: this.crypto15mDeltaThresholds.xrpMinDelta,
             updatedAt: this.crypto15mDeltaThresholds.updatedAt,
             loadedAt: this.crypto15mDeltaThresholds.loadedAt,
             persistLastError: this.crypto15mDeltaThresholds.persistLastError,
@@ -2040,20 +3267,23 @@ export class GroupArbitrageScanner {
         };
     }
 
-    setCrypto15mDeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; persist?: boolean }) {
+    setCrypto15mDeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; xrpMinDelta?: number; persist?: boolean }) {
         const btc = input.btcMinDelta != null ? Number(input.btcMinDelta) : this.crypto15mDeltaThresholds.btcMinDelta;
         const eth = input.ethMinDelta != null ? Number(input.ethMinDelta) : this.crypto15mDeltaThresholds.ethMinDelta;
         const sol = input.solMinDelta != null ? Number(input.solMinDelta) : this.crypto15mDeltaThresholds.solMinDelta;
+        const xrp = input.xrpMinDelta != null ? Number(input.xrpMinDelta) : this.crypto15mDeltaThresholds.xrpMinDelta;
         this.crypto15mDeltaThresholds = {
             ...this.crypto15mDeltaThresholds,
             btcMinDelta: Math.max(0, btc),
             ethMinDelta: Math.max(0, eth),
             solMinDelta: Math.max(0, sol),
+            xrpMinDelta: Math.max(0, xrp),
             updatedAt: new Date().toISOString(),
             persistLastError: null,
         };
         if (input.persist !== false) {
             this.persistCrypto15mDeltaThresholdsToFile();
+            this.recordConfigUpdateEvent('crypto15m', { kind: 'delta_thresholds', thresholds: { btcMinDelta: this.crypto15mDeltaThresholds.btcMinDelta, ethMinDelta: this.crypto15mDeltaThresholds.ethMinDelta, solMinDelta: this.crypto15mDeltaThresholds.solMinDelta, xrpMinDelta: this.crypto15mDeltaThresholds.xrpMinDelta } });
         }
         return this.getCrypto15mDeltaThresholds();
     }
@@ -2067,11 +3297,13 @@ export class GroupArbitrageScanner {
             const btcMinDelta = parsed?.btcMinDelta != null ? Number(parsed.btcMinDelta) : this.crypto15mDeltaThresholds.btcMinDelta;
             const ethMinDelta = parsed?.ethMinDelta != null ? Number(parsed.ethMinDelta) : this.crypto15mDeltaThresholds.ethMinDelta;
             const solMinDelta = parsed?.solMinDelta != null ? Number(parsed.solMinDelta) : this.crypto15mDeltaThresholds.solMinDelta;
+            const xrpMinDelta = parsed?.xrpMinDelta != null ? Number(parsed.xrpMinDelta) : this.crypto15mDeltaThresholds.xrpMinDelta;
             this.crypto15mDeltaThresholds = {
                 ...this.crypto15mDeltaThresholds,
                 btcMinDelta: Number.isFinite(btcMinDelta) ? Math.max(0, btcMinDelta) : this.crypto15mDeltaThresholds.btcMinDelta,
                 ethMinDelta: Number.isFinite(ethMinDelta) ? Math.max(0, ethMinDelta) : this.crypto15mDeltaThresholds.ethMinDelta,
                 solMinDelta: Number.isFinite(solMinDelta) ? Math.max(0, solMinDelta) : this.crypto15mDeltaThresholds.solMinDelta,
+                xrpMinDelta: Number.isFinite(xrpMinDelta) ? Math.max(0, xrpMinDelta) : this.crypto15mDeltaThresholds.xrpMinDelta,
                 loadedAt: new Date().toISOString(),
                 persistLastError: null,
             };
@@ -2091,13 +3323,177 @@ export class GroupArbitrageScanner {
         try {
             fs.writeFileSync(
                 this.crypto15mDeltaThresholdsPath,
-                JSON.stringify({ btcMinDelta: this.crypto15mDeltaThresholds.btcMinDelta, ethMinDelta: this.crypto15mDeltaThresholds.ethMinDelta, solMinDelta: this.crypto15mDeltaThresholds.solMinDelta }),
+                JSON.stringify({ btcMinDelta: this.crypto15mDeltaThresholds.btcMinDelta, ethMinDelta: this.crypto15mDeltaThresholds.ethMinDelta, solMinDelta: this.crypto15mDeltaThresholds.solMinDelta, xrpMinDelta: this.crypto15mDeltaThresholds.xrpMinDelta }),
                 { encoding: 'utf8', mode: 0o600 }
             );
             try { fs.chmodSync(this.crypto15mDeltaThresholdsPath, 0o600); } catch {}
             this.crypto15mDeltaThresholds.persistLastError = null;
         } catch (e: any) {
             this.crypto15mDeltaThresholds.persistLastError = e?.message ? String(e.message) : 'Failed to write crypto15m delta thresholds file';
+        }
+    }
+
+    getCryptoAll2DeltaThresholds() {
+        return {
+            btcMinDelta: this.cryptoAll2DeltaThresholds.btcMinDelta,
+            ethMinDelta: this.cryptoAll2DeltaThresholds.ethMinDelta,
+            solMinDelta: this.cryptoAll2DeltaThresholds.solMinDelta,
+            xrpMinDelta: this.cryptoAll2DeltaThresholds.xrpMinDelta,
+            updatedAt: this.cryptoAll2DeltaThresholds.updatedAt,
+            loadedAt: this.cryptoAll2DeltaThresholds.loadedAt,
+            persistLastError: this.cryptoAll2DeltaThresholds.persistLastError,
+            configPath: this.cryptoAll2DeltaThresholdsPath,
+            configFilePresent: this.cryptoAll2DeltaThresholdsPath ? fs.existsSync(this.cryptoAll2DeltaThresholdsPath) : false,
+        };
+    }
+
+    setCryptoAll2DeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; xrpMinDelta?: number; persist?: boolean }) {
+        const btc = input.btcMinDelta != null ? Number(input.btcMinDelta) : this.cryptoAll2DeltaThresholds.btcMinDelta;
+        const eth = input.ethMinDelta != null ? Number(input.ethMinDelta) : this.cryptoAll2DeltaThresholds.ethMinDelta;
+        const sol = input.solMinDelta != null ? Number(input.solMinDelta) : this.cryptoAll2DeltaThresholds.solMinDelta;
+        const xrp = input.xrpMinDelta != null ? Number(input.xrpMinDelta) : this.cryptoAll2DeltaThresholds.xrpMinDelta;
+        this.cryptoAll2DeltaThresholds = {
+            ...this.cryptoAll2DeltaThresholds,
+            btcMinDelta: Math.max(0, btc),
+            ethMinDelta: Math.max(0, eth),
+            solMinDelta: Math.max(0, sol),
+            xrpMinDelta: Math.max(0, xrp),
+            updatedAt: new Date().toISOString(),
+            persistLastError: null,
+        };
+        if (input.persist !== false) {
+            this.persistCryptoAll2DeltaThresholdsToFile();
+            this.recordConfigUpdateEvent('cryptoall2', { kind: 'delta_thresholds', thresholds: { btcMinDelta: this.cryptoAll2DeltaThresholds.btcMinDelta, ethMinDelta: this.cryptoAll2DeltaThresholds.ethMinDelta, solMinDelta: this.cryptoAll2DeltaThresholds.solMinDelta, xrpMinDelta: this.cryptoAll2DeltaThresholds.xrpMinDelta } });
+        }
+        return this.getCryptoAll2DeltaThresholds();
+    }
+
+    private loadCryptoAll2DeltaThresholdsFromFile() {
+        if (!this.cryptoAll2DeltaThresholdsPath) return;
+        try {
+            if (!fs.existsSync(this.cryptoAll2DeltaThresholdsPath)) return;
+            const raw = fs.readFileSync(this.cryptoAll2DeltaThresholdsPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const btcMinDelta = parsed?.btcMinDelta != null ? Number(parsed.btcMinDelta) : this.cryptoAll2DeltaThresholds.btcMinDelta;
+            const ethMinDelta = parsed?.ethMinDelta != null ? Number(parsed.ethMinDelta) : this.cryptoAll2DeltaThresholds.ethMinDelta;
+            const solMinDelta = parsed?.solMinDelta != null ? Number(parsed.solMinDelta) : this.cryptoAll2DeltaThresholds.solMinDelta;
+            const xrpMinDelta = parsed?.xrpMinDelta != null ? Number(parsed.xrpMinDelta) : this.cryptoAll2DeltaThresholds.xrpMinDelta;
+            this.cryptoAll2DeltaThresholds = {
+                ...this.cryptoAll2DeltaThresholds,
+                btcMinDelta: Number.isFinite(btcMinDelta) ? Math.max(0, btcMinDelta) : this.cryptoAll2DeltaThresholds.btcMinDelta,
+                ethMinDelta: Number.isFinite(ethMinDelta) ? Math.max(0, ethMinDelta) : this.cryptoAll2DeltaThresholds.ethMinDelta,
+                solMinDelta: Number.isFinite(solMinDelta) ? Math.max(0, solMinDelta) : this.cryptoAll2DeltaThresholds.solMinDelta,
+                xrpMinDelta: Number.isFinite(xrpMinDelta) ? Math.max(0, xrpMinDelta) : this.cryptoAll2DeltaThresholds.xrpMinDelta,
+                loadedAt: new Date().toISOString(),
+                persistLastError: null,
+            };
+        } catch {
+        }
+    }
+
+    private persistCryptoAll2DeltaThresholdsToFile() {
+        if (!this.cryptoAll2DeltaThresholdsPath) return;
+        const dir = path.dirname(this.cryptoAll2DeltaThresholdsPath);
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+        } catch (e: any) {
+            this.cryptoAll2DeltaThresholds.persistLastError = e?.message ? String(e.message) : 'Failed to create cryptoall2 delta thresholds dir';
+            return;
+        }
+        try {
+            fs.writeFileSync(
+                this.cryptoAll2DeltaThresholdsPath,
+                JSON.stringify({ btcMinDelta: this.cryptoAll2DeltaThresholds.btcMinDelta, ethMinDelta: this.cryptoAll2DeltaThresholds.ethMinDelta, solMinDelta: this.cryptoAll2DeltaThresholds.solMinDelta, xrpMinDelta: this.cryptoAll2DeltaThresholds.xrpMinDelta }),
+                { encoding: 'utf8', mode: 0o600 }
+            );
+            try { fs.chmodSync(this.cryptoAll2DeltaThresholdsPath, 0o600); } catch {}
+            this.cryptoAll2DeltaThresholds.persistLastError = null;
+        } catch (e: any) {
+            this.cryptoAll2DeltaThresholds.persistLastError = e?.message ? String(e.message) : 'Failed to write cryptoall2 delta thresholds file';
+        }
+    }
+
+    getCryptoAllDeltaThresholds() {
+        return {
+            btcMinDelta: this.cryptoAllDeltaThresholds.btcMinDelta,
+            ethMinDelta: this.cryptoAllDeltaThresholds.ethMinDelta,
+            solMinDelta: this.cryptoAllDeltaThresholds.solMinDelta,
+            xrpMinDelta: this.cryptoAllDeltaThresholds.xrpMinDelta,
+            updatedAt: this.cryptoAllDeltaThresholds.updatedAt,
+            loadedAt: this.cryptoAllDeltaThresholds.loadedAt,
+            persistLastError: this.cryptoAllDeltaThresholds.persistLastError,
+            configPath: this.cryptoAllDeltaThresholdsPath,
+            configFilePresent: this.cryptoAllDeltaThresholdsPath ? fs.existsSync(this.cryptoAllDeltaThresholdsPath) : false,
+        };
+    }
+
+    setCryptoAllDeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; xrpMinDelta?: number; persist?: boolean }) {
+        const btc = input.btcMinDelta != null ? Number(input.btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta;
+        const eth = input.ethMinDelta != null ? Number(input.ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta;
+        const sol = input.solMinDelta != null ? Number(input.solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta;
+        const xrp = input.xrpMinDelta != null ? Number(input.xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta;
+        this.cryptoAllDeltaThresholds = {
+            ...this.cryptoAllDeltaThresholds,
+            btcMinDelta: Math.max(0, btc),
+            ethMinDelta: Math.max(0, eth),
+            solMinDelta: Math.max(0, sol),
+            xrpMinDelta: Math.max(0, xrp),
+            updatedAt: new Date().toISOString(),
+            persistLastError: null,
+        };
+        if (input.persist !== false) {
+            this.persistCryptoAllDeltaThresholdsToFile();
+        }
+        return this.getCryptoAllDeltaThresholds();
+    }
+
+    private loadCryptoAllDeltaThresholdsFromFile() {
+        if (!this.cryptoAllDeltaThresholdsPath) return;
+        try {
+            if (!fs.existsSync(this.cryptoAllDeltaThresholdsPath)) return;
+            const raw = fs.readFileSync(this.cryptoAllDeltaThresholdsPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const btcMinDelta = parsed?.btcMinDelta != null ? Number(parsed.btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta;
+            const ethMinDelta = parsed?.ethMinDelta != null ? Number(parsed.ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta;
+            const solMinDelta = parsed?.solMinDelta != null ? Number(parsed.solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta;
+            const xrpMinDelta = parsed?.xrpMinDelta != null ? Number(parsed.xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta;
+            this.cryptoAllDeltaThresholds = {
+                ...this.cryptoAllDeltaThresholds,
+                btcMinDelta: Number.isFinite(btcMinDelta) ? Math.max(0, btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta,
+                ethMinDelta: Number.isFinite(ethMinDelta) ? Math.max(0, ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta,
+                solMinDelta: Number.isFinite(solMinDelta) ? Math.max(0, solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta,
+                xrpMinDelta: Number.isFinite(xrpMinDelta) ? Math.max(0, xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta,
+                loadedAt: new Date().toISOString(),
+                persistLastError: null,
+            };
+        } catch {
+        }
+    }
+
+    private persistCryptoAllDeltaThresholdsToFile() {
+        if (!this.cryptoAllDeltaThresholdsPath) return;
+        const dir = path.dirname(this.cryptoAllDeltaThresholdsPath);
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+        } catch (e: any) {
+            this.cryptoAllDeltaThresholds.persistLastError = e?.message ? String(e.message) : 'Failed to create cryptoall delta thresholds dir';
+            return;
+        }
+        try {
+            fs.writeFileSync(
+                this.cryptoAllDeltaThresholdsPath,
+                JSON.stringify({
+                    btcMinDelta: this.cryptoAllDeltaThresholds.btcMinDelta,
+                    ethMinDelta: this.cryptoAllDeltaThresholds.ethMinDelta,
+                    solMinDelta: this.cryptoAllDeltaThresholds.solMinDelta,
+                    xrpMinDelta: this.cryptoAllDeltaThresholds.xrpMinDelta,
+                }),
+                { encoding: 'utf8', mode: 0o600 }
+            );
+            try { fs.chmodSync(this.cryptoAllDeltaThresholdsPath, 0o600); } catch {}
+            this.cryptoAllDeltaThresholds.persistLastError = null;
+        } catch (e: any) {
+            this.cryptoAllDeltaThresholds.persistLastError = e?.message ? String(e.message) : 'Failed to write cryptoall delta thresholds file';
         }
     }
 
@@ -2651,8 +4047,14 @@ export class GroupArbitrageScanner {
 
     private tryParseJsonArray(raw: any): any[] {
         if (Array.isArray(raw)) return raw;
+        const s = String(raw ?? '').trim();
+        if (!s) return [];
+        if (s.startsWith('[') && s.endsWith(']') && !s.includes('"') && /\d/.test(s)) {
+            const nums = s.match(/\d+/g);
+            return Array.isArray(nums) ? nums : [];
+        }
         try {
-            const parsed = JSON.parse(String(raw || '[]'));
+            const parsed = JSON.parse(s);
             return Array.isArray(parsed) ? parsed : [];
         } catch {
             return [];
@@ -2705,6 +4107,116 @@ export class GroupArbitrageScanner {
         } catch {
             return [];
         }
+    }
+
+    private async fetchCryptoSlugsFromSitePath(sitePath: string, limit: number): Promise<string[]> {
+        const key = String(sitePath || '').trim() || '/';
+        const cache = (this as any).cryptoAllSlugsCache as Map<string, { atMs: number; slugs: string[] }> | undefined;
+        const cached = cache?.get(key);
+        if (cached && Date.now() - cached.atMs < 30_000) return cached.slugs.slice(0, limit);
+        try {
+            if (!(this as any).cryptoAllSlugsDiag) (this as any).cryptoAllSlugsDiag = new Map();
+            const headers: any = {
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+            };
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 2_500);
+            const res = await this.withTimeout(
+                fetch(`https://polymarket.com${key}`, { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
+                3_000,
+                `Site ${key}`
+            );
+            if (!res.ok) {
+                (this as any).cryptoAllSlugsDiag.set(key, { atMs: Date.now(), ok: false, status: res.status, slugsCount: 0, error: `HTTP ${res.status}` });
+                return [];
+            }
+            const html = await this.withTimeout(res.text(), 2_500, `Site ${key} html`);
+            const slugs: string[] = [];
+            const re = /\/event\/([a-z0-9-]{6,})/gi;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(html)) && slugs.length < limit * 5) {
+                slugs.push(String(m[1]).toLowerCase());
+            }
+            const uniq = Array.from(new Set(slugs));
+            if (!(this as any).cryptoAllSlugsCache) (this as any).cryptoAllSlugsCache = new Map();
+            (this as any).cryptoAllSlugsCache.set(key, { atMs: Date.now(), slugs: uniq });
+            (this as any).cryptoAllSlugsDiag.set(key, { atMs: Date.now(), ok: true, status: 200, slugsCount: uniq.length, error: null });
+            return uniq.slice(0, limit);
+        } catch (e: any) {
+            if (!(this as any).cryptoAllSlugsDiag) (this as any).cryptoAllSlugsDiag = new Map();
+            (this as any).cryptoAllSlugsDiag.set(key, { atMs: Date.now(), ok: false, status: null, slugsCount: 0, error: e?.message || String(e) });
+            return [];
+        }
+    }
+
+    getCryptoAllDiag() {
+        const diag = (this as any).cryptoAllSlugsDiag as Map<string, any> | undefined;
+        const entries = diag ? Array.from(diag.entries()) : [];
+        const cache = (this as any).cryptoAllSlugsCache as Map<string, { atMs: number; slugs: string[] }> | undefined;
+        const sources = entries
+            .map(([path, v]) => {
+                const c = cache?.get(path);
+                const sampleSlugs = c?.slugs ? c.slugs.slice(0, 8) : [];
+                return { path, ...(v || {}), sampleSlugs };
+            })
+            .sort((a: any, b: any) => String(a.path).localeCompare(String(b.path)));
+        const riskDiag = (this as any).cryptoAllRiskDiag as Map<string, any> | undefined;
+        const risk = riskDiag ? Array.from(riskDiag.entries()).slice(-80).map(([k, v]) => ({ key: k, ...(v || {}) })) : [];
+        const marketsAll = Array.isArray(this.cryptoAllMarketSnapshot.markets) ? this.cryptoAllMarketSnapshot.markets : [];
+        const markets = marketsAll.slice(0, 12).map((m: any) => ({
+            timeframe: m?.timeframe,
+            symbol: m?.symbol,
+            slug: m?.slug,
+            conditionId: m?.conditionId,
+            endMs: m?.endMs,
+            upTokenId: m?.upTokenId,
+            downTokenId: m?.downTokenId,
+        }));
+        const books = {
+            atMs: this.cryptoAllBooksSnapshot.atMs,
+            tokenCount: Object.keys(this.cryptoAllBooksSnapshot.byTokenId || {}).length,
+            lastError: this.cryptoAllBooksSnapshot.lastError,
+            lastAttemptAtMs: this.cryptoAllBooksSnapshot.lastAttemptAtMs,
+            lastAttemptError: this.cryptoAllBooksSnapshot.lastAttemptError,
+        };
+        return { success: true, sources, config: this.cryptoAllAutoConfig, markets, books, risk };
+    }
+
+    private inferCryptoTimeframeFromSlug(slug: string, title: string): '15m' | '1h' | '4h' | '1d' | null {
+        const s = String(slug || '').toLowerCase();
+        const t = String(title || '').toLowerCase();
+        const hay = `${s} ${t}`;
+        if (hay.includes('15m') || hay.includes('15-min') || hay.includes('15min')) return '15m';
+        if (hay.includes('1h') || hay.includes('1-hr') || hay.includes('1hr') || hay.includes('hourly')) return '1h';
+        if (hay.includes('4h') || hay.includes('4-hr') || hay.includes('4hr') || hay.includes('4-hour') || hay.includes('4hour')) return '4h';
+        if (hay.includes('1d') || hay.includes('1-day') || hay.includes('1day') || hay.includes('daily')) return '1d';
+        const m = String(title || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+        if (m) {
+            const toMin = (hh: number, mm: number, ap: string) => {
+                const p = String(ap || '').toLowerCase();
+                let h = Math.max(0, Math.min(12, Math.floor(hh)));
+                const mi = Math.max(0, Math.min(59, Math.floor(mm)));
+                if (p === 'am') {
+                    if (h === 12) h = 0;
+                } else if (p === 'pm') {
+                    if (h !== 12) h += 12;
+                }
+                return h * 60 + mi;
+            };
+            const sMin = toMin(Number(m[1]), Number(m[2]), String(m[3]));
+            const eMin = toMin(Number(m[4]), Number(m[5]), String(m[6]));
+            let diff = eMin - sMin;
+            if (diff < 0) diff += 24 * 60;
+            if (diff >= 10 && diff <= 20) return '15m';
+            if (diff >= 50 && diff <= 70) return '1h';
+            if (diff >= 220 && diff <= 260) return '4h';
+            if (diff >= 1300 && diff <= 1500) return '1d';
+        }
+        return null;
     }
 
     private findObjectDeep(root: any, predicate: (x: any) => boolean): any | null {
@@ -2786,13 +4298,14 @@ export class GroupArbitrageScanner {
             slug.startsWith('btc-') ? 'BTC'
             : slug.startsWith('eth-') ? 'ETH'
             : slug.startsWith('sol-') ? 'SOL'
+            : slug.startsWith('xrp-') ? 'XRP'
             : null;
         if (!symbol) {
             const out = { atMs: Date.now(), priceToBeat: null, currentPrice: null, deltaAbs: null, error: 'Unsupported symbol for delta thresholds' };
             this.crypto15mBeatCache.set(slug, out);
             return { priceToBeat: null, currentPrice: null, deltaAbs: null, error: out.error };
         }
-        const binSymbol = symbol === 'BTC' ? 'BTCUSDT' : symbol === 'ETH' ? 'ETHUSDT' : 'SOLUSDT';
+        const binSymbol = symbol === 'BTC' ? 'BTCUSDT' : symbol === 'ETH' ? 'ETHUSDT' : symbol === 'SOL' ? 'SOLUSDT' : 'XRPUSDT';
         const controller = new AbortController();
         const t = setTimeout(() => controller.abort(), 6_000);
         try {
@@ -2827,12 +4340,269 @@ export class GroupArbitrageScanner {
         }
     }
 
+    private getCryptoAllTimeframeSec(tf: '15m' | '1h' | '4h' | '1d'): number {
+        if (tf === '1h') return 60 * 60;
+        if (tf === '4h') return 4 * 60 * 60;
+        if (tf === '1d') return 24 * 60 * 60;
+        return 15 * 60;
+    }
+
+    private getCryptoAllListPaths(tf: '15m' | '1h' | '4h' | '1d'): string[] {
+        if (tf === '15m') return ['/crypto/15M'];
+        if (tf === '1h') return ['/crypto/hourly'];
+        if (tf === '4h') return ['/crypto/4H', '/crypto/4-hour', '/crypto/4hour', '/crypto/4-hours'];
+        return ['/crypto/daily', '/crypto/1D', '/crypto/1d'];
+    }
+
+    private predictCryptoAllSlugs(tf: '15m' | '1h' | '4h' | '1d', nowSec: number, symbols: string[]): string[] {
+        const tfSec = this.getCryptoAllTimeframeSec(tf);
+        const baseStart = Math.floor(nowSec / tfSec) * tfSec;
+        const starts = [baseStart - tfSec, baseStart, baseStart + tfSec, baseStart + 2 * tfSec];
+        const symList = symbols.length ? symbols : ['BTC', 'ETH', 'SOL', 'XRP'];
+        const tfTokens =
+            tf === '15m' ? ['15m', '15M', '15min', '15mins']
+            : tf === '1h' ? ['1h', '1H', '1hr', 'hourly']
+            : tf === '4h' ? ['4h', '4H', '4hr', '4hour', '4-hour']
+            : ['1d', '1D', 'daily', '1day', '1-day'];
+        const slugs: string[] = [];
+        for (const sym of symList) {
+            const s = String(sym || '').toLowerCase();
+            for (const token of tfTokens) {
+                const t = String(token || '').toLowerCase();
+                const prefixes = [`${s}-updown-${t}`, `${s}-up-or-down-${t}`];
+                for (const st of starts) {
+                    for (const prefix of prefixes) {
+                        slugs.push(`${prefix}-${Math.floor(st)}`);
+                    }
+                }
+            }
+        }
+        return Array.from(new Set(slugs));
+    }
+
+    private inferCryptoSymbolFromText(slug: string, title: string): 'BTC' | 'ETH' | 'SOL' | 'XRP' | null {
+        const s = String(slug || '').toLowerCase();
+        const t = String(title || '').toLowerCase();
+        if (s.startsWith('btc-') || s.includes('bitcoin') || t.includes('bitcoin')) return 'BTC';
+        if (s.startsWith('eth-') || s.includes('ethereum') || t.includes('ethereum')) return 'ETH';
+        if (s.startsWith('sol-') || s.includes('solana') || t.includes('solana')) return 'SOL';
+        if (s.startsWith('xrp-') || s.includes('xrp') || t.includes('xrp')) return 'XRP';
+        return null;
+    }
+
+    private getBinanceSymbol(symbol: string): string | null {
+        const s = String(symbol || '').toUpperCase();
+        if (s === 'BTC') return 'BTCUSDT';
+        if (s === 'ETH') return 'ETHUSDT';
+        if (s === 'SOL') return 'SOLUSDT';
+        if (s === 'XRP') return 'XRPUSDT';
+        return null;
+    }
+
+    private getLastClosedMinuteOpenMs(nowMs: number): number {
+        const now = Math.floor(Number(nowMs) || 0);
+        const floor = Math.floor(now / 60_000) * 60_000;
+        return floor - 60_000;
+    }
+
+    private async fetchBinanceSpotPrice(options: { binSymbol: string; nowMs?: number }): Promise<{ price: number | null; error: string | null }> {
+        const binSymbol = String(options.binSymbol || '').toUpperCase();
+        if (!binSymbol) return { price: null, error: 'Missing binSymbol' };
+        const now = options.nowMs != null ? Math.floor(Number(options.nowMs) || 0) : Date.now();
+        const cacheKey = `${binSymbol}:spot`;
+        const cached = this.cryptoAllBinanceSpotCache.get(cacheKey);
+        if (cached && now - cached.atMs < 500) return { price: cached.price, error: cached.error };
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 1_500);
+        try {
+            const res = await this.withTimeout(
+                fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${encodeURIComponent(binSymbol)}`, { signal: controller.signal }).finally(() => clearTimeout(t)),
+                2_000,
+                `Binance spot ${binSymbol}`
+            );
+            if (!res.ok) throw new Error(`Binance spot HTTP ${res.status}`);
+            const json: any = await this.withTimeout(res.json(), 1_000, `Binance spot json ${binSymbol}`);
+            const price = Number(json?.price);
+            const out = { atMs: now, price: Number.isFinite(price) && price > 0 ? price : null, error: Number.isFinite(price) && price > 0 ? null : 'Invalid price' };
+            this.cryptoAllBinanceSpotCache.set(cacheKey, out);
+            return { price: out.price, error: out.error };
+        } catch (e: any) {
+            const msg = e?.message || String(e);
+            this.cryptoAllBinanceSpotCache.set(cacheKey, { atMs: now, price: null, error: msg });
+            return { price: null, error: msg };
+        }
+    }
+
+    private async isBinanceTrendOkWithSpot(options: { symbol: string; minutes: number; direction?: 'Up' | 'Down'; nowMs?: number; spotPriceOverride?: number }): Promise<{ ok: boolean; closes: number[]; lastClose: number | null; spot: number | null; error: string | null }> {
+        const sym = String(options.symbol || '').toUpperCase();
+        const binSymbol = this.getBinanceSymbol(sym);
+        const m = Math.max(1, Math.min(10, Math.floor(Number(options.minutes) || 0)));
+        if (!binSymbol) return { ok: false, closes: [], lastClose: null, spot: null, error: 'Unsupported symbol' };
+        const dir: 'Up' | 'Down' = options.direction === 'Down' ? 'Down' : 'Up';
+        const now = options.nowMs != null ? Math.floor(Number(options.nowMs) || 0) : Date.now();
+        const lastClosedOpenMs = this.getLastClosedMinuteOpenMs(now);
+        if (!(lastClosedOpenMs > 0)) return { ok: false, closes: [], lastClose: null, spot: null, error: 'Invalid time' };
+        const startMs = lastClosedOpenMs - m * 60_000;
+        const candle = await this.fetchBinance1mCandleWindow({ binSymbol, startMs, minutes: m + 1 });
+        const closes = Array.isArray(candle.closes1m) ? candle.closes1m.filter((x) => Number.isFinite(Number(x))) : [];
+        if (closes.length < m + 1) return { ok: false, closes, lastClose: closes.length ? closes[closes.length - 1] : null, spot: null, error: candle.error || 'Insufficient klines' };
+
+        let candleOk = true;
+        for (let i = closes.length - m; i < closes.length; i++) {
+            const prev = closes[i - 1];
+            const cur = closes[i];
+            if (dir === 'Up') {
+                if (!(Number(cur) > Number(prev))) { candleOk = false; break; }
+            } else {
+                if (!(Number(cur) < Number(prev))) { candleOk = false; break; }
+            }
+        }
+        const lastClose = Number(closes[closes.length - 1]);
+
+        const spotRaw = Number.isFinite(Number(options.spotPriceOverride)) ? Number(options.spotPriceOverride) : (await this.fetchBinanceSpotPrice({ binSymbol, nowMs: now })).price;
+        const spot = Number(spotRaw);
+        if (!(Number.isFinite(spot) && spot > 0)) return { ok: false, closes, lastClose: Number.isFinite(lastClose) ? lastClose : null, spot: null, error: 'spot_unavailable' };
+
+        const spotOk = dir === 'Up' ? spot > lastClose : spot < lastClose;
+        return { ok: candleOk && spotOk, closes, lastClose, spot, error: null };
+    }
+
+    private async isBinanceUpPerMinute(symbol: string, minutes: number, direction?: 'Up' | 'Down'): Promise<{ ok: boolean; closes: number[]; error: string | null }> {
+        const sym = String(symbol || '').toUpperCase();
+        const binSymbol = this.getBinanceSymbol(sym);
+        const m = Math.max(1, Math.min(10, Math.floor(Number(minutes) || 0)));
+        if (!binSymbol) return { ok: false, closes: [], error: 'Unsupported symbol' };
+        const dir: 'Up' | 'Down' = direction === 'Down' ? 'Down' : 'Up';
+        const endMs = Date.now();
+        const startMsRaw = endMs - (m + 1) * 60_000;
+        const startMs = Math.floor(startMsRaw / 60_000) * 60_000;
+        const candle = await this.fetchBinance1mCandleWindow({ binSymbol, startMs, minutes: m + 1 });
+        const closes = Array.isArray(candle.closes1m) ? candle.closes1m.filter((x) => Number.isFinite(Number(x))) : [];
+        if (closes.length < m + 1) return { ok: false, closes, error: candle.error || 'Insufficient klines' };
+        for (let i = closes.length - m; i < closes.length; i++) {
+            const prev = closes[i - 1];
+            const cur = closes[i];
+            if (dir === 'Up') {
+                if (!(Number(cur) > Number(prev))) return { ok: false, closes, error: null };
+            } else {
+                if (!(Number(cur) < Number(prev))) return { ok: false, closes, error: null };
+            }
+        }
+        return { ok: true, closes, error: null };
+    }
+
+    private async fetchBinance1mCandleWindow(options: { binSymbol: string; startMs: number; minutes: number }): Promise<{ startMs: number; open: number | null; high: number | null; low: number | null; close: number | null; closes1m: number[]; error: string | null }> {
+        const binSymbol = String(options.binSymbol || '').toUpperCase();
+        const startMs = Math.floor(Number(options.startMs) || 0);
+        const minutes = Math.max(1, Math.min(60, Math.floor(Number(options.minutes) || 0)));
+        if (!binSymbol) return { startMs, open: null, high: null, low: null, close: null, closes1m: [], error: 'Missing binSymbol' };
+        if (!Number.isFinite(startMs) || startMs <= 0) return { startMs, open: null, high: null, low: null, close: null, closes1m: [], error: 'Invalid startMs' };
+        const cacheKey = `${binSymbol}:1m:${startMs}:${minutes}`;
+        const cached = this.cryptoAllBinanceCandleCache.get(cacheKey);
+        if (cached && Date.now() - cached.atMs < 900) {
+            return { startMs: cached.startMs, open: cached.open, high: cached.high, low: cached.low, close: cached.close, closes1m: cached.closes1m, error: cached.error };
+        }
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 6_000);
+        try {
+            const res = await this.withTimeout(
+                fetch(`https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(binSymbol)}&interval=1m&startTime=${startMs}&limit=${minutes}`, { signal: controller.signal }).finally(() => clearTimeout(t)),
+                6_500,
+                `Binance klines window ${binSymbol}`
+            );
+            if (!res.ok) throw new Error(`Binance klines HTTP ${res.status}`);
+            const json: any = await this.withTimeout(res.json(), 3_000, `Binance klines window json ${binSymbol}`);
+            const list = Array.isArray(json) ? json : [];
+            let open: number | null = null;
+            let high: number | null = null;
+            let low: number | null = null;
+            let close: number | null = null;
+            const closes1m: number[] = [];
+            for (let i = 0; i < list.length; i++) {
+                const row = list[i];
+                if (!Array.isArray(row) || row.length < 5) continue;
+                const o = Number(row[1]);
+                const h = Number(row[2]);
+                const l = Number(row[3]);
+                const c = Number(row[4]);
+                if (i === 0 && Number.isFinite(o)) open = o;
+                if (Number.isFinite(h)) high = high == null ? h : Math.max(high, h);
+                if (Number.isFinite(l)) low = low == null ? l : Math.min(low, l);
+                if (Number.isFinite(c)) {
+                    close = c;
+                    closes1m.push(c);
+                }
+            }
+            const out = { atMs: Date.now(), startMs, open, high, low, close, closes1m, error: null as string | null };
+            this.cryptoAllBinanceCandleCache.set(cacheKey, out);
+            return { startMs, open, high, low, close, closes1m, error: null };
+        } catch (e: any) {
+            const msg = e?.message || String(e);
+            const out = { atMs: Date.now(), startMs, open: null, high: null, low: null, close: null, closes1m: [], error: msg };
+            this.cryptoAllBinanceCandleCache.set(cacheKey, out);
+            return { startMs, open: null, high: null, low: null, close: null, closes1m: [], error: msg };
+        }
+    }
+
+    private async fetchCryptoAllBeatAndCurrentFromBinance(options: { symbol: string; endMs: number; timeframeSec: number }): Promise<{ priceToBeat: number | null; currentPrice: number | null; deltaAbs: number | null; error: string | null }> {
+        const symbol = String(options.symbol || '').toUpperCase();
+        const binSymbol = this.getBinanceSymbol(symbol);
+        if (!binSymbol) return { priceToBeat: null, currentPrice: null, deltaAbs: null, error: 'Unsupported symbol for delta thresholds' };
+        const endMs = Number(options.endMs);
+        const timeframeSec = Number(options.timeframeSec);
+        if (!Number.isFinite(endMs) || !Number.isFinite(timeframeSec) || timeframeSec <= 0) return { priceToBeat: null, currentPrice: null, deltaAbs: null, error: 'Invalid endMs/timeframeSec' };
+
+        const startMsRaw = endMs - Math.floor(timeframeSec) * 1000;
+        const startMs = Math.floor(startMsRaw / 60_000) * 60_000;
+        const cacheKey = `${binSymbol}:${startMs}`;
+        const cached = this.cryptoAllBeatCache.get(cacheKey);
+        if (cached && Date.now() - cached.atMs < 2_000) {
+            return { priceToBeat: cached.priceToBeat, currentPrice: cached.currentPrice, deltaAbs: cached.deltaAbs, error: cached.error };
+        }
+
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 6_000);
+        try {
+            const spotRes = await this.withTimeout(
+                fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${binSymbol}`, { signal: controller.signal }).finally(() => clearTimeout(t)),
+                6_500,
+                `Binance spot ${binSymbol}`
+            );
+            if (!spotRes.ok) throw new Error(`Binance spot HTTP ${spotRes.status}`);
+            const spotJson: any = await this.withTimeout(spotRes.json(), 3_000, `Binance spot json ${binSymbol}`);
+            const currentPrice = spotJson?.price != null ? Number(spotJson.price) : null;
+            if (currentPrice == null || !Number.isFinite(currentPrice)) throw new Error('Binance spot missing price');
+
+            const kRes = await this.withTimeout(
+                fetch(`https://api.binance.com/api/v3/klines?symbol=${binSymbol}&interval=1m&startTime=${startMs}&limit=1`, { signal: controller.signal }),
+                6_500,
+                `Binance kline ${binSymbol}`
+            );
+            if (!kRes.ok) throw new Error(`Binance kline HTTP ${kRes.status}`);
+            const kJson: any = await this.withTimeout(kRes.json(), 3_000, `Binance kline json ${binSymbol}`);
+            const open = Array.isArray(kJson) && kJson[0] && kJson[0][1] != null ? Number(kJson[0][1]) : null;
+            const priceToBeat = open != null && Number.isFinite(open) ? open : null;
+            const deltaAbs = priceToBeat != null ? Math.abs(currentPrice - priceToBeat) : null;
+            const out = { atMs: Date.now(), priceToBeat, currentPrice, deltaAbs, error: null };
+            this.cryptoAllBeatCache.set(cacheKey, out);
+            return { priceToBeat, currentPrice, deltaAbs, error: null };
+        } catch (e: any) {
+            const msg = e?.message || String(e);
+            const out = { atMs: Date.now(), priceToBeat: null, currentPrice: null, deltaAbs: null, error: msg };
+            this.cryptoAllBeatCache.set(cacheKey, out);
+            return { priceToBeat: null, currentPrice: null, deltaAbs: null, error: msg };
+        }
+    }
+
     private async fetchClobBooks(tokenIds: string[]): Promise<any[]> {
         const ids = Array.from(new Set((tokenIds || []).map((t) => String(t || '').trim()).filter((t) => t)));
         if (!ids.length) return [];
-        if (ids.length > 500) throw new Error('Too many tokenIds for /books');
+        const sortedKey = ids.slice().sort().join(',');
+        const cache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
+        const cached = cache?.get(sortedKey);
+        if (cached && Date.now() - cached.atMs < 1200) return cached.data;
         try {
-            const attempt = async (timeoutMs: number) => {
+            const attempt = async (chunkIds: string[], timeoutMs: number) => {
                 const controller = new AbortController();
                 const t = setTimeout(() => controller.abort(), timeoutMs);
                 try {
@@ -2842,8 +4612,10 @@ export class GroupArbitrageScanner {
                             headers: {
                                 'content-type': 'application/json',
                                 'accept': 'application/json',
+                                'user-agent': 'Mozilla/5.0',
+                                'accept-language': 'en-US,en;q=0.9',
                             },
-                            body: JSON.stringify(ids.map((token_id) => ({ token_id }))),
+                            body: JSON.stringify(chunkIds.map((token_id) => ({ token_id }))),
                             signal: controller.signal,
                         }).finally(() => clearTimeout(t)),
                         timeoutMs + 500,
@@ -2854,23 +4626,47 @@ export class GroupArbitrageScanner {
                         try { detail = await res.json(); } catch {}
                         throw new Error(`CLOB /books failed (${res.status}): ${detail?.error || detail?.message || 'unknown'}`);
                     }
+                    const ct = String(res.headers.get('content-type') || '');
+                    if (!ct.toLowerCase().includes('application/json')) {
+                        const text = await res.text().catch(() => '');
+                        throw new Error(`CLOB /books non-json (${res.status}) ct=${ct} body=${String(text || '').slice(0, 180)}`);
+                    }
                     const data = await res.json().catch(() => null);
                     return Array.isArray(data) ? data : [];
                 } finally {
                     clearTimeout(t);
                 }
             };
-            try {
-                return await attempt(2_000);
-            } catch (e1: any) {
-                await new Promise(r => setTimeout(r, 250));
+            const fetchOnce = async (chunkIds: string[]) => {
+                let out: any[] = [];
                 try {
-                    return await attempt(3_500);
-                } catch (e2: any) {
-                    await new Promise(r => setTimeout(r, 500));
-                    return await attempt(5_000);
+                    out = await attempt(chunkIds, 2_000);
+                } catch {
+                    await new Promise(r => setTimeout(r, 250));
+                    try {
+                        out = await attempt(chunkIds, 3_500);
+                    } catch {
+                        await new Promise(r => setTimeout(r, 500));
+                        out = await attempt(chunkIds, 5_000);
+                    }
+                }
+                return out;
+            };
+
+            let out: any[] = [];
+            const maxChunk = 200;
+            if (ids.length <= 500) {
+                out = await fetchOnce(ids);
+            } else {
+                for (let i = 0; i < ids.length; i += maxChunk) {
+                    const chunk = ids.slice(i, i + maxChunk);
+                    const r = await fetchOnce(chunk);
+                    if (Array.isArray(r) && r.length) out = out.concat(r);
                 }
             }
+            if (!(this as any).clobBooksCache) (this as any).clobBooksCache = new Map();
+            (this as any).clobBooksCache.set(sortedKey, { atMs: Date.now(), data: out });
+            return out;
         } finally {
         }
     }
@@ -2886,15 +4682,15 @@ export class GroupArbitrageScanner {
                     const title = String(m?.question || m?.title || '').toLowerCase();
                     const slug = String(m?.slug || '').toLowerCase();
                     const has15m = /\b15\s*(m|min|mins|minute|minutes)\b/.test(title) || slug.includes('15m') || slug.includes('15-min') || slug.includes('-15m-');
-                    const hasUpDown = title.includes('up or down') || title.includes('up/down') || title.includes('updown') || slug.includes('updown');
+                    const hasUpDown = title.includes('up or down') || title.includes('up/down') || title.includes('updown') || slug.includes('updown') || slug.includes('up-or-down');
                     return has15m && hasUpDown;
                 };
-                const priorityPrefixes = ['btc-updown-15m', 'eth-updown-15m', 'sol-updown-15m'];
                 const getSymbolFromSlug = (slug: string): string | null => {
                     const s = String(slug || '').toLowerCase();
                     if (s.startsWith('btc-')) return 'BTC';
                     if (s.startsWith('eth-')) return 'ETH';
                     if (s.startsWith('sol-')) return 'SOL';
+                    if (s.startsWith('xrp-')) return 'XRP';
                     return null;
                 };
                 const parseStartSecFromSlug = (slug: string): number | null => {
@@ -2905,20 +4701,30 @@ export class GroupArbitrageScanner {
                     if (n < 1_500_000_000) return null;
                     return Math.floor(n);
                 };
-                const baseStart = Math.floor(nowSec / (15 * 60)) * (15 * 60);
-                const starts = [baseStart - 15 * 60, baseStart, baseStart + 15 * 60, baseStart + 30 * 60];
-                const predictedSlugs = Array.from(new Set(priorityPrefixes.flatMap((p) => starts.map((s) => `${p}-${s}`))));
-                const orderedSlugs = predictedSlugs.slice(0, 12);
-                const settled = await Promise.allSettled(orderedSlugs.map(async (slug) => {
-                    const url = `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}`;
-                    const data = await this.withTimeout(this.fetchGammaJson(url), 2_000, `Gamma slug ${slug}`);
-                    const list = Array.isArray(data) ? data : [];
-                    return list[0] || null;
-                }));
-                const markets: any[] = [];
-                for (const r of settled) {
-                    if (r.status !== 'fulfilled') continue;
-                    if (r.value) markets.push(r.value);
+                const maxSlugs = 80;
+                const resolveMarkets = async (slugs: string[]): Promise<any[]> => {
+                    const settled = await Promise.allSettled(slugs.map(async (slug) => {
+                        const url = `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`;
+                        const data = await this.withTimeout(this.fetchGammaJson(url), 5_000, `Gamma slug ${slug}`);
+                        const list = Array.isArray(data) ? data : [];
+                        return list[0] || null;
+                    }));
+                    const out: any[] = [];
+                    for (const r of settled) {
+                        if (r.status !== 'fulfilled') continue;
+                        if (r.value) out.push(r.value);
+                    }
+                    return out;
+                };
+
+                const predicted = this.predictCryptoAllSlugs('15m', nowSec, ['BTC', 'ETH', 'SOL', 'XRP']).slice(0, maxSlugs);
+                let markets: any[] = await resolveMarkets(Array.from(new Set(predicted)));
+                if (!markets.length) {
+                    const siteSlugs = await this.fetchCryptoSlugsFromSitePath('/crypto/15M', maxSlugs).catch(() => []);
+                    const uniqSite = Array.from(new Set((siteSlugs || []).map((s: any) => String(s || '').trim()).filter(Boolean))).slice(0, maxSlugs);
+                    if (uniqSite.length) {
+                        markets = await resolveMarkets(uniqSite);
+                    }
                 }
                 const baseMarkets: any[] = [];
                 for (const m of markets) {
@@ -2938,7 +4744,7 @@ export class GroupArbitrageScanner {
                     }
                     if (!Number.isFinite(endMs)) continue;
                     const outcomes = this.tryParseJsonArray(m?.outcomes);
-                    const tokenIds = this.tryParseJsonArray(m?.clobTokenIds);
+                    const tokenIds = this.tryParseJsonArray(m?.clobTokenIds ?? m?.clob_token_ids ?? null);
                     if (outcomes.length < 2 || tokenIds.length < 2) continue;
                     const outsLower = outcomes.map((x) => String(x).toLowerCase());
                     const upIdx = outsLower.findIndex((x) => x.includes('up'));
@@ -2958,6 +4764,7 @@ export class GroupArbitrageScanner {
                         downIdx,
                     });
                 }
+                if (!baseMarkets.length) throw new Error('No 15m markets returned from Gamma');
                 this.crypto15mMarketSnapshot = { atMs: Date.now(), markets: baseMarkets.slice(0, 30), lastError: null };
                 this.crypto15mMarketBackoffMs = 0;
                 this.crypto15mMarketNextAllowedAtMs = 0;
@@ -2976,14 +4783,17 @@ export class GroupArbitrageScanner {
 
     private async refreshCrypto15mBooksSnapshot(): Promise<void> {
         if (this.crypto15mBooksInFlight) return this.crypto15mBooksInFlight;
-        if (this.crypto15mBooksNextAllowedAtMs && Date.now() < this.crypto15mBooksNextAllowedAtMs) return;
+        const now = Date.now();
+        const lastAt = this.crypto15mBooksSnapshot.atMs ? Number(this.crypto15mBooksSnapshot.atMs) : 0;
+        const staleTooLong = lastAt > 0 ? (now - lastAt) > 10_000 : false;
+        if (this.crypto15mBooksNextAllowedAtMs && now < this.crypto15mBooksNextAllowedAtMs && !staleTooLong) return;
         this.crypto15mBooksInFlight = (async () => {
             this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastAttemptAtMs: Date.now(), lastAttemptError: null };
             try {
                 const markets = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
                 const tokenIds = Array.from(new Set(markets.flatMap((m: any) => Array.isArray(m?.tokenIds) ? m.tokenIds : []).map((t: any) => String(t || '').trim()).filter((t: any) => !!t)));
                 if (!tokenIds.length) {
-                    this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, atMs: Date.now(), byTokenId: {}, lastError: null, lastAttemptError: null };
+                    this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastError: 'No tokenIds for books refresh', lastAttemptError: 'No tokenIds for books refresh' };
                     return;
                 }
                 const books = await this.fetchClobBooks(tokenIds);
@@ -3186,6 +4996,90 @@ export class GroupArbitrageScanner {
         }
     }
 
+    private startCryptoAllWsLoop() {
+        if (this.cryptoAllWsTimer) return;
+        const cache = new Map<string, { atMs: number; candidates: any[] }>();
+        const tick = async () => {
+            if (!this.cryptoAllWsClients.size) return;
+            const status = this.getCryptoAllStatus();
+            const now = Date.now();
+            for (const [socket, cfg] of this.cryptoAllWsClients.entries()) {
+                const key = JSON.stringify({ symbols: cfg.symbols.slice().sort(), timeframes: cfg.timeframes.slice().sort(), minProb: cfg.minProb, expiresWithinSec: cfg.expiresWithinSec, limit: cfg.limit });
+                try {
+                    const c = cache.get(key);
+                    let candidates: any[] = [];
+                    if (c && now - c.atMs < 250) {
+                        candidates = c.candidates;
+                    } else {
+                        const nextCandidates = await this.buildCryptoAllCandidatesFromSnapshots({
+                            symbols: cfg.symbols,
+                            timeframes: cfg.timeframes,
+                            minProb: cfg.minProb,
+                            expiresWithinSec: cfg.expiresWithinSec,
+                            limit: cfg.limit,
+                        });
+                        candidates = (nextCandidates.length === 0 && c && c.candidates.length) ? c.candidates : nextCandidates;
+                        cache.set(key, { atMs: now, candidates });
+                    }
+                    socket.send(JSON.stringify({
+                        type: 'snapshot',
+                        at: new Date().toISOString(),
+                        status,
+                        candidates,
+                    }));
+                } catch (e: any) {
+                    try {
+                        socket.send(JSON.stringify({ type: 'error', at: new Date().toISOString(), message: e?.message || String(e) }));
+                    } catch {
+                    }
+                }
+            }
+        };
+        this.cryptoAllWsTimer = setInterval(() => tick().catch(() => {}), 250);
+    }
+
+    private startCryptoAllSnapshotLoop() {
+        if (this.cryptoAllSnapshotTimer) return;
+        const tick = async () => {
+            if (!this.cryptoAllWsClients.size) return;
+            const symbols = Array.from(new Set(Array.from(this.cryptoAllWsClients.values()).flatMap((c: any) => c.symbols || [])));
+            const limit = Math.max(10, Math.min(100, Math.max(...Array.from(this.cryptoAllWsClients.values()).map((c: any) => Number(c.limit) || 0), 0)));
+            await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes: ['15m'], limit }).catch(() => {});
+            await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes: ['15m'], limit }).catch(() => {});
+        };
+        this.cryptoAllSnapshotTimer = setInterval(() => tick().catch(() => {}), 1000);
+        tick().catch(() => {});
+    }
+
+    public addCryptoAllWsClient(socket: any, options: { symbols?: string[] | string; timeframes?: Array<'15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; limit?: number; includeCandidates?: boolean | string }) {
+        const symbolsInput = options?.symbols;
+        const symbolsArr =
+            Array.isArray(symbolsInput) ? symbolsInput
+            : typeof symbolsInput === 'string' ? symbolsInput.split(',').map((x) => x.trim()).filter(Boolean)
+            : this.cryptoAllAutoConfig.symbols;
+        const symbols = Array.from(new Set(symbolsArr.map((s) => String(s || '').toUpperCase()).filter(Boolean)));
+
+        const minProb = Math.max(0, Math.min(1, Number(options?.minProb ?? this.cryptoAllAutoConfig.minProb)));
+        const expiresWithinSec = Math.max(10, Math.floor(Number(options?.expiresWithinSec ?? this.cryptoAllAutoConfig.expiresWithinSec)));
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(options?.limit ?? 40))));
+        const includeCandidates = options?.includeCandidates == null ? true : (String(options?.includeCandidates || '').toLowerCase() === '1' || String(options?.includeCandidates || '').toLowerCase() === 'true');
+        this.cryptoAllWsClients.set(socket, { symbols, timeframes: ['15m'], minProb, expiresWithinSec, limit, includeCandidates });
+        this.startCryptoAllSnapshotLoop();
+        this.startCryptoAllWsLoop();
+    }
+
+    public removeCryptoAllWsClient(socket: any) {
+        this.cryptoAllWsClients.delete(socket);
+        if (!this.cryptoAllWsClients.size && this.cryptoAllWsTimer) {
+            clearInterval(this.cryptoAllWsTimer);
+            this.cryptoAllWsTimer = null;
+        }
+        if (!this.cryptoAllWsClients.size && this.cryptoAllSnapshotTimer) {
+            clearInterval(this.cryptoAllSnapshotTimer);
+            this.cryptoAllSnapshotTimer = null;
+        }
+    }
+
     async getCrypto15mCandidates(options?: { minProb?: number; expiresWithinSec?: number; limit?: number }) {
         const now = Date.now();
         if (!this.crypto15mMarketSnapshot.atMs || now - this.crypto15mMarketSnapshot.atMs > 5_000) {
@@ -3193,6 +5087,26 @@ export class GroupArbitrageScanner {
         }
         if (!this.crypto15mBooksSnapshot.atMs || now - this.crypto15mBooksSnapshot.atMs > 500) {
             await this.refreshCrypto15mBooksSnapshot();
+            const afterStaleMs = this.crypto15mBooksSnapshot.atMs ? (Date.now() - Number(this.crypto15mBooksSnapshot.atMs)) : Infinity;
+            if (Number.isFinite(afterStaleMs) && afterStaleMs > 10_000 && !this.crypto15mBooksSnapshot.lastError) {
+                this.crypto15mBooksInFlight = null;
+                this.crypto15mBooksBackoffMs = 0;
+                this.crypto15mBooksNextAllowedAtMs = 0;
+                await this.refreshCrypto15mBooksSnapshot();
+            }
+        }
+        if (Array.isArray(this.crypto15mMarketSnapshot.markets) && this.crypto15mMarketSnapshot.markets.length > 0) {
+            const byTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
+            const hasAnyBook = Object.keys(byTokenId).some((k) => {
+                const b = byTokenId[k];
+                return b && Number(b.asksCount || 0) > 0 && b.bestAsk != null;
+            });
+            if (!hasAnyBook && !this.crypto15mBooksSnapshot.lastError) {
+                this.crypto15mBooksInFlight = null;
+                this.crypto15mBooksBackoffMs = 0;
+                this.crypto15mBooksNextAllowedAtMs = 0;
+                await this.refreshCrypto15mBooksSnapshot();
+            }
         }
         return this.buildCrypto15mCandidatesFromSnapshots(options);
     }
@@ -3203,17 +5117,1121 @@ export class GroupArbitrageScanner {
         for (const [symbol, a] of this.crypto15mActivesBySymbol.entries()) {
             actives[symbol] = a;
         }
+        const adaptiveDelta: any = {};
+        for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+            const base =
+                sym === 'BTC' ? this.crypto15mDeltaThresholds.btcMinDelta
+                : sym === 'ETH' ? this.crypto15mDeltaThresholds.ethMinDelta
+                : sym === 'SOL' ? this.crypto15mDeltaThresholds.solMinDelta
+                : sym === 'XRP' ? this.crypto15mDeltaThresholds.xrpMinDelta
+                : 0;
+            const st = this.crypto15mAdaptiveDeltaBySymbol.get(sym) || null;
+            const overrideDelta = st?.overrideDelta != null && Number.isFinite(Number(st.overrideDelta)) ? Number(st.overrideDelta) : null;
+            const noBuyCount = st?.noBuyCount != null ? Math.max(0, Math.floor(Number(st.noBuyCount))) : 0;
+            const limit = Math.max(1, Math.floor(Number(this.crypto15mAutoConfig.adaptiveDeltaRevertNoBuyCount) || 4));
+            adaptiveDelta[sym] = {
+                enabled: this.crypto15mAutoConfig.adaptiveDeltaEnabled === true,
+                baseMinDelta: base,
+                overrideMinDelta: overrideDelta,
+                effectiveMinDelta: overrideDelta != null ? overrideDelta : base,
+                noBuyCount,
+                revertAfter: limit,
+                remainingToRevert: overrideDelta != null ? Math.max(0, limit - noBuyCount) : null,
+                lastBigMoveAt: st?.lastBigMoveAt ?? null,
+                lastBigMoveDelta: st?.lastBigMoveDelta ?? null,
+            };
+        }
         const tracked = Array.from(this.crypto15mTrackedByCondition.values())
             .sort((a: any, b: any) => String(b?.startedAt || '').localeCompare(String(a?.startedAt || '')))
             .slice(0, 50);
         return {
+            hasValidKey: this.hasValidKey === true,
+            trading: this.getTradingInitStatus(),
             enabled: this.crypto15mAutoEnabled,
             config: this.crypto15mAutoConfig,
             lastScanAt: this.crypto15mLastScanAt,
             lastError: this.crypto15mLastError,
+            lastDecision: this.crypto15mLastDecision,
+            lastCandidateStats: this.crypto15mLastCandidateStats,
+            lastOrderAttempt: this.crypto15mLastOrderAttempt,
+            adaptiveDelta,
             actives,
             tracked,
         };
+    }
+
+    async getCryptoAll2Candidates(options?: { minProb?: number; expiresWithinSec?: number; limit?: number; symbols?: string[] | string }) {
+        const symbolsInput = options?.symbols;
+        const symbolsArr =
+            Array.isArray(symbolsInput) ? symbolsInput
+            : typeof symbolsInput === 'string' ? symbolsInput.split(',').map((x) => x.trim()).filter(Boolean)
+            : (this.cryptoAllAutoConfig.symbols || ['BTC', 'ETH', 'SOL', 'XRP']);
+        const symbols = new Set(symbolsArr.map((s) => String(s || '').toUpperCase()).filter(Boolean));
+        const minProb = Math.max(0, Math.min(1, Number(options?.minProb ?? this.cryptoAllAutoConfig.minProb)));
+        const expiresWithinSec = Math.max(5, Math.floor(Number(options?.expiresWithinSec ?? this.cryptoAllAutoConfig.expiresWithinSec)));
+        const limit = Math.max(1, Math.min(100, Math.floor(Number(options?.limit ?? 40))));
+        const base = await this.getCrypto15mCandidates({ minProb, expiresWithinSec, limit: Math.max(limit, 40) });
+        const list = Array.isArray((base as any)?.candidates) ? (base as any).candidates : [];
+        const candidates = list
+            .filter((c: any) => !symbols.size || symbols.has(String(c?.symbol || '').toUpperCase()))
+            .map((c: any) => {
+                const outcomes = Array.isArray(c?.outcomes) ? c.outcomes : [];
+                const tokenIds = Array.isArray(c?.tokenIds) ? c.tokenIds : [];
+                const prices = Array.isArray(c?.prices) ? c.prices : [];
+                const upIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('up'));
+                const downIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('down'));
+                const upPrice0 = upIdx >= 0 ? Number(prices[upIdx]) : NaN;
+                const downPrice0 = downIdx >= 0 ? Number(prices[downIdx]) : NaN;
+                return {
+                    timeframe: '15m',
+                    symbol: c?.symbol,
+                    slug: c?.slug ?? null,
+                    conditionId: c?.conditionId,
+                    question: c?.title ?? null,
+                    endMs: c?.endMs,
+                    endDateIso: c?.endDate ?? null,
+                    secondsToExpire: c?.secondsToExpire,
+                    eligibleByExpiry: c?.eligibleByExpiry,
+                    minProb,
+                    meetsMinProb: c?.meetsMinProb,
+                    upTokenId: upIdx >= 0 ? String(tokenIds[upIdx] || '') : null,
+                    downTokenId: downIdx >= 0 ? String(tokenIds[downIdx] || '') : null,
+                    upPrice: Number.isFinite(upPrice0) ? upPrice0 : null,
+                    downPrice: Number.isFinite(downPrice0) ? downPrice0 : null,
+                    chosenOutcome: c?.chosenOutcome ?? null,
+                    chosenPrice: c?.chosenPrice ?? null,
+                    chosenTokenId: c?.chosenTokenId ?? null,
+                    chosenIndex: c?.chosenIndex ?? null,
+                    riskState: 'pending',
+                    riskPendingReason: 'not_computed',
+                    riskScore: null,
+                    riskError: null,
+                    reason: c?.reason ?? null,
+                    booksError: c?.booksError ?? null,
+                    marketsError: c?.marketsError ?? null,
+                    staleMs: c?.staleMs ?? null,
+                    snapshotAt: c?.snapshotAt ?? null,
+                };
+            });
+        const byTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
+        const riskLeadSec = Math.max(0, Math.floor(Number.isFinite(expiresWithinSec) ? expiresWithinSec : 0) + 60);
+        const timeframeSec = this.getCryptoAllTimeframeSec('15m');
+        await Promise.all(candidates.map(async (r: any) => {
+            const secondsToExpire = r?.secondsToExpire != null ? Number(r.secondsToExpire) : NaN;
+            if (!Number.isFinite(secondsToExpire)) {
+                r.riskState = 'pending';
+                r.riskPendingReason = 'missing_expiry';
+                return;
+            }
+            if (secondsToExpire > riskLeadSec) {
+                r.riskState = 'pending';
+                r.riskPendingReason = 'not_in_window';
+                return;
+            }
+            const endMs = r?.endMs != null ? Number(r.endMs) : NaN;
+            if (!Number.isFinite(endMs)) {
+                r.riskState = 'pending';
+                r.riskPendingReason = 'missing_endMs';
+                return;
+            }
+            const chosenTokenId = String(r?.chosenTokenId || '').trim();
+            if (!chosenTokenId) {
+                r.riskState = 'pending';
+                r.riskPendingReason = 'missing_tokenId';
+                return;
+            }
+            const sym = String(r?.symbol || '').toUpperCase();
+            const chosenOutcomeLc = String(r?.chosenOutcome || '').toLowerCase();
+            const direction = chosenOutcomeLc.includes('down') ? 'Down' : 'Up';
+            const book0: any = byTokenId[chosenTokenId] || null;
+            const beat = await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: sym, endMs, timeframeSec }).catch((e: any) => ({ priceToBeat: null, currentPrice: null, deltaAbs: null, error: e?.message || String(e) }));
+            const risk = await this.computeCryptoAllRisk({
+                symbol: sym,
+                timeframeSec,
+                endMs,
+                direction: direction as any,
+                beat,
+                book: book0 ? { bestAsk: book0.bestAsk ?? null, bestBid: book0.bestBid ?? null, asksCount: book0.asksCount, bidsCount: book0.bidsCount } : null,
+            }).catch((e: any) => ({ riskScore: null, dojiLikely: null, wickRatio: null, bodyRatio: null, retraceRatio: null, marginPct: null, momentum3m: null, spread: null, reasons: [], error: e?.message || String(e) }));
+            r.riskState = risk?.riskScore != null ? 'ready' : 'error';
+            r.riskScore = risk?.riskScore ?? null;
+            r.riskError = risk?.error ?? null;
+            r.riskPendingReason = null;
+        }));
+        return { success: true, count: candidates.length, candidates: candidates.slice(0, limit) };
+    }
+
+    getCryptoAll2Status() {
+        this.cryptoAll2UpdateTracking(Date.now());
+        const actives: any = {};
+        for (const [symbol, a] of this.cryptoAll2ActivesBySymbol.entries()) {
+            actives[symbol] = a;
+        }
+        const adaptiveDelta: any = {};
+        for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+            const base =
+                sym === 'BTC' ? this.crypto15mDeltaThresholds.btcMinDelta
+                : sym === 'ETH' ? this.crypto15mDeltaThresholds.ethMinDelta
+                : sym === 'SOL' ? this.crypto15mDeltaThresholds.solMinDelta
+                : sym === 'XRP' ? this.crypto15mDeltaThresholds.xrpMinDelta
+                : 0;
+            const st = this.cryptoAll2AdaptiveDeltaBySymbol.get(sym) || null;
+            const overrideDelta = st?.overrideDelta != null && Number.isFinite(Number(st.overrideDelta)) ? Number(st.overrideDelta) : null;
+            const noBuyCount = st?.noBuyCount != null ? Math.max(0, Math.floor(Number(st.noBuyCount))) : 0;
+            const limit = Math.max(1, Math.floor(Number(this.cryptoAll2AutoConfig.adaptiveDeltaRevertNoBuyCount) || 4));
+            adaptiveDelta[sym] = {
+                enabled: this.cryptoAll2AutoConfig.adaptiveDeltaEnabled === true,
+                baseMinDelta: base,
+                overrideMinDelta: overrideDelta,
+                effectiveMinDelta: overrideDelta != null ? overrideDelta : base,
+                noBuyCount,
+                revertAfter: limit,
+                remainingToRevert: overrideDelta != null ? Math.max(0, limit - noBuyCount) : null,
+                lastBigMoveAt: st?.lastBigMoveAt ?? null,
+                lastBigMoveDelta: st?.lastBigMoveDelta ?? null,
+            };
+        }
+        const tracked = Array.from(this.cryptoAll2TrackedByCondition.values())
+            .sort((a: any, b: any) => String(b?.startedAt || '').localeCompare(String(a?.startedAt || '')))
+            .slice(0, 50);
+        return {
+            hasValidKey: this.hasValidKey === true,
+            trading: this.getTradingInitStatus(),
+            enabled: this.cryptoAll2AutoEnabled,
+            config: this.cryptoAll2AutoConfig,
+            lastScanAt: this.cryptoAll2LastScanAt,
+            lastError: this.cryptoAll2LastError,
+            lastDecision: this.cryptoAll2LastDecision,
+            lastCandidateStats: this.cryptoAll2LastCandidateStats,
+            lastOrderAttempt: this.cryptoAll2LastOrderAttempt,
+            splitBuyState: Array.from(this.cryptoAll2SplitBuyState.values()).slice(0, 10),
+            lastSplitLegAttempt: this.cryptoAll2LastSplitLegAttempt,
+            adaptiveDelta,
+            actives,
+            tracked,
+        };
+    }
+
+    private cryptoAll2UpdateTracking(nowMs: number) {
+        for (const [symbol, a] of this.cryptoAll2ActivesBySymbol.entries()) {
+            const endMs = a?.expiresAtMs != null ? Number(a.expiresAtMs) : Date.parse(String(a?.endDate || ''));
+            if (Number.isFinite(endMs) && nowMs > endMs) {
+                const expired = { ...a, phase: 'expired', expiredAt: new Date(nowMs).toISOString() };
+                this.cryptoAll2TrackedByCondition.set(String(expired.conditionId), expired);
+                this.cryptoAll2ActivesBySymbol.delete(symbol);
+            }
+        }
+        const cutoff = nowMs - 48 * 60 * 60_000;
+        for (const [cid, a] of this.cryptoAll2TrackedByCondition.entries()) {
+            const started = Date.parse(String(a?.startedAt || a?.started_at || ''));
+            if (Number.isFinite(started) && started < cutoff) this.cryptoAll2TrackedByCondition.delete(cid);
+        }
+    }
+
+    startCryptoAll2Auto(config?: {
+        pollMs?: number;
+        expiresWithinSec?: number;
+        minProb?: number;
+        amountUsd?: number;
+        symbols?: string[];
+        dojiGuardEnabled?: boolean;
+        riskSkipScore?: number;
+        splitBuyEnabled?: boolean;
+        splitBuyPct3m?: number;
+        splitBuyPct2m?: number;
+        splitBuyPct1m?: number;
+        splitBuyTrendEnabled?: boolean;
+        splitBuyTrendMinutes3m?: number;
+        splitBuyTrendMinutes2m?: number;
+        splitBuyTrendMinutes1m?: number;
+        stoplossEnabled?: boolean;
+        stoplossCut1DropCents?: number;
+        stoplossCut1SellPct?: number;
+        stoplossCut2DropCents?: number;
+        stoplossCut2SellPct?: number;
+        stoplossMinSecToExit?: number;
+        adaptiveDeltaEnabled?: boolean;
+        adaptiveDeltaBigMoveMultiplier?: number;
+        adaptiveDeltaRevertNoBuyCount?: number;
+    }) {
+        if (this.autoRedeemConfig.enabled !== true) {
+            this.setAutoRedeemConfig({ enabled: true, persist: true });
+        }
+        const pollMsRaw = config?.pollMs != null ? Number(config.pollMs) : this.cryptoAll2AutoConfig.pollMs;
+        const expiresWithinSecRaw = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.cryptoAll2AutoConfig.expiresWithinSec;
+        const minProbRaw = config?.minProb != null ? Number(config.minProb) : this.cryptoAll2AutoConfig.minProb;
+        const amountUsdRaw = config?.amountUsd != null ? Number(config.amountUsd) : this.cryptoAll2AutoConfig.amountUsd;
+        const symbols = Array.isArray(config?.symbols) && config?.symbols.length ? Array.from(new Set(config.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean))) : this.cryptoAll2AutoConfig.symbols;
+        const dojiGuardEnabled = config?.dojiGuardEnabled != null ? !!config.dojiGuardEnabled : this.cryptoAll2AutoConfig.dojiGuardEnabled;
+        const riskSkipScoreRaw = config?.riskSkipScore != null ? Number(config.riskSkipScore) : this.cryptoAll2AutoConfig.riskSkipScore;
+        const splitBuyEnabled = config?.splitBuyEnabled != null ? !!config.splitBuyEnabled : this.cryptoAll2AutoConfig.splitBuyEnabled;
+        const splitBuyPct3mRaw = config?.splitBuyPct3m != null ? Number(config.splitBuyPct3m) : this.cryptoAll2AutoConfig.splitBuyPct3m;
+        const splitBuyPct2mRaw = config?.splitBuyPct2m != null ? Number(config.splitBuyPct2m) : this.cryptoAll2AutoConfig.splitBuyPct2m;
+        const splitBuyPct1mRaw = config?.splitBuyPct1m != null ? Number(config.splitBuyPct1m) : this.cryptoAll2AutoConfig.splitBuyPct1m;
+        const splitBuyTrendEnabled = config?.splitBuyTrendEnabled != null ? !!config.splitBuyTrendEnabled : this.cryptoAll2AutoConfig.splitBuyTrendEnabled;
+        const splitBuyTrendMinutes3mRaw = config?.splitBuyTrendMinutes3m != null ? Number(config.splitBuyTrendMinutes3m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m;
+        const splitBuyTrendMinutes2mRaw = config?.splitBuyTrendMinutes2m != null ? Number(config.splitBuyTrendMinutes2m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m;
+        const splitBuyTrendMinutes1mRaw = config?.splitBuyTrendMinutes1m != null ? Number(config.splitBuyTrendMinutes1m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m;
+        const stoplossEnabled = config?.stoplossEnabled != null ? !!config.stoplossEnabled : this.cryptoAll2AutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = config?.stoplossCut1DropCents != null ? Number(config.stoplossCut1DropCents) : this.cryptoAll2AutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = config?.stoplossCut1SellPct != null ? Number(config.stoplossCut1SellPct) : this.cryptoAll2AutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = config?.stoplossCut2DropCents != null ? Number(config.stoplossCut2DropCents) : this.cryptoAll2AutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = config?.stoplossCut2SellPct != null ? Number(config.stoplossCut2SellPct) : this.cryptoAll2AutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = config?.stoplossMinSecToExit != null ? Number(config.stoplossMinSecToExit) : this.cryptoAll2AutoConfig.stoplossMinSecToExit;
+        const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.cryptoAll2AutoConfig.adaptiveDeltaEnabled;
+        const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.cryptoAll2AutoConfig.adaptiveDeltaBigMoveMultiplier;
+        const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.cryptoAll2AutoConfig.adaptiveDeltaRevertNoBuyCount;
+
+        this.cryptoAll2AutoConfig = {
+            pollMs: Math.max(500, Math.floor(Number.isFinite(pollMsRaw) ? pollMsRaw : 2_000)),
+            expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : 180)),
+            minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : 0.9)),
+            amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : 1),
+            symbols,
+            dojiGuardEnabled,
+            riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(riskSkipScoreRaw) ? riskSkipScoreRaw : 70))),
+            splitBuyEnabled,
+            splitBuyPct3m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct3mRaw) ? splitBuyPct3mRaw : 34)),
+            splitBuyPct2m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct2mRaw) ? splitBuyPct2mRaw : 33)),
+            splitBuyPct1m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct1mRaw) ? splitBuyPct1mRaw : 33)),
+            splitBuyTrendEnabled,
+            splitBuyTrendMinutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes3mRaw) ? splitBuyTrendMinutes3mRaw : 3))),
+            splitBuyTrendMinutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes2mRaw) ? splitBuyTrendMinutes2mRaw : 2))),
+            splitBuyTrendMinutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes1mRaw) ? splitBuyTrendMinutes1mRaw : 1))),
+            stoplossEnabled,
+            stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+            adaptiveDeltaEnabled,
+            adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(adaptiveDeltaBigMoveMultiplierRaw) ? adaptiveDeltaBigMoveMultiplierRaw : 2)),
+            adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(adaptiveDeltaRevertNoBuyCountRaw) ? adaptiveDeltaRevertNoBuyCountRaw : 4))),
+        };
+        this.persistCryptoAll2AutoConfigToFile();
+
+        this.cryptoAll2AutoEnabled = true;
+        this.recordAutoConfigEvent('cryptoall2', 'start', { enabled: true, ...this.cryptoAll2AutoConfig });
+        if (this.cryptoAll2AutoTimer) {
+            clearInterval(this.cryptoAll2AutoTimer);
+            this.cryptoAll2AutoTimer = null;
+        }
+        const tick = async () => {
+            await this.cryptoAll2TryAutoOnce().catch(() => {});
+        };
+        setTimeout(() => tick().catch(() => null), 250);
+        this.cryptoAll2AutoTimer = setInterval(() => setTimeout(() => tick().catch(() => null), 250), this.cryptoAll2AutoConfig.pollMs);
+        return this.getCryptoAll2Status();
+    }
+
+    stopCryptoAll2Auto() {
+        this.cryptoAll2AutoEnabled = false;
+        this.recordAutoConfigEvent('cryptoall2', 'stop', { enabled: false, ...this.cryptoAll2AutoConfig });
+        if (this.cryptoAll2AutoTimer) {
+            clearInterval(this.cryptoAll2AutoTimer);
+            this.cryptoAll2AutoTimer = null;
+        }
+        return this.getCryptoAll2Status();
+    }
+
+    updateCryptoAll2Config(config?: {
+        pollMs?: number;
+        expiresWithinSec?: number;
+        minProb?: number;
+        amountUsd?: number;
+        symbols?: string[];
+        dojiGuardEnabled?: boolean;
+        riskSkipScore?: number;
+        splitBuyEnabled?: boolean;
+        splitBuyPct3m?: number;
+        splitBuyPct2m?: number;
+        splitBuyPct1m?: number;
+        splitBuyTrendEnabled?: boolean;
+        splitBuyTrendMinutes3m?: number;
+        splitBuyTrendMinutes2m?: number;
+        splitBuyTrendMinutes1m?: number;
+        stoplossEnabled?: boolean;
+        stoplossCut1DropCents?: number;
+        stoplossCut1SellPct?: number;
+        stoplossCut2DropCents?: number;
+        stoplossCut2SellPct?: number;
+        stoplossMinSecToExit?: number;
+        adaptiveDeltaEnabled?: boolean;
+        adaptiveDeltaBigMoveMultiplier?: number;
+        adaptiveDeltaRevertNoBuyCount?: number;
+    }) {
+        const pollMsRaw = config?.pollMs != null ? Number(config.pollMs) : this.cryptoAll2AutoConfig.pollMs;
+        const expiresWithinSecRaw = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.cryptoAll2AutoConfig.expiresWithinSec;
+        const minProbRaw = config?.minProb != null ? Number(config.minProb) : this.cryptoAll2AutoConfig.minProb;
+        const amountUsdRaw = config?.amountUsd != null ? Number(config.amountUsd) : this.cryptoAll2AutoConfig.amountUsd;
+        const symbols = Array.isArray(config?.symbols) && config?.symbols.length ? Array.from(new Set(config.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean))) : this.cryptoAll2AutoConfig.symbols;
+        const dojiGuardEnabled = config?.dojiGuardEnabled != null ? !!config.dojiGuardEnabled : this.cryptoAll2AutoConfig.dojiGuardEnabled;
+        const riskSkipScoreRaw = config?.riskSkipScore != null ? Number(config.riskSkipScore) : this.cryptoAll2AutoConfig.riskSkipScore;
+        const splitBuyEnabled = config?.splitBuyEnabled != null ? !!config.splitBuyEnabled : this.cryptoAll2AutoConfig.splitBuyEnabled;
+        const splitBuyPct3mRaw = config?.splitBuyPct3m != null ? Number(config.splitBuyPct3m) : this.cryptoAll2AutoConfig.splitBuyPct3m;
+        const splitBuyPct2mRaw = config?.splitBuyPct2m != null ? Number(config.splitBuyPct2m) : this.cryptoAll2AutoConfig.splitBuyPct2m;
+        const splitBuyPct1mRaw = config?.splitBuyPct1m != null ? Number(config.splitBuyPct1m) : this.cryptoAll2AutoConfig.splitBuyPct1m;
+        const splitBuyTrendEnabled = config?.splitBuyTrendEnabled != null ? !!config.splitBuyTrendEnabled : this.cryptoAll2AutoConfig.splitBuyTrendEnabled;
+        const splitBuyTrendMinutes3mRaw = config?.splitBuyTrendMinutes3m != null ? Number(config.splitBuyTrendMinutes3m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m;
+        const splitBuyTrendMinutes2mRaw = config?.splitBuyTrendMinutes2m != null ? Number(config.splitBuyTrendMinutes2m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m;
+        const splitBuyTrendMinutes1mRaw = config?.splitBuyTrendMinutes1m != null ? Number(config.splitBuyTrendMinutes1m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m;
+        const stoplossEnabled = config?.stoplossEnabled != null ? !!config.stoplossEnabled : this.cryptoAll2AutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = config?.stoplossCut1DropCents != null ? Number(config.stoplossCut1DropCents) : this.cryptoAll2AutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = config?.stoplossCut1SellPct != null ? Number(config.stoplossCut1SellPct) : this.cryptoAll2AutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = config?.stoplossCut2DropCents != null ? Number(config.stoplossCut2DropCents) : this.cryptoAll2AutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = config?.stoplossCut2SellPct != null ? Number(config.stoplossCut2SellPct) : this.cryptoAll2AutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = config?.stoplossMinSecToExit != null ? Number(config.stoplossMinSecToExit) : this.cryptoAll2AutoConfig.stoplossMinSecToExit;
+        const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.cryptoAll2AutoConfig.adaptiveDeltaEnabled;
+        const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.cryptoAll2AutoConfig.adaptiveDeltaBigMoveMultiplier;
+        const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.cryptoAll2AutoConfig.adaptiveDeltaRevertNoBuyCount;
+
+        this.cryptoAll2AutoConfig = {
+            pollMs: Math.max(500, Math.floor(Number.isFinite(pollMsRaw) ? pollMsRaw : 2_000)),
+            expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : 180)),
+            minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : 0.9)),
+            amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : 1),
+            symbols,
+            dojiGuardEnabled,
+            riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(riskSkipScoreRaw) ? riskSkipScoreRaw : 70))),
+            splitBuyEnabled,
+            splitBuyPct3m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct3mRaw) ? splitBuyPct3mRaw : 34))),
+            splitBuyPct2m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct2mRaw) ? splitBuyPct2mRaw : 33))),
+            splitBuyPct1m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct1mRaw) ? splitBuyPct1mRaw : 33))),
+            splitBuyTrendEnabled,
+            splitBuyTrendMinutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes3mRaw) ? splitBuyTrendMinutes3mRaw : 3))),
+            splitBuyTrendMinutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes2mRaw) ? splitBuyTrendMinutes2mRaw : 2))),
+            splitBuyTrendMinutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes1mRaw) ? splitBuyTrendMinutes1mRaw : 1))),
+            stoplossEnabled,
+            stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+            adaptiveDeltaEnabled,
+            adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(adaptiveDeltaBigMoveMultiplierRaw) ? adaptiveDeltaBigMoveMultiplierRaw : 2)),
+            adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(adaptiveDeltaRevertNoBuyCountRaw) ? adaptiveDeltaRevertNoBuyCountRaw : 4))),
+        };
+        this.persistCryptoAll2AutoConfigToFile();
+    }
+
+    updateCryptoAllConfig(config?: {
+        pollMs?: number;
+        expiresWithinSec?: number;
+        minProb?: number;
+        amountUsd?: number;
+        symbols?: string[];
+        dojiGuardEnabled?: boolean;
+        riskSkipScore?: number;
+        splitBuyEnabled?: boolean;
+        splitBuyPct3m?: number;
+        splitBuyPct2m?: number;
+        splitBuyPct1m?: number;
+        splitBuyTrendEnabled?: boolean;
+        splitBuyTrendMinutes3m?: number;
+        splitBuyTrendMinutes2m?: number;
+        splitBuyTrendMinutes1m?: number;
+        stoplossEnabled?: boolean;
+        stoplossCut1DropCents?: number;
+        stoplossCut1SellPct?: number;
+        stoplossCut2DropCents?: number;
+        stoplossCut2SellPct?: number;
+        stoplossMinSecToExit?: number;
+        adaptiveDeltaEnabled?: boolean;
+        adaptiveDeltaBigMoveMultiplier?: number;
+        adaptiveDeltaRevertNoBuyCount?: number;
+    }) {
+        const pollMsRaw = config?.pollMs != null ? Number(config.pollMs) : this.cryptoAllAutoConfig.pollMs;
+        const expiresWithinSecRaw = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec;
+        const minProbRaw = config?.minProb != null ? Number(config.minProb) : this.cryptoAllAutoConfig.minProb;
+        const amountUsdRaw = config?.amountUsd != null ? Number(config.amountUsd) : this.cryptoAllAutoConfig.amountUsd;
+        const symbols = Array.isArray(config?.symbols) && config?.symbols.length ? Array.from(new Set(config.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean))) : this.cryptoAllAutoConfig.symbols;
+        const dojiGuardEnabled = config?.dojiGuardEnabled != null ? !!config.dojiGuardEnabled : this.cryptoAllAutoConfig.dojiGuardEnabled;
+        const riskSkipScoreRaw = config?.riskSkipScore != null ? Number(config.riskSkipScore) : this.cryptoAllAutoConfig.riskSkipScore;
+        const splitBuyEnabled = config?.splitBuyEnabled != null ? !!config.splitBuyEnabled : this.cryptoAllAutoConfig.splitBuyEnabled;
+        const splitBuyPct3mRaw = config?.splitBuyPct3m != null ? Number(config.splitBuyPct3m) : this.cryptoAllAutoConfig.splitBuyPct3m;
+        const splitBuyPct2mRaw = config?.splitBuyPct2m != null ? Number(config.splitBuyPct2m) : this.cryptoAllAutoConfig.splitBuyPct2m;
+        const splitBuyPct1mRaw = config?.splitBuyPct1m != null ? Number(config.splitBuyPct1m) : this.cryptoAllAutoConfig.splitBuyPct1m;
+        const splitBuyTrendEnabled = config?.splitBuyTrendEnabled != null ? !!config.splitBuyTrendEnabled : this.cryptoAllAutoConfig.splitBuyTrendEnabled;
+        const splitBuyTrendMinutes3mRaw = config?.splitBuyTrendMinutes3m != null ? Number(config.splitBuyTrendMinutes3m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes3m;
+        const splitBuyTrendMinutes2mRaw = config?.splitBuyTrendMinutes2m != null ? Number(config.splitBuyTrendMinutes2m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes2m;
+        const splitBuyTrendMinutes1mRaw = config?.splitBuyTrendMinutes1m != null ? Number(config.splitBuyTrendMinutes1m) : this.cryptoAllAutoConfig.splitBuyTrendMinutes1m;
+        const stoplossEnabled = config?.stoplossEnabled != null ? !!config.stoplossEnabled : this.cryptoAllAutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = config?.stoplossCut1DropCents != null ? Number(config.stoplossCut1DropCents) : this.cryptoAllAutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = config?.stoplossCut1SellPct != null ? Number(config.stoplossCut1SellPct) : this.cryptoAllAutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = config?.stoplossCut2DropCents != null ? Number(config.stoplossCut2DropCents) : this.cryptoAllAutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = config?.stoplossCut2SellPct != null ? Number(config.stoplossCut2SellPct) : this.cryptoAllAutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = config?.stoplossMinSecToExit != null ? Number(config.stoplossMinSecToExit) : this.cryptoAllAutoConfig.stoplossMinSecToExit;
+        const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.cryptoAllAutoConfig.adaptiveDeltaEnabled;
+        const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier;
+        const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount;
+
+        this.cryptoAllAutoConfig = {
+            pollMs: Math.max(500, Math.floor(Number.isFinite(pollMsRaw) ? pollMsRaw : 2_000)),
+            expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : 180)),
+            minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : 0.9)),
+            amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : 1),
+            symbols,
+            timeframes: Array.isArray(this.cryptoAllAutoConfig.timeframes) && this.cryptoAllAutoConfig.timeframes.length ? this.cryptoAllAutoConfig.timeframes : ['15m'],
+            dojiGuard: {
+                ...this.cryptoAllAutoConfig.dojiGuard,
+                enabled: dojiGuardEnabled,
+                riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(riskSkipScoreRaw) ? riskSkipScoreRaw : 70))),
+            },
+            addOn: { ...this.cryptoAllAutoConfig.addOn },
+            stoploss: {
+                ...this.cryptoAllAutoConfig.stoploss,
+                enabled: stoplossEnabled,
+                cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : this.cryptoAllAutoConfig.stoploss.cut1DropCents))),
+                cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : this.cryptoAllAutoConfig.stoploss.cut1SellPct))),
+                cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : this.cryptoAllAutoConfig.stoploss.cut2DropCents))),
+                cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : this.cryptoAllAutoConfig.stoploss.cut2SellPct))),
+                minSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : this.cryptoAllAutoConfig.stoploss.minSecToExit))),
+            },
+            dojiGuardEnabled,
+            riskSkipScore: Math.max(0, Math.min(100, Math.floor(Number.isFinite(riskSkipScoreRaw) ? riskSkipScoreRaw : 70))),
+            splitBuyEnabled,
+            splitBuyPct3m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct3mRaw) ? splitBuyPct3mRaw : 34))),
+            splitBuyPct2m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct2mRaw) ? splitBuyPct2mRaw : 33))),
+            splitBuyPct1m: Math.max(0, Math.min(1000, Math.floor(Number.isFinite(splitBuyPct1mRaw) ? splitBuyPct1mRaw : 33))),
+            splitBuyTrendEnabled,
+            splitBuyTrendMinutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes3mRaw) ? splitBuyTrendMinutes3mRaw : 3))),
+            splitBuyTrendMinutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes2mRaw) ? splitBuyTrendMinutes2mRaw : 2))),
+            splitBuyTrendMinutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes1mRaw) ? splitBuyTrendMinutes1mRaw : 1))),
+            stoplossEnabled,
+            stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+            adaptiveDeltaEnabled,
+            adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(adaptiveDeltaBigMoveMultiplierRaw) ? adaptiveDeltaBigMoveMultiplierRaw : 2)),
+            adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(adaptiveDeltaRevertNoBuyCountRaw) ? adaptiveDeltaRevertNoBuyCountRaw : 4))),
+        };
+        this.persistCryptoAllAutoConfigToFile();
+    }
+
+    private ensureCryptoAll2SplitBuyLoop() {
+        if (this.cryptoAll2SplitBuyTimer) return;
+        this.cryptoAll2SplitBuyTimer = setInterval(() => {
+            this.tickCryptoAll2SplitBuyOnce().catch(() => {});
+        }, 750);
+    }
+
+    private async tickCryptoAll2SplitBuyOnce() {
+        if (!this.cryptoAll2SplitBuyState.size) {
+            if (this.cryptoAll2SplitBuyTimer) {
+                clearInterval(this.cryptoAll2SplitBuyTimer);
+                this.cryptoAll2SplitBuyTimer = null;
+            }
+            return;
+        }
+        const now = Date.now();
+        for (const [k, v] of Array.from(this.cryptoAll2SplitBuyState.entries())) {
+            if (!v) { this.cryptoAll2SplitBuyState.delete(k); continue; }
+            const expiresAtMs = Number(v.expiresAtMs || 0);
+            const remainingSec = Math.floor((expiresAtMs - now) / 1000);
+            if (!(remainingSec > 0)) { this.cryptoAll2SplitBuyState.delete(k); continue; }
+            const lastAttemptAtMs = Number(v.lastAttemptAtMs || 0);
+            if (now - lastAttemptAtMs < 2000) continue;
+            const due3m = remainingSec <= 180 && remainingSec > 120;
+            const due2m = remainingSec <= 120 && remainingSec > 60;
+            const due1m = remainingSec <= 60;
+            const nextLeg =
+                !v.done3m && due3m ? '3m'
+                : !v.done2m && due2m ? '2m'
+                : !v.done1m && due1m ? '1m'
+                : null;
+            if (!nextLeg) continue;
+            const amt = nextLeg === '3m' ? Number(v.amount3mUsd) : nextLeg === '2m' ? Number(v.amount2mUsd) : Number(v.amount1mUsd);
+            if (!(amt > 0)) {
+                if (nextLeg === '3m') v.done3m = true;
+                if (nextLeg === '2m') v.done2m = true;
+                if (nextLeg === '1m') v.done1m = true;
+                v.lastAttemptAtMs = now;
+                this.cryptoAll2SplitBuyState.set(k, v);
+                continue;
+            }
+            v.lastAttemptAtMs = now;
+            this.cryptoAll2SplitBuyState.set(k, v);
+            if (this.cryptoAll2AutoConfig.splitBuyTrendEnabled !== false) {
+                const needUpMin =
+                    nextLeg === '3m' ? this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m
+                    : nextLeg === '2m' ? this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m
+                    : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m;
+                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
+                if (!up.ok) continue;
+            }
+            const r: any = await this.placeCryptoAll2Order({
+                conditionId: String(v.conditionId),
+                outcomeIndex: Number(v.outcomeIndex),
+                amountUsd: amt,
+                minPrice: Number(v.minPrice),
+                force: true,
+                source: 'addon',
+                symbol: v.symbol,
+                endDate: v.endDate,
+                secondsToExpire: remainingSec,
+                stoplossEnabled: v.stoplossConfig?.enabled,
+                stoplossCut1DropCents: v.stoplossConfig?.cut1DropCents,
+                stoplossCut1SellPct: v.stoplossConfig?.cut1SellPct,
+                stoplossCut2DropCents: v.stoplossConfig?.cut2DropCents,
+                stoplossCut2SellPct: v.stoplossConfig?.cut2SellPct,
+                stoplossMinSecToExit: v.stoplossConfig?.minSecToExit,
+            }).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+            if (r?.success === true) {
+                if (nextLeg === '3m') v.done3m = true;
+                if (nextLeg === '2m') v.done2m = true;
+                if (nextLeg === '1m') v.done1m = true;
+                this.cryptoAll2SplitBuyState.set(k, v);
+            }
+            if (v.done3m && v.done2m && v.done1m) {
+                this.cryptoAll2SplitBuyState.delete(k);
+            }
+        }
+    }
+
+    private async cryptoAll2TryAutoOnce() {
+        if (!this.cryptoAll2AutoEnabled) return;
+        if (Date.now() < this.cryptoAll2NextScanAllowedAtMs) return;
+        if (this.cryptoAll2AutoInFlight) return;
+        this.cryptoAll2AutoInFlight = true;
+        if (!this.hasValidKey) {
+            this.cryptoAll2LastError = 'Missing private key';
+            this.cryptoAll2AutoInFlight = false;
+            return;
+        }
+        const cleanupLocks = () => {
+            const now = Date.now();
+            for (const [k, v] of this.cryptoAll2OrderLocks.entries()) {
+                if (!v) { this.cryptoAll2OrderLocks.delete(k); continue; }
+                if (now > Number(v.expiresAtMs || 0) + 10 * 60_000) this.cryptoAll2OrderLocks.delete(k);
+                else if (now - Number(v.atMs || 0) > 60 * 60_000) this.cryptoAll2OrderLocks.delete(k);
+            }
+        };
+        const nowMs = Date.now();
+        this.cryptoAll2UpdateTracking(nowMs);
+        this.cryptoAll2LastScanAt = new Date(nowMs).toISOString();
+        try {
+            cleanupLocks();
+            const r: any = await this.getCryptoAll2Candidates({
+                symbols: this.cryptoAll2AutoConfig.symbols,
+                minProb: this.cryptoAll2AutoConfig.minProb,
+                expiresWithinSec: this.cryptoAll2AutoConfig.expiresWithinSec,
+                limit: 40,
+            });
+            const candidates = Array.isArray(r?.candidates) ? r.candidates : [];
+            const okList = candidates.filter((c: any) => c?.eligibleByExpiry === true && c?.meetsMinProb === true && c?.reason == null && c?.conditionId && c?.chosenIndex != null);
+            let picked: any = null;
+            for (const c of okList) {
+                const sym = String(c?.symbol || '').toUpperCase();
+                const marketSlug = String(c?.slug || '').trim();
+                if (!sym || sym === 'UNKNOWN') continue;
+                if (this.cryptoAll2ActivesBySymbol.has(sym)) continue;
+                if (this.cryptoAll2TrackedByCondition.has(String(c.conditionId))) continue;
+                if (this.cryptoAll2AutoConfig.dojiGuardEnabled && c?.riskScore != null && Number(c.riskScore) >= Number(this.cryptoAll2AutoConfig.riskSkipScore)) continue;
+                picked = c;
+                break;
+            }
+            if (!picked) {
+                this.cryptoAll2LastError = null;
+                this.cryptoAll2AutoInFlight = false;
+                return;
+            }
+            const placed: any = await this.placeCryptoAll2Order({
+                conditionId: String(picked.conditionId),
+                outcomeIndex: Number(picked.chosenIndex),
+                amountUsd: this.cryptoAll2AutoConfig.amountUsd,
+                minPrice: this.cryptoAll2AutoConfig.minProb,
+                force: false,
+                source: 'auto',
+                symbol: picked.symbol,
+                endDate: picked.endDateIso,
+                secondsToExpire: picked.secondsToExpire,
+                chosenPrice: picked.chosenPrice,
+                stoplossEnabled: this.cryptoAll2AutoConfig.stoplossEnabled,
+                stoplossCut1DropCents: this.cryptoAll2AutoConfig.stoplossCut1DropCents,
+                stoplossCut1SellPct: this.cryptoAll2AutoConfig.stoplossCut1SellPct,
+                stoplossCut2DropCents: this.cryptoAll2AutoConfig.stoplossCut2DropCents,
+                stoplossCut2SellPct: this.cryptoAll2AutoConfig.stoplossCut2SellPct,
+                stoplossMinSecToExit: this.cryptoAll2AutoConfig.stoplossMinSecToExit,
+            }).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+            if (this.cryptoAll2AutoConfig.adaptiveDeltaEnabled === true) {
+                const sym = String(picked?.symbol || '').toUpperCase();
+                const st = this.cryptoAll2AdaptiveDeltaBySymbol.get(sym);
+                const overrideDelta = st?.overrideDelta != null ? Number(st.overrideDelta) : NaN;
+                if (st && Number.isFinite(overrideDelta) && overrideDelta > 0) {
+                    const didBuy = placed?.active?.phase === 'ordered' || placed?.order?.success === true;
+                    const next = { ...st };
+                    if (didBuy) {
+                        next.noBuyCount = 0;
+                    } else {
+                        next.noBuyCount = Math.max(0, Math.floor(Number(next.noBuyCount || 0)) + 1);
+                        const limit = Math.max(1, Math.floor(Number(this.cryptoAll2AutoConfig.adaptiveDeltaRevertNoBuyCount) || 4));
+                        if (next.noBuyCount >= limit) {
+                            next.overrideDelta = null;
+                            next.noBuyCount = 0;
+                        }
+                    }
+                    this.cryptoAll2AdaptiveDeltaBySymbol.set(sym, next);
+                }
+            }
+            if (placed?.success !== true) {
+                this.cryptoAll2LastError = placed?.error || 'order_failed';
+                this.cryptoAll2NextScanAllowedAtMs = Date.now() + 2_000;
+            } else {
+                this.cryptoAll2LastError = null;
+                this.cryptoAll2NextScanAllowedAtMs = Date.now() + 500;
+            }
+        } catch (e: any) {
+            this.cryptoAll2LastError = e?.message || String(e);
+            this.cryptoAll2NextScanAllowedAtMs = Date.now() + 2_000;
+        } finally {
+            this.cryptoAll2AutoInFlight = false;
+        }
+    }
+
+    async placeCryptoAll2Order(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi' | 'addon'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number; splitBuyEnabled?: boolean; splitBuyPct3m?: number; splitBuyPct2m?: number; splitBuyPct1m?: number; splitBuyTrendEnabled?: boolean; splitBuyTrendMinutes3m?: number; splitBuyTrendMinutes2m?: number; splitBuyTrendMinutes1m?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number }) {
+        if (!this.hasValidKey) throw new Error('Missing private key');
+        const conditionId = String(params.conditionId || '').trim();
+        if (!conditionId) throw new Error('Missing conditionId');
+        const requestedAmountUsd = params.amountUsd != null ? Number(params.amountUsd) : NaN;
+        const source = params.source || 'semi';
+        let amountUsd = Math.max(source === 'addon' ? 0.01 : 1, Number.isFinite(requestedAmountUsd) ? requestedAmountUsd : this.cryptoAll2AutoConfig.amountUsd);
+        const force = params.force === true;
+        const requestedMinPrice = params.minPrice != null ? Number(params.minPrice) : NaN;
+        const effectiveMinPrice = Math.max(0.9, this.cryptoAll2AutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
+        const splitBuyEnabled = params.splitBuyEnabled != null ? (params.splitBuyEnabled === true) : this.cryptoAll2AutoConfig.splitBuyEnabled;
+        const splitBuyPct3mRaw = params.splitBuyPct3m != null ? Number(params.splitBuyPct3m) : this.cryptoAll2AutoConfig.splitBuyPct3m;
+        const splitBuyPct2mRaw = params.splitBuyPct2m != null ? Number(params.splitBuyPct2m) : this.cryptoAll2AutoConfig.splitBuyPct2m;
+        const splitBuyPct1mRaw = params.splitBuyPct1m != null ? Number(params.splitBuyPct1m) : this.cryptoAll2AutoConfig.splitBuyPct1m;
+        const splitBuyTrendEnabled = params.splitBuyTrendEnabled != null ? (params.splitBuyTrendEnabled === true) : this.cryptoAll2AutoConfig.splitBuyTrendEnabled;
+        const splitBuyTrendMinutes3mRaw = params.splitBuyTrendMinutes3m != null ? Number(params.splitBuyTrendMinutes3m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m;
+        const splitBuyTrendMinutes2mRaw = params.splitBuyTrendMinutes2m != null ? Number(params.splitBuyTrendMinutes2m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m;
+        const splitBuyTrendMinutes1mRaw = params.splitBuyTrendMinutes1m != null ? Number(params.splitBuyTrendMinutes1m) : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m;
+        const splitBuyConfig = {
+            enabled: splitBuyEnabled,
+            pct3m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct3mRaw) ? splitBuyPct3mRaw : 34)),
+            pct2m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct2mRaw) ? splitBuyPct2mRaw : 33)),
+            pct1m: Math.max(0, Math.min(1000, Number.isFinite(splitBuyPct1mRaw) ? splitBuyPct1mRaw : 33)),
+        };
+        const splitBuyTrendConfig = {
+            enabled: splitBuyTrendEnabled,
+            minutes3m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes3mRaw) ? splitBuyTrendMinutes3mRaw : 3))),
+            minutes2m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes2mRaw) ? splitBuyTrendMinutes2mRaw : 2))),
+            minutes1m: Math.max(1, Math.min(10, Math.floor(Number.isFinite(splitBuyTrendMinutes1mRaw) ? splitBuyTrendMinutes1mRaw : 1))),
+        };
+        if (
+            params.splitBuyEnabled != null || params.splitBuyPct3m != null || params.splitBuyPct2m != null || params.splitBuyPct1m != null
+            || params.splitBuyTrendEnabled != null || params.splitBuyTrendMinutes3m != null || params.splitBuyTrendMinutes2m != null || params.splitBuyTrendMinutes1m != null
+        ) {
+            this.cryptoAll2AutoConfig = {
+                ...this.cryptoAll2AutoConfig,
+                splitBuyEnabled: splitBuyConfig.enabled,
+                splitBuyPct3m: splitBuyConfig.pct3m,
+                splitBuyPct2m: splitBuyConfig.pct2m,
+                splitBuyPct1m: splitBuyConfig.pct1m,
+                splitBuyTrendEnabled: splitBuyTrendConfig.enabled,
+                splitBuyTrendMinutes3m: splitBuyTrendConfig.minutes3m,
+                splitBuyTrendMinutes2m: splitBuyTrendConfig.minutes2m,
+                splitBuyTrendMinutes1m: splitBuyTrendConfig.minutes1m,
+            };
+        }
+        const stoplossEnabled = params.stoplossEnabled != null ? (params.stoplossEnabled === true) : this.cryptoAll2AutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = params.stoplossCut1DropCents != null ? Number(params.stoplossCut1DropCents) : this.cryptoAll2AutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = params.stoplossCut1SellPct != null ? Number(params.stoplossCut1SellPct) : this.cryptoAll2AutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = params.stoplossCut2DropCents != null ? Number(params.stoplossCut2DropCents) : this.cryptoAll2AutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = params.stoplossCut2SellPct != null ? Number(params.stoplossCut2SellPct) : this.cryptoAll2AutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = params.stoplossMinSecToExit != null ? Number(params.stoplossMinSecToExit) : this.cryptoAll2AutoConfig.stoplossMinSecToExit;
+        const stoplossConfig = {
+            enabled: stoplossEnabled,
+            cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            spreadGuardCents: 0,
+            minSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+        };
+        if (params.stoplossEnabled != null || params.stoplossCut1DropCents != null || params.stoplossCut1SellPct != null || params.stoplossCut2DropCents != null || params.stoplossCut2SellPct != null || params.stoplossMinSecToExit != null) {
+            this.cryptoAll2AutoConfig = {
+                ...this.cryptoAll2AutoConfig,
+                stoplossEnabled: stoplossConfig.enabled,
+                stoplossCut1DropCents: stoplossConfig.cut1DropCents,
+                stoplossCut1SellPct: stoplossConfig.cut1SellPct,
+                stoplossCut2DropCents: stoplossConfig.cut2DropCents,
+                stoplossCut2SellPct: stoplossConfig.cut2SellPct,
+                stoplossMinSecToExit: stoplossConfig.minSecToExit,
+            };
+        }
+        if (source !== 'addon' && this.cryptoAll2TrackedByCondition.has(conditionId)) {
+            return { success: false, skipped: true, reason: 'already_ordered', conditionId };
+        }
+        const alreadyInHistory = this.orderHistory.some((e: any) => {
+            if (!e) return false;
+            if (String(e?.action || '') !== 'cryptoall2_order') return false;
+            const mid = String(e?.marketId || '').trim().toLowerCase();
+            if (!mid || mid !== conditionId.toLowerCase()) return false;
+            const res0 = Array.isArray(e?.results) ? e.results[0] : null;
+            const orderStatus = String(res0?.orderStatus || '').toLowerCase();
+            if (orderStatus.startsWith('skipped:')) return false;
+            const ok = res0?.success === true;
+            const orderId = res0?.orderId != null ? String(res0.orderId) : '';
+            return ok || !!orderId;
+        });
+        if (source !== 'addon' && alreadyInHistory) {
+            return { success: false, skipped: true, reason: 'already_ordered_history', conditionId };
+        }
+
+        const cleanupLocks = () => {
+            const now = Date.now();
+            for (const [k, v] of this.cryptoAll2OrderLocks.entries()) {
+                if (!v) { this.cryptoAll2OrderLocks.delete(k); continue; }
+                if (now > Number(v.expiresAtMs || 0) + 10 * 60_000) this.cryptoAll2OrderLocks.delete(k);
+                else if (now - Number(v.atMs || 0) > 60 * 60_000) this.cryptoAll2OrderLocks.delete(k);
+            }
+        };
+        cleanupLocks();
+
+        const market = await withRetry(() => this.sdk.clobApi.getMarket(conditionId), { maxRetries: 2 });
+        const marketAny: any = market as any;
+        const marketSlug = String(marketAny?.marketSlug ?? marketAny?.market_slug ?? '');
+        const q = String(marketAny?.question || '');
+        const slugLc = marketSlug.toLowerCase();
+        const qLc = q.toLowerCase();
+        const symbol = String(params.symbol || (slugLc.startsWith('btc-') ? 'BTC' : slugLc.startsWith('eth-') ? 'ETH' : slugLc.startsWith('sol-') ? 'SOL' : slugLc.startsWith('xrp-') ? 'XRP' : qLc.includes('bitcoin') ? 'BTC' : qLc.includes('ethereum') ? 'ETH' : qLc.includes('solana') ? 'SOL' : (qLc.includes('xrp') || qLc.includes('ripple')) ? 'XRP' : 'UNKNOWN'));
+        let endDate: string | null = params.endDate != null ? String(params.endDate) : null;
+        if (!endDate && marketSlug.includes('-15m-')) {
+            const parts = marketSlug.split('-');
+            const last = parts[parts.length - 1];
+            const n = Number(last);
+            if (Number.isFinite(n) && n > 1_500_000_000) {
+                const endMs = (Math.floor(n) + 15 * 60) * 1000;
+                endDate = new Date(endMs).toISOString();
+            }
+        }
+        if (!endDate) {
+            const endIso = marketAny?.endDateIso ?? marketAny?.end_date_iso ?? null;
+            const ms = endIso ? Date.parse(String(endIso)) : NaN;
+            if (Number.isFinite(ms)) endDate = new Date(ms).toISOString();
+        }
+        let expiresAtMs = endDate ? Date.parse(endDate) : NaN;
+        if (!Number.isFinite(expiresAtMs)) {
+            expiresAtMs = Date.now() + 20 * 60_000;
+            endDate = new Date(expiresAtMs).toISOString();
+        }
+
+        const upperSymbol = String(symbol || '').toUpperCase();
+
+        const tokens: any[] = Array.isArray(marketAny?.tokens) ? marketAny.tokens : [];
+        if (tokens.length < 2) throw new Error('Invalid market tokens');
+        const requestedIdxRaw = params.outcomeIndex != null ? Math.floor(Number(params.outcomeIndex)) : NaN;
+        let idx = Number.isFinite(requestedIdxRaw) ? Math.max(0, Math.min(tokens.length - 1, requestedIdxRaw)) : 0;
+        const tokenOutcomeLc = String(tokens[idx]?.outcome || '').toLowerCase();
+        if (!tokenOutcomeLc.includes('up') && !tokenOutcomeLc.includes('down')) {
+            const upIdx = tokens.findIndex((t: any) => String(t?.outcome || '').toLowerCase().includes('up'));
+            const downIdx = tokens.findIndex((t: any) => String(t?.outcome || '').toLowerCase().includes('down'));
+            if (upIdx < 0 || downIdx < 0) throw new Error('Missing Up/Down outcomes');
+            idx = Number.isFinite(requestedIdxRaw) && requestedIdxRaw === downIdx ? downIdx : upIdx;
+        }
+        const baseStakeUsd = amountUsd;
+        const nowForSplit = Date.now();
+        const requestedSecondsToExpire = params.secondsToExpire != null ? Number(params.secondsToExpire) : NaN;
+        const remainingSecForSplit = Number.isFinite(requestedSecondsToExpire) ? Math.floor(requestedSecondsToExpire) : Math.floor((expiresAtMs - nowForSplit) / 1000);
+        let splitPlan: any = null;
+        if (source !== 'addon' && splitBuyConfig.enabled && remainingSecForSplit > 0) {
+            const dueLeg =
+                remainingSecForSplit <= 180 && remainingSecForSplit > 120 ? '3m'
+                : remainingSecForSplit <= 120 && remainingSecForSplit > 60 ? '2m'
+                : remainingSecForSplit <= 60 ? '1m'
+                : null;
+            if (dueLeg) {
+                const pctToMultiplier = (pctRaw: number): number => {
+                    const pct = Math.max(0, Math.min(300, Math.floor(Number(pctRaw) || 0)));
+                    if (pct <= 0) return 0;
+                    const level = Math.max(1, Math.min(3, Math.floor(pct / 100)));
+                    return Math.pow(2, level - 1);
+                };
+                const mult3 = pctToMultiplier(splitBuyConfig.pct3m);
+                const mult2 = pctToMultiplier(splitBuyConfig.pct2m);
+                const mult1 = pctToMultiplier(splitBuyConfig.pct1m);
+
+                const seq1Usd = Number((baseStakeUsd * mult3).toFixed(6));
+                const seq2Usd = Number((baseStakeUsd * mult2).toFixed(6));
+                const seq3Usd = Number((baseStakeUsd * mult1).toFixed(6));
+
+                const amount3mUsd = dueLeg === '3m' ? seq1Usd : 0;
+                const amount2mUsd = dueLeg === '3m' ? seq2Usd : dueLeg === '2m' ? seq1Usd : 0;
+                const amount1mUsd = dueLeg === '3m' ? seq3Usd : dueLeg === '2m' ? seq2Usd : dueLeg === '1m' ? seq1Usd : 0;
+
+                const legAmount = dueLeg === '3m' ? amount3mUsd : dueLeg === '2m' ? amount2mUsd : amount1mUsd;
+                if (legAmount >= 1) {
+                    amountUsd = legAmount;
+                    const direction: 'Up' | 'Down' = String(tokens[idx]?.outcome || '').toLowerCase().includes('down') ? 'Down' : 'Up';
+                    splitPlan = {
+                        key: `${conditionId}:${idx}`,
+                        conditionId,
+                        outcomeIndex: idx,
+                        symbol,
+                        direction,
+                        endDate,
+                        expiresAtMs,
+                        minPrice: effectiveMinPrice,
+                        stoplossConfig,
+                        dueLeg,
+                        amount3mUsd,
+                        amount2mUsd,
+                        amount1mUsd,
+                        done3m: dueLeg !== '3m',
+                        done2m: false,
+                        done1m: dueLeg === '1m' || (dueLeg === '2m' && !(amount1mUsd >= 1)),
+                        lastAttemptAtMs: 0,
+                    };
+                }
+            }
+        }
+        const tok: any = tokens[idx];
+        const tokenId = String(tok?.tokenId ?? tok?.token_id ?? tok?.id ?? '').trim();
+        if (!tokenId) throw new Error('Missing tokenId');
+        const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
+
+        const recordSkipEarly = (reason: string, extra?: any) => {
+            try {
+                const orderStatus = `skipped:${reason}`;
+                const last = this.orderHistory[0];
+                if (last && String(last?.action || '') === 'cryptoall2_order' && String(last?.marketId || '') === conditionId) {
+                    const lastStatus = Array.isArray(last?.results) && last.results.length ? String(last.results[0]?.orderStatus || '') : '';
+                    const lastTs = last?.timestamp ? Date.parse(String(last.timestamp)) : NaN;
+                    if (lastStatus === orderStatus && Number.isFinite(lastTs) && (Date.now() - lastTs) < 5000) return;
+                }
+                this.orderHistory.unshift({
+                    id: Date.now(),
+                    timestamp: new Date().toISOString(),
+                    mode: source,
+                    action: 'cryptoall2_order',
+                    marketId: conditionId,
+                    symbol: upperSymbol || symbol,
+                    slug: marketSlug || null,
+                    marketQuestion: market?.question ?? null,
+                    outcome,
+                    outcomeIndex: idx,
+                    tokenId,
+                    amountUsd,
+                    results: [{ success: false, orderId: null, tokenId, outcome, conditionId, orderStatus, errorMsg: extra != null ? String(extra) : '' }],
+                });
+                if (this.orderHistory.length > 300) this.orderHistory.pop();
+                this.schedulePersistOrderHistory();
+            } catch {
+            }
+        };
+
+        if (!force && source !== 'addon' && upperSymbol && upperSymbol !== 'UNKNOWN' && marketSlug) {
+            const baseMinDelta =
+                upperSymbol === 'BTC' ? this.cryptoAll2DeltaThresholds.btcMinDelta
+                : upperSymbol === 'ETH' ? this.cryptoAll2DeltaThresholds.ethMinDelta
+                : upperSymbol === 'SOL' ? this.cryptoAll2DeltaThresholds.solMinDelta
+                : upperSymbol === 'XRP' ? this.cryptoAll2DeltaThresholds.xrpMinDelta
+                : 0;
+            let overrideDelta: number | null = null;
+            let minDeltaRequired = baseMinDelta;
+            if (baseMinDelta > 0 && this.cryptoAll2AutoConfig.adaptiveDeltaEnabled === true) {
+                const s = this.cryptoAll2AdaptiveDeltaBySymbol.get(upperSymbol);
+                const d = s?.overrideDelta != null ? Number(s.overrideDelta) : NaN;
+                overrideDelta = Number.isFinite(d) && d > 0 ? d : null;
+                if (overrideDelta != null) minDeltaRequired = overrideDelta;
+            }
+            if (minDeltaRequired > 0) {
+                const beat = await this.fetchCrypto15mBeatAndCurrentFromSite(marketSlug);
+                if (beat.deltaAbs == null) {
+                    recordSkipEarly('delta_unavailable', beat.error || 'Failed to compute delta');
+                    return { success: false, skipped: true, reason: 'delta_unavailable', symbol: upperSymbol, slug: marketSlug || null, minDeltaBase: baseMinDelta, minDeltaRequired, minDeltaOverride: overrideDelta, error: beat.error || 'Failed to compute delta' };
+                }
+                const deltaAbs = Number(beat.deltaAbs);
+                if (this.cryptoAll2AutoConfig.adaptiveDeltaEnabled === true && baseMinDelta > 0 && Number.isFinite(deltaAbs) && deltaAbs > 0) {
+                    const m = Number(this.cryptoAll2AutoConfig.adaptiveDeltaBigMoveMultiplier) || 2;
+                    if (deltaAbs >= baseMinDelta * Math.max(1, m)) {
+                        this.cryptoAll2AdaptiveDeltaBySymbol.set(upperSymbol, { overrideDelta: deltaAbs, noBuyCount: 0, lastBigMoveAt: new Date().toISOString(), lastBigMoveDelta: deltaAbs });
+                        overrideDelta = deltaAbs;
+                        minDeltaRequired = deltaAbs;
+                    }
+                }
+                if (Number.isFinite(deltaAbs) && deltaAbs < Number(minDeltaRequired)) {
+                    recordSkipEarly('delta_too_small', `deltaAbs=${deltaAbs}, minDeltaRequired=${minDeltaRequired}`);
+                    return { success: false, skipped: true, reason: 'delta_too_small', symbol: upperSymbol, slug: marketSlug || null, minDeltaBase: baseMinDelta, minDeltaRequired, minDeltaOverride: overrideDelta, deltaAbs, priceToBeat: beat.priceToBeat, currentPrice: beat.currentPrice };
+                }
+            }
+        }
+
+        const books = await this.fetchClobBooks([tokenId]);
+        const book = books && books.length ? books[0] : null;
+        const asks = Array.isArray(book?.asks) ? book.asks : [];
+        let bestAsk = NaN;
+        for (const a of asks) {
+            const p = Number(a?.price);
+            if (!Number.isFinite(p) || p <= 0) continue;
+            if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+        }
+        const asksCount = asks.length;
+        if (!(asksCount > 0) || !Number.isFinite(bestAsk) || bestAsk <= 0) {
+            throw new Error(`No asks (orderbook unavailable) for tokenId=${tokenId}`);
+        }
+        const price = bestAsk;
+        if (Number.isFinite(effectiveMinPrice) && effectiveMinPrice > 0 && price < effectiveMinPrice) {
+            throw new Error(`Price below threshold: bestAsk=${price} < minPrice=${effectiveMinPrice}`);
+        }
+
+        const orderLockKey = upperSymbol && upperSymbol !== 'UNKNOWN' ? `${upperSymbol}:${expiresAtMs}` : null;
+        if (!force && orderLockKey) {
+            if (this.cryptoAll2ActivesBySymbol.has(upperSymbol)) {
+                recordSkipEarly('already_active');
+                return { success: false, skipped: true, reason: 'already_active', symbol: upperSymbol, slug: marketSlug || null, expiresAtMs };
+            }
+            const locked = this.cryptoAll2OrderLocks.get(orderLockKey);
+            if (locked && locked.status === 'placing') {
+                recordSkipEarly('duplicate_inflight');
+                return { success: false, skipped: true, reason: 'duplicate_inflight', symbol: upperSymbol, slug: marketSlug || null, expiresAtMs };
+            }
+            this.cryptoAll2OrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'placing' });
+        }
+
+        const limitPrice = Math.min(0.999, Math.max(effectiveMinPrice, price) + 0.02);
+        const globalKey = `cryptoall2:${conditionId}`.toLowerCase();
+        let order: any = null;
+        let globalOk = false;
+        try {
+            if (!force) {
+                if (!this.tryAcquireGlobalOrderLock(globalKey, 'other')) {
+                    recordSkipEarly('global_locked');
+                    return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
+                }
+                if (this.globalOrderPlaceInFlight) {
+                    this.markGlobalOrderLockDone(globalKey, false);
+                    recordSkipEarly('global_inflight');
+                    return { success: false, skipped: true, reason: 'global_inflight', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
+                }
+                this.globalOrderPlaceInFlight = true;
+            }
+            order = await this.tradingClient.createMarketOrder({
+                tokenId,
+                side: 'BUY',
+                amount: amountUsd,
+                price: limitPrice,
+                orderType: 'FAK',
+            });
+            globalOk = !!order?.success;
+        } catch (e: any) {
+            if (orderLockKey) {
+                this.cryptoAll2OrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'failed' });
+            }
+            throw e;
+        } finally {
+            if (!force) {
+                this.globalOrderPlaceInFlight = false;
+                this.markGlobalOrderLockDone(globalKey, globalOk);
+            }
+        }
+
+        const orderStatus = order?.success === true
+            ? 'placed'
+            : `failed:${String(order?.errorMsg || 'order_failed').slice(0, 160)}`;
+        const entry = {
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            mode: source,
+            action: 'cryptoall2_order',
+            marketId: conditionId,
+            symbol,
+            slug: marketSlug || undefined,
+            marketQuestion: market?.question,
+            outcome,
+            price: price,
+            bestAsk: price,
+            limitPrice,
+            amountUsd: amountUsd,
+            results: [{ ...order, orderStatus, tokenId, outcome, conditionId }],
+        };
+        this.orderHistory.unshift(entry);
+        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+
+        if (order?.success === true && splitPlan && splitPlan.dueLeg) {
+            if (splitPlan.dueLeg === '3m') splitPlan.done3m = true;
+            if (splitPlan.dueLeg === '2m') splitPlan.done2m = true;
+            if (splitPlan.dueLeg === '1m') splitPlan.done1m = true;
+            splitPlan.lastAttemptAtMs = Date.now();
+            this.cryptoAll2SplitBuyState.set(String(splitPlan.key), splitPlan);
+            this.ensureCryptoAll2SplitBuyLoop();
+        }
+
+        const active = {
+            startedAt: entry.timestamp,
+            phase: order?.success ? 'ordered' : 'failed',
+            symbol,
+            conditionId,
+            tokenId,
+            outcome,
+            price: price,
+            bestAsk: price,
+            limitPrice,
+            amountUsd: amountUsd,
+            source,
+            orderId: order?.orderId ?? order?.id ?? null,
+            order,
+            endDate,
+            expiresAtMs,
+            secondsToExpire: params.secondsToExpire,
+            chosenPrice: params.chosenPrice,
+        };
+        if (source === 'addon') {
+            const prev = this.cryptoAll2TrackedByCondition.get(conditionId);
+            if (prev) {
+                const merged = {
+                    ...prev,
+                    amountUsd: (Number(prev?.amountUsd) || 0) + Number(amountUsd),
+                    lastAddOnAt: entry.timestamp,
+                    lastAddOnAmountUsd: amountUsd,
+                };
+                this.cryptoAll2TrackedByCondition.set(conditionId, merged);
+                const sym = String(merged?.symbol || '').toUpperCase();
+                if (sym && sym !== 'UNKNOWN' && this.cryptoAll2ActivesBySymbol.get(sym)?.conditionId === conditionId) {
+                    this.cryptoAll2ActivesBySymbol.set(sym, merged);
+                }
+            }
+        } else {
+            this.cryptoAll2TrackedByCondition.set(conditionId, active);
+            if (active.phase === 'ordered' && symbol && symbol !== 'UNKNOWN') {
+                this.cryptoAll2ActivesBySymbol.set(symbol, active);
+            }
+        }
+
+        if (active.phase === 'ordered' && stoplossConfig.enabled === true) {
+            const entryPrice = active?.bestAsk != null ? Number(active.bestAsk) : NaN;
+            const sizeEstimate = Number.isFinite(entryPrice) && entryPrice > 0 ? (Number(amountUsd) / entryPrice) : 0;
+            const tf: any = '15m';
+            if (Number.isFinite(entryPrice) && entryPrice > 0 && sizeEstimate > 0) {
+                this.registerCryptoAllStoplossPosition({
+                    strategy: 'cryptoall2',
+                    conditionId,
+                    tokenId,
+                    symbol: upperSymbol,
+                    timeframe: tf,
+                    endMs: expiresAtMs,
+                    entryPrice,
+                    sizeEstimate,
+                    stoploss: {
+                        cut1DropCents: stoplossConfig.cut1DropCents,
+                        cut1SellPct: stoplossConfig.cut1SellPct,
+                        cut2DropCents: stoplossConfig.cut2DropCents,
+                        cut2SellPct: stoplossConfig.cut2SellPct,
+                        minSecToExit: stoplossConfig.minSecToExit,
+                    }
+                });
+                this.startCryptoAllStoplossLoop();
+            }
+        }
+
+        if (order?.success === true) {
+            return { success: true, active, order };
+        }
+        return { success: false, error: order?.errorMsg || 'order_failed', active, order };
     }
 
     private crypto15mUpdateTracking(nowMs: number) {
@@ -3305,7 +6323,7 @@ export class GroupArbitrageScanner {
                 return;
             }
             const candidates = Array.isArray((r as any)?.candidates) ? (r as any).candidates : [];
-            const symbols = ['BTC', 'ETH', 'SOL'];
+            const symbols = ['BTC', 'ETH', 'SOL', 'XRP'];
             for (const symbol of symbols) {
                 if (this.crypto15mActivesBySymbol.has(symbol)) continue;
                 const cd = this.crypto15mCooldownUntilBySymbol.get(symbol);
@@ -3325,6 +6343,25 @@ export class GroupArbitrageScanner {
                     secondsToExpire: pick.secondsToExpire,
                     chosenPrice: pick.chosenPrice,
                 });
+                if (this.crypto15mAutoConfig.adaptiveDeltaEnabled === true) {
+                    const st = this.crypto15mAdaptiveDeltaBySymbol.get(symbol);
+                    const overrideDelta = st?.overrideDelta != null ? Number(st.overrideDelta) : NaN;
+                    if (st && Number.isFinite(overrideDelta) && overrideDelta > 0) {
+                        const didBuy = placed?.active?.phase === 'ordered' || placed?.order?.success === true;
+                        const next = { ...st };
+                        if (didBuy) {
+                            next.noBuyCount = 0;
+                        } else {
+                            next.noBuyCount = Math.max(0, Math.floor(Number(next.noBuyCount || 0)) + 1);
+                            const limit = Math.max(1, Math.floor(Number(this.crypto15mAutoConfig.adaptiveDeltaRevertNoBuyCount) || 4));
+                            if (next.noBuyCount >= limit) {
+                                next.overrideDelta = null;
+                                next.noBuyCount = 0;
+                            }
+                        }
+                        this.crypto15mAdaptiveDeltaBySymbol.set(symbol, next);
+                    }
+                }
                 if (placed?.success !== true) {
                     const reason = placed?.reason ? String(placed.reason) : 'order_skipped';
                     const msg = placed?.minDeltaRequired != null && placed?.deltaAbs != null
@@ -3344,21 +6381,46 @@ export class GroupArbitrageScanner {
         }
     }
 
-    startCrypto15mAuto(config?: { enabled?: boolean; amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; staleMsThreshold?: number }) {
+    startCrypto15mAuto(config?: { enabled?: boolean; amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; buySizingMode?: 'fixed' | 'orderbook_max' | 'all_capital' | string; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
         const enabled = config?.enabled != null ? !!config.enabled : true;
         const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mAutoConfig.amountUsd;
         const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mAutoConfig.minProb;
         const expiresWithinSec = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec;
         const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mAutoConfig.pollMs;
+        const buySizingModeRaw = config?.buySizingMode != null ? String(config.buySizingMode) : this.crypto15mAutoConfig.buySizingMode;
+        const trendEnabled = config?.trendEnabled != null ? !!config.trendEnabled : this.crypto15mAutoConfig.trendEnabled;
+        const trendMinutesRaw = config?.trendMinutes != null ? Number(config.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
         const staleMsThreshold = config?.staleMsThreshold != null ? Number(config.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold;
+        const stoplossEnabled = config?.stoplossEnabled != null ? !!config.stoplossEnabled : this.crypto15mAutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = config?.stoplossCut1DropCents != null ? Number(config.stoplossCut1DropCents) : this.crypto15mAutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = config?.stoplossCut1SellPct != null ? Number(config.stoplossCut1SellPct) : this.crypto15mAutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = config?.stoplossCut2DropCents != null ? Number(config.stoplossCut2DropCents) : this.crypto15mAutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = config?.stoplossCut2SellPct != null ? Number(config.stoplossCut2SellPct) : this.crypto15mAutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = config?.stoplossMinSecToExit != null ? Number(config.stoplossMinSecToExit) : this.crypto15mAutoConfig.stoplossMinSecToExit;
+        const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.crypto15mAutoConfig.adaptiveDeltaEnabled;
+        const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.crypto15mAutoConfig.adaptiveDeltaBigMoveMultiplier;
+        const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.crypto15mAutoConfig.adaptiveDeltaRevertNoBuyCount;
 
         this.crypto15mAutoConfig = {
             pollMs: Math.max(500, Math.floor(pollMs)),
             expiresWithinSec: Math.max(5, Math.floor(expiresWithinSec)),
             minProb: Math.max(0, Math.min(1, minProb)),
             amountUsd: Math.max(1, Number.isFinite(amountUsd) ? amountUsd : 1),
+            buySizingMode: buySizingModeRaw === 'orderbook_max' ? 'orderbook_max' : buySizingModeRaw === 'all_capital' ? 'all_capital' : 'fixed',
+            trendEnabled,
+            trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1))),
             staleMsThreshold: Math.max(500, Math.floor(staleMsThreshold)),
+            stoplossEnabled,
+            stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+            adaptiveDeltaEnabled,
+            adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(adaptiveDeltaBigMoveMultiplierRaw) ? adaptiveDeltaBigMoveMultiplierRaw : 2)),
+            adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(adaptiveDeltaRevertNoBuyCountRaw) ? adaptiveDeltaRevertNoBuyCountRaw : 4))),
         };
+        this.persistCrypto15mAutoConfigToFile();
 
         this.crypto15mAutoEnabled = enabled;
         this.crypto15mLastError = null;
@@ -3379,15 +6441,60 @@ export class GroupArbitrageScanner {
             }
         }
 
+        this.recordAutoConfigEvent('crypto15m', enabled ? 'start' : 'stop', { enabled, ...this.crypto15mAutoConfig });
         return this.getCrypto15mStatus();
     }
 
     stopCrypto15mAuto() {
         this.crypto15mAutoEnabled = false;
+        this.recordAutoConfigEvent('crypto15m', 'stop', { enabled: false, ...this.crypto15mAutoConfig });
         if (this.crypto15mAutoTimer) {
             clearInterval(this.crypto15mAutoTimer);
             this.crypto15mAutoTimer = null;
         }
+        return this.getCrypto15mStatus();
+    }
+
+    updateCrypto15mConfig(config?: { amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
+        const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mAutoConfig.amountUsd;
+        const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mAutoConfig.minProb;
+        const expiresWithinSec = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec;
+        const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mAutoConfig.pollMs;
+        const buySizingModeRaw = (config as any)?.buySizingMode != null ? String((config as any).buySizingMode) : this.crypto15mAutoConfig.buySizingMode;
+        const trendEnabled = config?.trendEnabled != null ? !!config.trendEnabled : this.crypto15mAutoConfig.trendEnabled;
+        const trendMinutesRaw = config?.trendMinutes != null ? Number(config.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
+        const staleMsThreshold = config?.staleMsThreshold != null ? Number(config.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold;
+        const stoplossEnabled = config?.stoplossEnabled != null ? !!config.stoplossEnabled : this.crypto15mAutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = config?.stoplossCut1DropCents != null ? Number(config.stoplossCut1DropCents) : this.crypto15mAutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = config?.stoplossCut1SellPct != null ? Number(config.stoplossCut1SellPct) : this.crypto15mAutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = config?.stoplossCut2DropCents != null ? Number(config.stoplossCut2DropCents) : this.crypto15mAutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = config?.stoplossCut2SellPct != null ? Number(config.stoplossCut2SellPct) : this.crypto15mAutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = config?.stoplossMinSecToExit != null ? Number(config.stoplossMinSecToExit) : this.crypto15mAutoConfig.stoplossMinSecToExit;
+        const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.crypto15mAutoConfig.adaptiveDeltaEnabled;
+        const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.crypto15mAutoConfig.adaptiveDeltaBigMoveMultiplier;
+        const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.crypto15mAutoConfig.adaptiveDeltaRevertNoBuyCount;
+
+        this.crypto15mAutoConfig = {
+            pollMs: Math.max(500, Math.floor(pollMs)),
+            expiresWithinSec: Math.max(5, Math.floor(expiresWithinSec)),
+            minProb: Math.max(0, Math.min(1, minProb)),
+            amountUsd: Math.max(1, Number.isFinite(amountUsd) ? amountUsd : 1),
+            buySizingMode: buySizingModeRaw === 'orderbook_max' ? 'orderbook_max' : buySizingModeRaw === 'all_capital' ? 'all_capital' : 'fixed',
+            trendEnabled,
+            trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1))),
+            staleMsThreshold: Math.max(500, Math.floor(staleMsThreshold)),
+            stoplossEnabled,
+            stoplossCut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            stoplossCut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            stoplossCut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            stoplossCut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            stoplossMinSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+            adaptiveDeltaEnabled,
+            adaptiveDeltaBigMoveMultiplier: Math.max(1, Math.min(10, Number.isFinite(adaptiveDeltaBigMoveMultiplierRaw) ? adaptiveDeltaBigMoveMultiplierRaw : 2)),
+            adaptiveDeltaRevertNoBuyCount: Math.max(1, Math.min(50, Math.floor(Number.isFinite(adaptiveDeltaRevertNoBuyCountRaw) ? adaptiveDeltaRevertNoBuyCountRaw : 4))),
+        };
+        this.persistCrypto15mAutoConfigToFile();
+        this.recordConfigUpdateEvent('crypto15m', { kind: 'settings', enabled: this.crypto15mAutoEnabled === true, ...this.crypto15mAutoConfig });
         return this.getCrypto15mStatus();
     }
 
@@ -3634,7 +6741,7 @@ export class GroupArbitrageScanner {
         return this.getCrypto15mStatus();
     }
 
-    async placeCrypto15mOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number }) {
+    async placeCrypto15mOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number; trendEnabled?: boolean; trendMinutes?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number }) {
         if (!this.hasValidKey) throw new Error('Missing private key');
         const conditionId = String(params.conditionId || '').trim();
         if (!conditionId) throw new Error('Missing conditionId');
@@ -3644,6 +6751,37 @@ export class GroupArbitrageScanner {
         const force = params.force === true;
         const requestedMinPrice = params.minPrice != null ? Number(params.minPrice) : NaN;
         const effectiveMinPrice = Math.max(0.9, this.crypto15mAutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
+        const trendEnabled = params.trendEnabled != null ? (params.trendEnabled === true) : this.crypto15mAutoConfig.trendEnabled;
+        const trendMinutesRaw = params.trendMinutes != null ? Number(params.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
+        const trendMinutes = Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1)));
+        const stoplossEnabled = params.stoplossEnabled != null ? (params.stoplossEnabled === true) : this.crypto15mAutoConfig.stoplossEnabled;
+        const stoplossCut1DropCentsRaw = params.stoplossCut1DropCents != null ? Number(params.stoplossCut1DropCents) : this.crypto15mAutoConfig.stoplossCut1DropCents;
+        const stoplossCut1SellPctRaw = params.stoplossCut1SellPct != null ? Number(params.stoplossCut1SellPct) : this.crypto15mAutoConfig.stoplossCut1SellPct;
+        const stoplossCut2DropCentsRaw = params.stoplossCut2DropCents != null ? Number(params.stoplossCut2DropCents) : this.crypto15mAutoConfig.stoplossCut2DropCents;
+        const stoplossCut2SellPctRaw = params.stoplossCut2SellPct != null ? Number(params.stoplossCut2SellPct) : this.crypto15mAutoConfig.stoplossCut2SellPct;
+        const stoplossMinSecToExitRaw = params.stoplossMinSecToExit != null ? Number(params.stoplossMinSecToExit) : this.crypto15mAutoConfig.stoplossMinSecToExit;
+        const stoplossConfig = {
+            enabled: stoplossEnabled,
+            cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut1DropCentsRaw) ? stoplossCut1DropCentsRaw : 1))),
+            cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut1SellPctRaw) ? stoplossCut1SellPctRaw : 50))),
+            cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(stoplossCut2DropCentsRaw) ? stoplossCut2DropCentsRaw : 2))),
+            cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(stoplossCut2SellPctRaw) ? stoplossCut2SellPctRaw : 100))),
+            minSecToExit: Math.max(0, Math.min(600, Math.floor(Number.isFinite(stoplossMinSecToExitRaw) ? stoplossMinSecToExitRaw : 25))),
+        };
+        if (params.stoplossEnabled != null || params.stoplossCut1DropCents != null || params.stoplossCut1SellPct != null || params.stoplossCut2DropCents != null || params.stoplossCut2SellPct != null || params.stoplossMinSecToExit != null) {
+            this.crypto15mAutoConfig = {
+                ...this.crypto15mAutoConfig,
+                stoplossEnabled: stoplossConfig.enabled,
+                stoplossCut1DropCents: stoplossConfig.cut1DropCents,
+                stoplossCut1SellPct: stoplossConfig.cut1SellPct,
+                stoplossCut2DropCents: stoplossConfig.cut2DropCents,
+                stoplossCut2SellPct: stoplossConfig.cut2SellPct,
+                stoplossMinSecToExit: stoplossConfig.minSecToExit,
+            };
+        }
+        if (params.trendEnabled != null || params.trendMinutes != null) {
+            this.crypto15mAutoConfig = { ...this.crypto15mAutoConfig, trendEnabled, trendMinutes };
+        }
         if (this.crypto15mTrackedByCondition.has(conditionId)) {
             throw new Error(`Already ordered for this market (conditionId=${conditionId})`);
         }
@@ -3661,7 +6799,9 @@ export class GroupArbitrageScanner {
         const marketAny: any = market as any;
         const marketSlug = String(marketAny?.marketSlug ?? marketAny?.market_slug ?? '');
         const q = String(marketAny?.question || '');
-        const symbol = String(params.symbol || (marketSlug.toLowerCase().startsWith('btc-') ? 'BTC' : marketSlug.toLowerCase().startsWith('eth-') ? 'ETH' : marketSlug.toLowerCase().startsWith('sol-') ? 'SOL' : q.toLowerCase().includes('bitcoin') ? 'BTC' : q.toLowerCase().includes('ethereum') ? 'ETH' : q.toLowerCase().includes('solana') ? 'SOL' : 'UNKNOWN'));
+        const slugLc = marketSlug.toLowerCase();
+        const qLc = q.toLowerCase();
+        const symbol = String(params.symbol || (slugLc.startsWith('btc-') ? 'BTC' : slugLc.startsWith('eth-') ? 'ETH' : slugLc.startsWith('sol-') ? 'SOL' : slugLc.startsWith('xrp-') ? 'XRP' : qLc.includes('bitcoin') ? 'BTC' : qLc.includes('ethereum') ? 'ETH' : qLc.includes('solana') ? 'SOL' : qLc.includes('xrp') ? 'XRP' : 'UNKNOWN'));
         let endDate: string | null = params.endDate != null ? String(params.endDate) : null;
         if (!endDate && marketSlug.includes('-15m-')) {
             const parts = marketSlug.split('-');
@@ -3711,19 +6851,46 @@ export class GroupArbitrageScanner {
         const tokenId = String(tok?.tokenId ?? tok?.token_id ?? tok?.id ?? '').trim();
         if (!tokenId) throw new Error('Missing tokenId');
         const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
+        const direction: 'Up' | 'Down' = outcome.toLowerCase().includes('down') ? 'Down' : 'Up';
+        if (!force && trendEnabled === true && upperSymbol && upperSymbol !== 'UNKNOWN') {
+            const up = await this.isBinanceUpPerMinute(upperSymbol, trendMinutes, direction).catch(() => ({ ok: false, closes: [], error: 'binance_error' }));
+            if (!up.ok) {
+                return { success: false, skipped: true, reason: 'trend', symbol: upperSymbol, slug: marketSlug || null, trendMinutes, direction };
+            }
+        }
         if (!force && symbol && symbol !== 'UNKNOWN' && marketSlug) {
-            const minDeltaRequired =
+            const baseMinDelta =
                 symbol === 'BTC' ? this.crypto15mDeltaThresholds.btcMinDelta
                 : symbol === 'ETH' ? this.crypto15mDeltaThresholds.ethMinDelta
                 : symbol === 'SOL' ? this.crypto15mDeltaThresholds.solMinDelta
+                : symbol === 'XRP' ? this.crypto15mDeltaThresholds.xrpMinDelta
                 : 0;
+            let overrideDelta: number | null = null;
+            let minDeltaRequired = baseMinDelta;
+            if (baseMinDelta > 0 && this.crypto15mAutoConfig.adaptiveDeltaEnabled === true) {
+                const s = this.crypto15mAdaptiveDeltaBySymbol.get(upperSymbol);
+                const d = s?.overrideDelta != null ? Number(s.overrideDelta) : NaN;
+                overrideDelta = Number.isFinite(d) && d > 0 ? d : null;
+                if (overrideDelta != null) {
+                    minDeltaRequired = overrideDelta;
+                }
+            }
             if (minDeltaRequired > 0) {
                 const beat = await this.fetchCrypto15mBeatAndCurrentFromSite(marketSlug);
                 if (beat.deltaAbs == null) {
-                    return { success: false, skipped: true, reason: 'delta_unavailable', symbol, slug: marketSlug, minDeltaRequired, error: beat.error || 'Failed to compute delta' };
+                    return { success: false, skipped: true, reason: 'delta_unavailable', symbol, slug: marketSlug, minDeltaBase: baseMinDelta, minDeltaRequired, minDeltaOverride: overrideDelta, error: beat.error || 'Failed to compute delta' };
                 }
-                if (Number(beat.deltaAbs) < Number(minDeltaRequired)) {
-                    return { success: false, skipped: true, reason: 'delta_too_small', symbol, slug: marketSlug, minDeltaRequired, deltaAbs: beat.deltaAbs, priceToBeat: beat.priceToBeat, currentPrice: beat.currentPrice };
+                const deltaAbs = Number(beat.deltaAbs);
+                if (this.crypto15mAutoConfig.adaptiveDeltaEnabled === true && baseMinDelta > 0 && Number.isFinite(deltaAbs) && deltaAbs > 0) {
+                    const m = Number(this.crypto15mAutoConfig.adaptiveDeltaBigMoveMultiplier) || 2;
+                    if (deltaAbs >= baseMinDelta * Math.max(1, m)) {
+                        this.crypto15mAdaptiveDeltaBySymbol.set(upperSymbol, { overrideDelta: deltaAbs, noBuyCount: 0, lastBigMoveAt: new Date().toISOString(), lastBigMoveDelta: deltaAbs });
+                        overrideDelta = deltaAbs;
+                        minDeltaRequired = deltaAbs;
+                    }
+                }
+                if (Number.isFinite(deltaAbs) && deltaAbs < Number(minDeltaRequired)) {
+                    return { success: false, skipped: true, reason: 'delta_too_small', symbol, slug: marketSlug, minDeltaBase: baseMinDelta, minDeltaRequired, minDeltaOverride: overrideDelta, deltaAbs, priceToBeat: beat.priceToBeat, currentPrice: beat.currentPrice };
                 }
             }
         }
@@ -3746,20 +6913,69 @@ export class GroupArbitrageScanner {
         }
 
         const limitPrice = Math.min(0.999, Math.max(effectiveMinPrice, price) + 0.02);
+        let amountUsdFinal = amountUsd;
+        const buySizingMode = this.crypto15mAutoConfig.buySizingMode || 'fixed';
+        if (buySizingMode !== 'fixed') {
+            let depthUsd = 0;
+            let count = 0;
+            for (const a of asks) {
+                if (count >= 10) break;
+                const p = Number(a?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (p > limitPrice) break;
+                const sz = Number(a?.size ?? a?.amount ?? a?.quantity);
+                if (!Number.isFinite(sz) || sz <= 0) continue;
+                depthUsd += sz * p;
+                count += 1;
+            }
+            const depthCap = depthUsd * 0.95;
+            if (buySizingMode === 'orderbook_max') {
+                if (Number.isFinite(depthCap) && depthCap >= 1) {
+                    amountUsdFinal = Math.max(1, Math.min(amountUsd, depthCap));
+                }
+            } else if (buySizingMode === 'all_capital') {
+                const pf: any = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
+                const cash = pf?.cash != null ? Number(pf.cash) : NaN;
+                if (!Number.isFinite(cash) || cash < 1) {
+                    return { success: false, skipped: true, reason: 'no_cash', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
+                }
+                const hardCap = 5_000;
+                const cap = Math.min(cash, hardCap);
+                amountUsdFinal = Math.max(1, Number.isFinite(depthCap) && depthCap >= 1 ? Math.min(cap, depthCap) : cap);
+            }
+        }
+        const globalKey = `crypto15m:${conditionId}`.toLowerCase();
         let order: any = null;
+        let globalOk = false;
         try {
+            if (!force) {
+                if (!this.tryAcquireGlobalOrderLock(globalKey, 'crypto15m')) {
+                    return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
+                }
+                if (this.globalOrderPlaceInFlight) {
+                    this.markGlobalOrderLockDone(globalKey, false);
+                    return { success: false, skipped: true, reason: 'global_inflight', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
+                }
+                this.globalOrderPlaceInFlight = true;
+            }
             order = await this.tradingClient.createMarketOrder({
                 tokenId,
                 side: 'BUY',
-                amount: amountUsd,
+                amount: amountUsdFinal,
                 price: limitPrice,
                 orderType: 'FAK',
             });
+            globalOk = !!order?.success;
         } catch (e: any) {
             if (orderLockKey) {
                 this.crypto15mOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'failed' });
             }
             throw e;
+        } finally {
+            if (!force) {
+                this.globalOrderPlaceInFlight = false;
+                this.markGlobalOrderLockDone(globalKey, globalOk);
+            }
         }
 
         const entry = {
@@ -3775,7 +6991,7 @@ export class GroupArbitrageScanner {
             price: price,
             bestAsk: price,
             limitPrice,
-            amountUsd: amountUsd,
+            amountUsd: amountUsdFinal,
             results: [{ ...order, tokenId, outcome, conditionId }],
         };
         this.orderHistory.unshift(entry);
@@ -3792,7 +7008,7 @@ export class GroupArbitrageScanner {
             price: price,
             bestAsk: price,
             limitPrice,
-            amountUsd: amountUsd,
+            amountUsd: amountUsdFinal,
             source,
             orderId: order?.orderId ?? order?.id ?? null,
             order,
@@ -3806,6 +7022,32 @@ export class GroupArbitrageScanner {
             this.crypto15mActivesBySymbol.set(symbol, active);
         } else if (symbol && symbol !== 'UNKNOWN') {
             this.crypto15mCooldownUntilBySymbol.set(symbol, Date.now() + 5_000);
+        }
+
+        if (active.phase === 'ordered' && stoplossConfig.enabled === true) {
+            const entryPrice = active?.bestAsk != null ? Number(active.bestAsk) : NaN;
+            const sizeEstimate = Number.isFinite(entryPrice) && entryPrice > 0 ? (Number(amountUsdFinal) / entryPrice) : 0;
+            const tf: any = '15m';
+            if (Number.isFinite(entryPrice) && entryPrice > 0 && sizeEstimate > 0) {
+                this.registerCryptoAllStoplossPosition({
+                    strategy: 'crypto15m',
+                    conditionId,
+                    tokenId,
+                    symbol: upperSymbol,
+                    timeframe: tf,
+                    endMs: expiresAtMs,
+                    entryPrice,
+                    sizeEstimate,
+                    stoploss: {
+                        cut1DropCents: stoplossConfig.cut1DropCents,
+                        cut1SellPct: stoplossConfig.cut1SellPct,
+                        cut2DropCents: stoplossConfig.cut2DropCents,
+                        cut2SellPct: stoplossConfig.cut2SellPct,
+                        minSecToExit: stoplossConfig.minSecToExit,
+                    }
+                });
+                this.startCryptoAllStoplossLoop();
+            }
         }
 
         return { success: true, active, order };
@@ -4223,6 +7465,1726 @@ export class GroupArbitrageScanner {
         };
     }
 
+    resetCryptoAllActive() {
+        this.cryptoAllActivesByKey.clear();
+        this.cryptoAllTrackedByCondition.clear();
+        return this.getCryptoAllStatus();
+    }
+
+    getCryptoAllStatus() {
+        const now = Date.now();
+        const addOnPositions = Array.from(this.cryptoAllAddOnState.values())
+            .slice(0, 80)
+            .map((p: any) => {
+                const secondsToExpire = Math.floor((Number(p.endMs) - now) / 1000);
+                return {
+                    ...p,
+                    secondsToExpire,
+                    window: this.getCryptoAllAddOnWindow(secondsToExpire),
+                };
+            });
+        const stoplossPositions = Array.from(this.cryptoAllStoplossState.values())
+            .slice(0, 80)
+            .map((p: any) => {
+                const secondsToExpire = Math.floor((Number(p.endMs) - now) / 1000);
+                const soldPct = (Number(p.soldSize) / Math.max(1e-9, Number(p.totalSize))) * 100;
+                return { ...p, secondsToExpire, soldPct };
+            });
+        return {
+            hasValidKey: this.hasValidKey === true,
+            trading: this.getTradingInitStatus(),
+            enabled: this.cryptoAllAutoEnabled,
+            config: this.cryptoAllAutoConfig,
+            lastScanAt: this.cryptoAllLastScanAt,
+            lastScanSummary: this.cryptoAllLastScanSummary,
+            lastError: this.cryptoAllLastError,
+            books: {
+                atMs: this.cryptoAllBooksSnapshot.atMs,
+                tokenCount: Object.keys(this.cryptoAllBooksSnapshot.byTokenId || {}).length,
+                lastError: this.cryptoAllBooksSnapshot.lastError,
+                lastAttemptAtMs: this.cryptoAllBooksSnapshot.lastAttemptAtMs,
+                lastAttemptError: this.cryptoAllBooksSnapshot.lastAttemptError,
+            },
+            actives: Object.fromEntries(Array.from(this.cryptoAllActivesByKey.entries()).slice(0, 50)),
+            trackedCount: this.cryptoAllTrackedByCondition.size,
+            addOn: { enabled: this.cryptoAllAutoConfig.addOn.enabled, positions: addOnPositions },
+            stoploss: { enabled: this.cryptoAllAutoConfig.stoploss.enabled, positions: stoplossPositions },
+        };
+    }
+
+    getCryptoAllWatchdogStatus() {
+        const w = this.cryptoAllWatchdog;
+        const now = Date.now();
+        const remainingMs = w.running && w.endsAtMs ? Math.max(0, w.endsAtMs - now) : 0;
+        return {
+            running: w.running,
+            pollMs: w.pollMs,
+            startedAt: w.startedAtMs ? new Date(w.startedAtMs).toISOString() : null,
+            endsAt: w.endsAtMs ? new Date(w.endsAtMs).toISOString() : null,
+            remainingMs: w.running ? remainingMs : null,
+            lastTickAt: w.lastTickAtMs ? new Date(w.lastTickAtMs).toISOString() : null,
+            lastError: w.lastError,
+            stopReason: w.stopReason,
+            thresholds: w.thresholds,
+            counters: w.counters,
+            issuesCount: w.issues.length,
+            lastIssue: w.issues.length ? w.issues[w.issues.length - 1] : null,
+            reportPaths: w.reportPaths,
+        };
+    }
+
+    startCryptoAllWatchdog(options?: { durationHours?: number; pollMs?: number }) {
+        const durationHours = options?.durationHours != null ? Number(options.durationHours) : 12;
+        const pollMs = options?.pollMs != null ? Number(options.pollMs) : 30_000;
+        const now = Date.now();
+        this.cryptoAllWatchdog.running = true;
+        this.cryptoAllWatchdog.pollMs = Math.max(5_000, Math.floor(pollMs));
+        this.cryptoAllWatchdog.startedAtMs = now;
+        this.cryptoAllWatchdog.endsAtMs = now + Math.max(1, durationHours) * 60 * 60_000;
+        this.cryptoAllWatchdog.lastTickAtMs = 0;
+        this.cryptoAllWatchdog.lastError = null;
+        this.cryptoAllWatchdog.stopReason = null;
+        this.cryptoAllWatchdog.counters = { consecutiveDataError: 0, redeemFailed: 0, orderFailed: 0 };
+        this.cryptoAllWatchdog.issues = [];
+        this.cryptoAllWatchdog.reportPaths = {};
+        if (this.cryptoAllWatchdogTimer) {
+            clearInterval(this.cryptoAllWatchdogTimer);
+            this.cryptoAllWatchdogTimer = null;
+        }
+        const tick = () => {
+            this.cryptoAllWatchdogTick().catch((e: any) => {
+                this.cryptoAllWatchdog.lastError = e?.message || String(e);
+            });
+        };
+        tick();
+        this.cryptoAllWatchdogTimer = setInterval(tick, this.cryptoAllWatchdog.pollMs);
+        return this.getCryptoAllWatchdogStatus();
+    }
+
+    stopCryptoAllWatchdog(options?: { reason?: string; stopAuto?: boolean }) {
+        const reason = options?.reason != null ? String(options.reason) : 'manual_stop';
+        const stopAuto = options?.stopAuto !== false;
+        if (this.cryptoAllWatchdogTimer) {
+            clearInterval(this.cryptoAllWatchdogTimer);
+            this.cryptoAllWatchdogTimer = null;
+        }
+        if (stopAuto) {
+            try {
+                this.stopCryptoAllAuto();
+            } catch {
+            }
+        }
+        this.cryptoAllWatchdog.running = false;
+        this.cryptoAllWatchdog.stopReason = reason;
+        this.cryptoAllWatchdog.lastTickAtMs = Date.now();
+        this.cryptoAllWriteWatchdogReport(reason);
+        return this.getCryptoAllWatchdogStatus();
+    }
+
+    getCryptoAllWatchdogReportLatest() {
+        const jsonPath = this.cryptoAllWatchdog.reportPaths.json;
+        const mdPath = this.cryptoAllWatchdog.reportPaths.md;
+        let json: any = null;
+        let md: string | null = null;
+        try {
+            if (jsonPath && fs.existsSync(jsonPath)) json = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+        } catch {
+        }
+        try {
+            if (mdPath && fs.existsSync(mdPath)) md = String(fs.readFileSync(mdPath, 'utf8'));
+        } catch {
+        }
+        return { success: true, jsonPath: jsonPath || null, mdPath: mdPath || null, json, md };
+    }
+
+    private async cryptoAllWatchdogTick() {
+        const w = this.cryptoAllWatchdog;
+        if (!w.running) return;
+        const now = Date.now();
+        w.lastTickAtMs = now;
+        if (w.endsAtMs && now >= w.endsAtMs) {
+            this.stopCryptoAllWatchdog({ reason: 'duration_elapsed', stopAuto: true });
+            return;
+        }
+
+        let candidates: any[] = [];
+        let dataError: string | null = null;
+        try {
+            const limit = Math.max(10, Math.min(40, (this.cryptoAllAutoConfig.symbols.length || 1) * (this.cryptoAllAutoConfig.timeframes.length || 1) * 2));
+            candidates = await this.getCryptoAllCandidates({
+                symbols: this.cryptoAllAutoConfig.symbols,
+                timeframes: this.cryptoAllAutoConfig.timeframes,
+                minProb: this.cryptoAllAutoConfig.minProb,
+                expiresWithinSec: this.cryptoAllAutoConfig.expiresWithinSec,
+                limit,
+            });
+        } catch (e: any) {
+            dataError = e?.message || String(e);
+        }
+
+        if (!dataError) {
+            const list = Array.isArray(candidates) ? candidates : [];
+            const errCount = list.filter((c: any) => c && c.deltaError).length;
+            const total = list.length;
+            if (total > 0 && errCount / total >= w.thresholds.deltaErrorRateThreshold) {
+                dataError = `delta_error_rate=${(errCount / total).toFixed(2)} (${errCount}/${total})`;
+            }
+        }
+
+        if (dataError) w.counters.consecutiveDataError += 1;
+        else w.counters.consecutiveDataError = 0;
+
+        if (w.counters.consecutiveDataError >= w.thresholds.consecutiveDataStops) {
+            w.issues.push({ at: new Date().toISOString(), type: 'data_error', message: String(dataError || '-') });
+            this.stopCryptoAllWatchdog({ reason: 'data_error', stopAuto: true });
+            return;
+        }
+
+        await this.refreshHistoryStatuses({ maxEntries: 50, minIntervalMs: 1000 }).catch(() => null);
+        const h: any = await this.getCryptoAllHistory({ refresh: false, maxEntries: 50 }).catch(() => null);
+        const items = Array.isArray(h?.history) ? h.history : [];
+
+        const anyRedeemFailed = items.find((it: any) => String(it?.redeemStatus || '') === 'failed' || String(it?.state || '') === 'redeem_failed') || null;
+        if (anyRedeemFailed) {
+            w.counters.redeemFailed += 1;
+            w.issues.push({ at: new Date().toISOString(), type: 'redeem_failed', message: `${anyRedeemFailed.slug || anyRedeemFailed.conditionId || ''}`, meta: { conditionId: anyRedeemFailed.conditionId, txHash: anyRedeemFailed.txHash || null } });
+            if (w.counters.redeemFailed >= w.thresholds.redeemFailedStops) {
+                this.stopCryptoAllWatchdog({ reason: 'redeem_failed', stopAuto: true });
+                return;
+            }
+        } else {
+            w.counters.redeemFailed = 0;
+        }
+
+        const anyOrderFailed = items.find((it: any) => {
+            const st = String(it?.orderStatus || '');
+            return st === 'FAILED' || st === 'REJECTED';
+        }) || null;
+        if (anyOrderFailed) {
+            w.counters.orderFailed += 1;
+            w.issues.push({ at: new Date().toISOString(), type: 'order_failed', message: `${anyOrderFailed.slug || anyOrderFailed.conditionId || ''}`, meta: { conditionId: anyOrderFailed.conditionId, orderId: anyOrderFailed.orderId || null, orderStatus: anyOrderFailed.orderStatus } });
+            if (w.counters.orderFailed >= w.thresholds.orderFailedStops) {
+                this.stopCryptoAllWatchdog({ reason: 'order_failed', stopAuto: true });
+                return;
+            }
+        } else {
+            w.counters.orderFailed = 0;
+        }
+
+        const recent = this.orderHistory
+            .filter((e: any) => e && String(e?.action || '') === 'cryptoall_order')
+            .filter((e: any) => {
+                const ts = Date.parse(String(e?.timestamp || ''));
+                return Number.isFinite(ts) ? (now - ts) <= 10 * 60_000 : true;
+            });
+        const dupCounts = new Map<string, number>();
+        for (const e of recent) {
+            const res0 = Array.isArray(e?.results) && e.results.length ? e.results[0] : null;
+            const orderStatus = String(res0?.orderStatus || '').toLowerCase();
+            if (orderStatus.startsWith('skipped:')) continue;
+            const ok = res0?.success === true;
+            const orderId = res0?.orderId != null ? String(res0.orderId) : '';
+            if (!(ok || orderId)) continue;
+            const key = String(e?.marketId || e?.slug || '').trim();
+            if (!key) continue;
+            dupCounts.set(key, (dupCounts.get(key) || 0) + 1);
+        }
+        const dup = Array.from(dupCounts.entries()).find(([, c]) => c >= 2) || null;
+        if (dup) {
+            const [key, count] = dup;
+            w.issues.push({ at: new Date().toISOString(), type: 'duplicate_order', message: `${key} count=${count} (10m)`, meta: { key, count } });
+            this.stopCryptoAllWatchdog({ reason: 'duplicate_order', stopAuto: true });
+            return;
+        }
+
+        for (const [cid, inflight] of this.redeemInFlight.entries()) {
+            if (!inflight || inflight.status !== 'submitted') continue;
+            const subAt = Date.parse(String(inflight.submittedAt || ''));
+            if (!Number.isFinite(subAt)) continue;
+            if (now - subAt <= w.thresholds.redeemSubmittedTimeoutMs) continue;
+            w.issues.push({ at: new Date().toISOString(), type: 'redeem_timeout', message: `conditionId=${cid}`, meta: { submittedAt: inflight.submittedAt, transactionId: inflight.transactionId || null } });
+            this.stopCryptoAllWatchdog({ reason: 'redeem_timeout', stopAuto: true });
+            return;
+        }
+    }
+
+    private cryptoAllWriteWatchdogReport(stopReason: string) {
+        const w = this.cryptoAllWatchdog;
+        const baseDir = this.orderHistoryPath ? path.dirname(this.orderHistoryPath) : path.join(os.tmpdir(), 'polymarket-tools');
+        const dir = path.join(baseDir, 'cryptoall-watchdog');
+        fs.mkdirSync(dir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const jsonPath = path.join(dir, `cryptoall_watchdog_report_${stamp}.json`);
+        const mdPath = path.join(dir, `cryptoall_watchdog_report_${stamp}.md`);
+        const status = this.getCryptoAllStatus();
+        const watchdogStatus = this.getCryptoAllWatchdogStatus();
+        const autoRedeemStatus = this.getAutoRedeemStatus();
+        const report = {
+            generatedAt: new Date().toISOString(),
+            stopReason: stopReason,
+            watchdog: watchdogStatus,
+            cryptoAllStatus: status,
+            autoRedeemStatus,
+            issues: w.issues.slice(-200),
+        };
+        const md = [
+            `# CryptoAll Watchdog Report`,
+            ``,
+            `- generatedAt: ${report.generatedAt}`,
+            `- stopReason: ${stopReason}`,
+            `- watchdog: ${watchdogStatus.running ? 'RUNNING' : 'STOPPED'}`,
+            `- startedAt: ${watchdogStatus.startedAt || '-'}`,
+            `- endsAt: ${watchdogStatus.endsAt || '-'}`,
+            `- lastTickAt: ${watchdogStatus.lastTickAt || '-'}`,
+            `- lastError: ${watchdogStatus.lastError || '-'}`,
+            `- issuesCount: ${watchdogStatus.issuesCount}`,
+            ``,
+            `## Last Issue`,
+            ``,
+            '```json',
+            JSON.stringify(watchdogStatus.lastIssue || null, null, 2),
+            '```',
+            ``,
+            `## Auto Redeem`,
+            ``,
+            '```json',
+            JSON.stringify(autoRedeemStatus, null, 2),
+            '```',
+        ].join('\n');
+        fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2), { encoding: 'utf8', mode: 0o600 });
+        fs.writeFileSync(mdPath, md, { encoding: 'utf8', mode: 0o600 });
+        w.reportPaths = { json: jsonPath, md: mdPath };
+    }
+
+    private async refreshCryptoAllMarketSnapshot(params: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; limit: number }) {
+        const key = JSON.stringify({ symbols: params.symbols.slice().sort(), timeframes: params.timeframes.slice().sort(), limit: params.limit });
+        if (this.cryptoAllMarketInFlight) return this.cryptoAllMarketInFlight;
+        if ((this.cryptoAllMarketSnapshot as any).key === key && this.cryptoAllMarketSnapshot.atMs && Date.now() - this.cryptoAllMarketSnapshot.atMs < 5_000) return;
+        if (this.cryptoAllMarketNextAllowedAtMs && Date.now() < this.cryptoAllMarketNextAllowedAtMs) return;
+        this.cryptoAllMarketInFlight = (async () => {
+            this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, lastAttemptAtMs: Date.now(), lastAttemptError: null };
+            try {
+                const symbols = params.symbols;
+                const timeframes = params.timeframes;
+                const limit = params.limit;
+                const now = Date.now();
+                const maxSlugsPerTf = Math.max(30, Math.min(120, limit * 3));
+                const marketRefs: Array<{
+                    timeframe: '15m' | '1h' | '4h' | '1d';
+                    timeframeSec: number;
+                    slug: string;
+                    conditionId: string;
+                    symbol: 'BTC' | 'ETH' | 'SOL' | 'XRP';
+                    question: string;
+                    endMs: number;
+                    upTokenId: string;
+                    downTokenId: string;
+                }> = [];
+
+                for (const tf of timeframes) {
+                    const timeframeSec = this.getCryptoAllTimeframeSec(tf);
+                    const paths = this.getCryptoAllListPaths(tf);
+                    const nowSec = Math.floor(now / 1000);
+                    const predicted = this.predictCryptoAllSlugs(tf, nowSec, symbols).slice(0, Math.max(20, Math.min(80, maxSlugsPerTf)));
+                    const tfLimit = Math.max(12, limit * 3);
+                    const parseAndAppend = async (slugs: string[]) => {
+                        const settled = await Promise.allSettled(Array.from(new Set(slugs)).slice(0, tfLimit).map(async (slug) => {
+                            const gamma = await this.fetchGammaJson(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`);
+                            const list = Array.isArray(gamma) ? gamma : [];
+                            return { slug, m: list[0] };
+                        }));
+                        for (const r of settled) {
+                            try {
+                                if (r.status !== 'fulfilled') continue;
+                                const slug = r.value.slug;
+                                const m: any = r.value.m;
+                                if (!m) continue;
+                                const conditionId = String(m?.conditionId ?? m?.condition_id ?? '').trim();
+                                if (!conditionId || !conditionId.startsWith('0x')) continue;
+                                const q = String(m?.question ?? m?.title ?? '').trim();
+                                const sym = this.inferCryptoSymbolFromText(slug, q);
+                                if (!sym) continue;
+                                if (symbols.length && !symbols.includes(sym)) continue;
+
+                                const endIso = m?.endDate ?? m?.end_date ?? m?.endDateIso ?? m?.end_date_iso ?? null;
+                                const endMs = endIso ? Date.parse(String(endIso)) : NaN;
+                                if (!Number.isFinite(endMs)) continue;
+                                if (endMs <= now) continue;
+
+                                const outcomes = this.tryParseJsonArray(m?.outcomes);
+                                const tokenIds = this.tryParseJsonArray(m?.clobTokenIds ?? m?.clob_token_ids ?? null);
+                                if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length < 2 || tokenIds.length < 2) continue;
+                                const upIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('up'));
+                                const downIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('down'));
+                                if (upIdx < 0 || downIdx < 0) continue;
+                                const upTokenId = String(tokenIds[upIdx] || '').trim();
+                                const downTokenId = String(tokenIds[downIdx] || '').trim();
+                                if (!upTokenId || !downTokenId) continue;
+
+                                marketRefs.push({ timeframe: tf, timeframeSec, slug, conditionId, symbol: sym, question: q, endMs, upTokenId, downTokenId });
+                                if (marketRefs.length >= limit * 8) return;
+                            } catch {
+                            }
+                        }
+                    };
+
+                    const before = marketRefs.length;
+                    await parseAndAppend(predicted);
+                    if (marketRefs.length === before && paths.length) {
+                        const settledPaths = await Promise.allSettled(paths.slice(0, 2).map((p) => this.fetchCryptoSlugsFromSitePath(p, maxSlugsPerTf)));
+                        const slugs = settledPaths.flatMap((r: any) => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : []);
+                        await parseAndAppend(slugs);
+                    }
+                }
+
+                const uniqMarketRefs = Array.from(new Map(marketRefs.map((m) => [`${m.timeframe}:${m.conditionId}`, m])).values());
+                (this.cryptoAllMarketSnapshot as any).key = key;
+                this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, atMs: Date.now(), markets: uniqMarketRefs, lastError: null, lastAttemptError: null };
+                this.cryptoAllMarketBackoffMs = 0;
+                this.cryptoAllMarketNextAllowedAtMs = 0;
+            } catch (e: any) {
+                const msg = e?.message || String(e);
+                const next = this.cryptoAllMarketBackoffMs ? Math.min(30_000, this.cryptoAllMarketBackoffMs * 2) : 1000;
+                this.cryptoAllMarketBackoffMs = next;
+                this.cryptoAllMarketNextAllowedAtMs = Date.now() + next;
+                this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, lastError: msg, lastAttemptError: msg };
+            } finally {
+                this.cryptoAllMarketInFlight = null;
+            }
+        })();
+        return this.cryptoAllMarketInFlight;
+    }
+
+    private async refreshCryptoAllBooksSnapshot(params: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; limit: number }) {
+        const key = JSON.stringify({ symbols: params.symbols.slice().sort(), timeframes: params.timeframes.slice().sort(), limit: params.limit });
+        if (this.cryptoAllBooksInFlight) return this.cryptoAllBooksInFlight;
+        if ((this.cryptoAllBooksSnapshot as any).key === key && this.cryptoAllBooksSnapshot.atMs && Date.now() - this.cryptoAllBooksSnapshot.atMs < 500) return;
+        if (this.cryptoAllBooksNextAllowedAtMs && Date.now() < this.cryptoAllBooksNextAllowedAtMs) return;
+        this.cryptoAllBooksInFlight = (async () => {
+            this.cryptoAllBooksSnapshot = { ...this.cryptoAllBooksSnapshot, lastAttemptAtMs: Date.now(), lastAttemptError: null };
+            try {
+                const marketsAll = Array.isArray(this.cryptoAllMarketSnapshot.markets) ? this.cryptoAllMarketSnapshot.markets : [];
+                const markets = marketsAll
+                    .filter((m: any) => m && (!params.timeframes.length || params.timeframes.includes(String(m?.timeframe || '').toLowerCase() as any)) && (!params.symbols.length || params.symbols.includes(String(m?.symbol || '').toUpperCase())))
+                    .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))
+                    .slice(0, Math.max(60, Math.min(400, Math.floor(Number(params.limit) || 0) * 8)));
+                const tokenIds: string[] = [];
+                const seen = new Set<string>();
+                for (const m of markets) {
+                    const up = String(m?.upTokenId || '').trim();
+                    const down = String(m?.downTokenId || '').trim();
+                    if (up && !seen.has(up)) { tokenIds.push(up); seen.add(up); }
+                    if (down && !seen.has(down)) { tokenIds.push(down); seen.add(down); }
+                    if (tokenIds.length >= 480) break;
+                }
+                if (!tokenIds.length) {
+                    (this.cryptoAllBooksSnapshot as any).key = key;
+                    const msg = markets.length ? 'missing_token_ids_in_market_snapshot' : null;
+                    this.cryptoAllBooksSnapshot = { ...this.cryptoAllBooksSnapshot, atMs: Date.now(), byTokenId: {}, lastError: msg, lastAttemptError: msg };
+                    return;
+                }
+                const books = await this.fetchClobBooks(tokenIds);
+                if (!Array.isArray(books) || books.length === 0) {
+                    throw new Error(`CLOB /books returned empty (tokenIds=${tokenIds.length})`);
+                }
+                const byTokenId: Record<string, any> = {};
+                for (const b of books) {
+                    const tokenId = String((b as any)?.asset_id || (b as any)?.assetId || '').trim();
+                    if (!tokenId) continue;
+                    const asks = Array.isArray((b as any)?.asks) ? (b as any).asks : [];
+                    const bids = Array.isArray((b as any)?.bids) ? (b as any).bids : [];
+                    let bestAsk = NaN;
+                    for (const a of asks) {
+                        const p = Number(a?.price);
+                        if (!Number.isFinite(p) || p <= 0) continue;
+                        if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+                    }
+                    let bestBid = NaN;
+                    for (const bb of bids) {
+                        const p = Number(bb?.price);
+                        if (!Number.isFinite(p) || p <= 0) continue;
+                        if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+                    }
+                    byTokenId[tokenId] = {
+                        tokenId,
+                        timestamp: (b as any)?.timestamp ?? null,
+                        asksCount: asks.length,
+                        bidsCount: bids.length,
+                        bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                        bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                    };
+                }
+                for (const t of tokenIds) {
+                    if (!byTokenId[t]) byTokenId[t] = { tokenId: t, timestamp: null, asksCount: 0, bidsCount: 0, bestAsk: null, bestBid: null, error: 'missing' };
+                }
+                (this.cryptoAllBooksSnapshot as any).key = key;
+                this.cryptoAllBooksSnapshot = { ...this.cryptoAllBooksSnapshot, atMs: Date.now(), byTokenId, lastError: null, lastAttemptError: null };
+                this.cryptoAllBooksBackoffMs = 0;
+                this.cryptoAllBooksNextAllowedAtMs = 0;
+            } catch (e: any) {
+                const msg = e?.message || String(e);
+                const next = this.cryptoAllBooksBackoffMs ? Math.min(30_000, this.cryptoAllBooksBackoffMs * 2) : 1000;
+                this.cryptoAllBooksBackoffMs = next;
+                this.cryptoAllBooksNextAllowedAtMs = Date.now() + next;
+                this.cryptoAllBooksSnapshot = { ...this.cryptoAllBooksSnapshot, lastError: msg, lastAttemptError: msg };
+            } finally {
+                this.cryptoAllBooksInFlight = null;
+            }
+        })();
+        return this.cryptoAllBooksInFlight;
+    }
+
+    private async computeCryptoAllRisk(options: {
+        symbol: string;
+        timeframeSec: number;
+        endMs: number;
+        direction: 'Up' | 'Down';
+        beat: { priceToBeat: number | null; currentPrice: number | null; deltaAbs: number | null; error: string | null };
+        book: { bestAsk: number | null; bestBid: number | null; asksCount?: number; bidsCount?: number } | null;
+    }): Promise<{ riskScore: number | null; dojiLikely: boolean | null; wickRatio: number | null; bodyRatio: number | null; retraceRatio: number | null; marginPct: number | null; momentum3m: number | null; spread: number | null; reasons: Array<{ k: string; score: number; v?: any }>; error: string | null }> {
+        const symbol = String(options.symbol || '').toUpperCase();
+        const tfSec = Number(options.timeframeSec) || 0;
+        const endMs = Number(options.endMs) || 0;
+        const direction = options.direction;
+        const beat = options.beat || { priceToBeat: null, currentPrice: null, deltaAbs: null, error: 'Missing beat' };
+        const book = options.book || null;
+        if (!symbol || !tfSec || !endMs) return { riskScore: null, dojiLikely: null, wickRatio: null, bodyRatio: null, retraceRatio: null, marginPct: null, momentum3m: null, spread: null, reasons: [], error: 'Missing symbol/timeframe/endMs' };
+        const binSymbol = this.getBinanceSymbol(symbol);
+        if (!binSymbol) return { riskScore: null, dojiLikely: null, wickRatio: null, bodyRatio: null, retraceRatio: null, marginPct: null, momentum3m: null, spread: null, reasons: [], error: 'Unsupported symbol' };
+        const startMsRaw = endMs - Math.floor(tfSec) * 1000;
+        const startMs = Math.floor(startMsRaw / 60_000) * 60_000;
+        const candle = await this.fetchBinance1mCandleWindow({ binSymbol, startMs, minutes: Math.min(60, Math.max(1, Math.floor(tfSec / 60))) });
+        const open = candle.open;
+        const high = candle.high;
+        const low = candle.low;
+        const close = beat.currentPrice != null ? Number(beat.currentPrice) : candle.close;
+        const priceToBeat = beat.priceToBeat != null ? Number(beat.priceToBeat) : open;
+        const reasons: Array<{ k: string; score: number; v?: any }> = [];
+
+        let spread: number | null = null;
+        if (book?.bestAsk != null && book?.bestBid != null) {
+            const s = Number(book.bestAsk) - Number(book.bestBid);
+            spread = Number.isFinite(s) ? s : null;
+        }
+
+        let dojiLikely: boolean | null = null;
+        let wickRatio: number | null = null;
+        let bodyRatio: number | null = null;
+        let retraceRatio: number | null = null;
+        if (open != null && high != null && low != null && close != null) {
+            const range = Number(high) - Number(low);
+            if (Number.isFinite(range) && range > 0) {
+                bodyRatio = Math.abs(Number(close) - Number(open)) / range;
+                const upperWick = Number(high) - Math.max(Number(open), Number(close));
+                const lowerWick = Math.min(Number(open), Number(close)) - Number(low);
+                wickRatio = direction === 'Up' ? (upperWick / range) : (lowerWick / range);
+                retraceRatio = direction === 'Up' ? ((Number(high) - Number(close)) / range) : ((Number(close) - Number(low)) / range);
+                dojiLikely = bodyRatio <= 0.15;
+            }
+        }
+
+        let marginPct: number | null = null;
+        if (priceToBeat != null && close != null && Number.isFinite(priceToBeat) && priceToBeat !== 0) {
+            const signed = (Number(close) - Number(priceToBeat)) * (direction === 'Up' ? 1 : -1);
+            marginPct = signed / Number(priceToBeat);
+        }
+
+        let momentum3m: number | null = null;
+        if (Array.isArray(candle.closes1m) && candle.closes1m.length >= 4) {
+            const closes = candle.closes1m;
+            const cur = closes[closes.length - 1];
+            const prev3 = closes[closes.length - 4];
+            if (Number.isFinite(cur) && Number.isFinite(prev3) && prev3 !== 0) {
+                momentum3m = (cur - prev3) / prev3;
+            }
+        }
+
+        let score = 0;
+        if (dojiLikely === true) {
+            reasons.push({ k: 'dojiLikely', score: 30, v: { bodyRatio } });
+            score += 30;
+        }
+        if (wickRatio != null && wickRatio >= 0.5) {
+            reasons.push({ k: 'wickPressure', score: 25, v: { wickRatio } });
+            score += 25;
+        }
+        if (retraceRatio != null && retraceRatio >= 0.6) {
+            reasons.push({ k: 'retrace', score: 15, v: { retraceRatio } });
+            score += 15;
+        }
+        if (marginPct != null) {
+            if (marginPct < 0) {
+                reasons.push({ k: 'marginNegative', score: 35, v: { marginPct } });
+                score += 35;
+            } else if (marginPct < 0.0005) {
+                reasons.push({ k: 'marginVeryThin', score: 30, v: { marginPct } });
+                score += 30;
+            } else if (marginPct < 0.001) {
+                reasons.push({ k: 'marginThin', score: 20, v: { marginPct } });
+                score += 20;
+            }
+        }
+        if (momentum3m != null) {
+            const signedMom = momentum3m * (direction === 'Up' ? 1 : -1);
+            if (signedMom < 0) {
+                reasons.push({ k: 'momentumOpposite', score: 15, v: { momentum3m } });
+                score += 15;
+            }
+        }
+        if (spread != null) {
+            if (spread >= 0.02) {
+                reasons.push({ k: 'spreadWide', score: 20, v: { spread } });
+                score += 20;
+            } else if (spread >= 0.01) {
+                reasons.push({ k: 'spread', score: 10, v: { spread } });
+                score += 10;
+            }
+        } else if (book) {
+            reasons.push({ k: 'spreadMissing', score: 10 });
+            score += 10;
+        }
+
+        score = Math.max(0, Math.min(100, Math.floor(score)));
+        return { riskScore: score, dojiLikely, wickRatio, bodyRatio, retraceRatio, marginPct, momentum3m, spread, reasons, error: candle.error || beat.error || null };
+    }
+
+    private async buildCryptoAllCandidatesFromSnapshots(options: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; limit: number }) {
+        const { symbols, timeframes, minProb, expiresWithinSec, limit } = options;
+        const precomputeExpiryBufferSec = 10;
+        const now = Date.now();
+        const marketsAll = Array.isArray(this.cryptoAllMarketSnapshot.markets) ? this.cryptoAllMarketSnapshot.markets : [];
+        const markets = marketsAll
+            .filter((m: any) => m && (!timeframes.length || timeframes.includes(String(m?.timeframe || '').toLowerCase() as any)) && (!symbols.length || symbols.includes(String(m?.symbol || '').toUpperCase())))
+            .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))
+            .slice(0, Math.max(40, Math.min(220, Math.floor(Number(limit) || 0) * 2)));
+        const byTokenId = this.cryptoAllBooksSnapshot.byTokenId || {};
+        const candidates: any[] = [];
+        for (const m of markets) {
+            if (!m) continue;
+            const endMs = Number(m?.endMs);
+            if (!Number.isFinite(endMs)) continue;
+            const secondsToExpire = Math.floor((endMs - now) / 1000);
+            if (secondsToExpire <= 0) continue;
+
+            const upBook = byTokenId[String(m?.upTokenId || '').trim()] || null;
+            const downBook = byTokenId[String(m?.downTokenId || '').trim()] || null;
+            const upPrice = upBook?.bestAsk != null ? Number(upBook.bestAsk) : null;
+            const downPrice = downBook?.bestAsk != null ? Number(downBook.bestAsk) : null;
+            const chosen =
+                upPrice != null && downPrice != null ? (upPrice >= downPrice ? { outcome: 'Up', tokenId: m.upTokenId, price: upPrice } : { outcome: 'Down', tokenId: m.downTokenId, price: downPrice })
+                : upPrice != null ? { outcome: 'Up', tokenId: m.upTokenId, price: upPrice }
+                : downPrice != null ? { outcome: 'Down', tokenId: m.downTokenId, price: downPrice }
+                : null;
+            const meetsMinProb = chosen ? chosen.price >= minProb : false;
+            const eligibleByExpiry = secondsToExpire <= expiresWithinSec;
+            const withinComputeWindow = secondsToExpire <= (expiresWithinSec + precomputeExpiryBufferSec);
+            const minDeltaRequired =
+                m.symbol === 'BTC' ? this.cryptoAllDeltaThresholds.btcMinDelta
+                : m.symbol === 'ETH' ? this.cryptoAllDeltaThresholds.ethMinDelta
+                : m.symbol === 'SOL' ? this.cryptoAllDeltaThresholds.solMinDelta
+                : this.cryptoAllDeltaThresholds.xrpMinDelta;
+            const beat = withinComputeWindow ? await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: m.symbol, endMs: m.endMs, timeframeSec: m.timeframeSec }) : { priceToBeat: null, currentPrice: null, deltaAbs: null, error: null };
+            const meetsMinDelta = withinComputeWindow ? (beat.deltaAbs != null && minDeltaRequired > 0 ? beat.deltaAbs >= minDeltaRequired : minDeltaRequired <= 0) : false;
+            let risk: any = null;
+            if (withinComputeWindow && chosen && chosen.outcome && beat) {
+                const chosenBook = byTokenId[String(chosen.tokenId || '').trim()] || null;
+                risk = await this.computeCryptoAllRisk({
+                    symbol: m.symbol,
+                    timeframeSec: m.timeframeSec,
+                    endMs: m.endMs,
+                    direction: chosen.outcome === 'Down' ? 'Down' : 'Up',
+                    beat,
+                    book: chosenBook ? { bestAsk: chosenBook.bestAsk ?? null, bestBid: chosenBook.bestBid ?? null, asksCount: chosenBook.asksCount, bidsCount: chosenBook.bidsCount } : null,
+                }).catch((e: any) => ({ riskScore: null, dojiLikely: null, wickRatio: null, bodyRatio: null, retraceRatio: null, marginPct: null, momentum3m: null, spread: null, reasons: [], error: e?.message || String(e) }));
+                if (!(this as any).cryptoAllRiskDiag) (this as any).cryptoAllRiskDiag = new Map();
+                const k = `${String(m.conditionId)}:${String(chosen.tokenId)}`;
+                (this as any).cryptoAllRiskDiag.set(k, { at: new Date().toISOString(), symbol: m.symbol, timeframe: m.timeframe, risk });
+            }
+            candidates.push({
+                timeframe: m.timeframe,
+                symbol: m.symbol,
+                slug: m.slug,
+                conditionId: m.conditionId,
+                question: m.question,
+                endMs: m.endMs,
+                endDateIso: new Date(m.endMs).toISOString(),
+                secondsToExpire,
+                eligibleByExpiry,
+                minProb,
+                meetsMinProb,
+                upPrice,
+                downPrice,
+                chosen: chosen ? { outcome: chosen.outcome, tokenId: chosen.tokenId, price: chosen.price } : null,
+                chosenOutcome: chosen ? chosen.outcome : null,
+                chosenPrice: chosen ? chosen.price : null,
+                chosenTokenId: chosen ? chosen.tokenId : null,
+                chosenIndex: chosen ? (chosen.outcome === 'Down' ? 1 : 0) : null,
+                minDeltaRequired,
+                priceToBeat: beat.priceToBeat,
+                currentPrice: beat.currentPrice,
+                deltaAbs: beat.deltaAbs,
+                meetsMinDelta,
+                deltaError: beat.error,
+                riskScore: risk?.riskScore ?? null,
+                dojiLikely: risk?.dojiLikely ?? null,
+                wickRatio: risk?.wickRatio ?? null,
+                bodyRatio: risk?.bodyRatio ?? null,
+                retraceRatio: risk?.retraceRatio ?? null,
+                marginPct: risk?.marginPct ?? null,
+                momentum3m: risk?.momentum3m ?? null,
+                spread: risk?.spread ?? null,
+                riskReasons: Array.isArray(risk?.reasons) ? risk.reasons : [],
+                riskError: risk?.error ?? null,
+            });
+        }
+        candidates.sort((a, b) => {
+            const ab = (a.eligibleByExpiry ? 1 : 0) - (b.eligibleByExpiry ? 1 : 0);
+            if (ab !== 0) return -ab;
+            const ap = (a.meetsMinProb ? 1 : 0) - (b.meetsMinProb ? 1 : 0);
+            if (ap !== 0) return -ap;
+            const ad = (a.meetsMinDelta ? 1 : 0) - (b.meetsMinDelta ? 1 : 0);
+            if (ad !== 0) return -ad;
+            const pa = a?.chosen?.price != null ? Number(a.chosen.price) : -Infinity;
+            const pb = b?.chosen?.price != null ? Number(b.chosen.price) : -Infinity;
+            if (pa !== pb) return pb - pa;
+            const sa = a?.secondsToExpire != null ? Number(a.secondsToExpire) : Infinity;
+            const sb = b?.secondsToExpire != null ? Number(b.secondsToExpire) : Infinity;
+            return sa - sb;
+        });
+        return candidates.slice(0, limit);
+    }
+
+    async getCryptoAllCandidates(options?: { symbols?: string[] | string; timeframes?: Array<'15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; limit?: number }) {
+        const symbolsInput = options?.symbols;
+        const symbolsArr =
+            Array.isArray(symbolsInput) ? symbolsInput
+            : typeof symbolsInput === 'string' ? symbolsInput.split(',').map((x) => x.trim()).filter(Boolean)
+            : this.cryptoAllAutoConfig.symbols;
+        const symbols = Array.from(new Set(symbolsArr.map((s) => String(s || '').toUpperCase()).filter(Boolean)));
+
+        const tfsInput = options?.timeframes;
+        const tfArr =
+            Array.isArray(tfsInput) ? tfsInput
+            : typeof tfsInput === 'string' ? tfsInput.split(',').map((x) => x.trim()).filter(Boolean) as any
+            : this.cryptoAllAutoConfig.timeframes;
+        const timeframes = Array.from(new Set(tfArr.map((x: any) => String(x || '').toLowerCase()).filter(Boolean))) as Array<'15m' | '1h' | '4h' | '1d'>;
+
+        const minProbRaw = options?.minProb != null ? Number(options.minProb) : this.cryptoAllAutoConfig.minProb;
+        const expiresWithinSecRaw = options?.expiresWithinSec != null ? Number(options.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec;
+        const limitRaw = options?.limit != null ? Number(options.limit) : 20;
+
+        const minProb = Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : this.cryptoAllAutoConfig.minProb));
+        const expiresWithinSec = Math.max(10, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : this.cryptoAllAutoConfig.expiresWithinSec));
+        const limit = Math.max(1, Math.min(100, Math.floor(Number.isFinite(limitRaw) ? limitRaw : 20)));
+
+        await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        return await this.buildCryptoAllCandidatesFromSnapshots({ symbols, timeframes, minProb, expiresWithinSec, limit });
+    }
+
+    startCryptoAllAuto(config?: {
+        pollMs?: number;
+        expiresWithinSec?: number;
+        minProb?: number;
+        amountUsd?: number;
+        symbols?: string[];
+        timeframes?: Array<'15m' | '1h' | '4h' | '1d'>;
+        dojiGuardEnabled?: boolean;
+        riskSkipScore?: number;
+        riskAddOnBlockScore?: number;
+        addOnEnabled?: boolean;
+        addOnMultiplierA?: number;
+        addOnMultiplierB?: number;
+        addOnMultiplierC?: number;
+        addOnAccelEnabled?: boolean;
+        addOnTrendEnabled?: boolean;
+        addOnTrendMinutesA?: number;
+        addOnTrendMinutesB?: number;
+        addOnTrendMinutesC?: number;
+        addOnMaxTotalStakeUsdPerPosition?: number;
+        stoplossEnabled?: boolean;
+        stoplossCut1DropCents?: number;
+        stoplossCut1SellPct?: number;
+        stoplossCut2DropCents?: number;
+        stoplossCut2SellPct?: number;
+        stoplossSpreadGuardCents?: number;
+        stoplossMinSecToExit?: number;
+        splitBuyEnabled?: boolean;
+        splitBuyPct3m?: number;
+        splitBuyPct2m?: number;
+        splitBuyPct1m?: number;
+        splitBuyTrendEnabled?: boolean;
+        splitBuyTrendMinutes3m?: number;
+        splitBuyTrendMinutes2m?: number;
+        splitBuyTrendMinutes1m?: number;
+        adaptiveDeltaEnabled?: boolean;
+        adaptiveDeltaBigMoveMultiplier?: number;
+        adaptiveDeltaRevertNoBuyCount?: number;
+    }) {
+        if (this.autoRedeemConfig.enabled !== true) {
+            this.setAutoRedeemConfig({ enabled: true, persist: true });
+        }
+        this.updateCryptoAllConfig(config);
+        this.ensureCryptoAllSplitBuyLoop();
+
+        this.cryptoAllAutoEnabled = true;
+        this.recordAutoConfigEvent('cryptoall', 'start', { enabled: true, ...this.cryptoAllAutoConfig });
+        this.startCryptoAllStoplossLoop();
+        if (this.cryptoAllAutoTimer) {
+            clearInterval(this.cryptoAllAutoTimer);
+            this.cryptoAllAutoTimer = null;
+        }
+        const tick = async () => {
+            await this.cryptoAllTryAutoOnce().catch(() => {});
+        };
+        setTimeout(() => tick().catch(() => null), 250);
+        this.cryptoAllAutoTimer = setInterval(() => setTimeout(() => tick().catch(() => null), 250), this.cryptoAllAutoConfig.pollMs);
+        return this.getCryptoAllStatus();
+    }
+
+
+    stopCryptoAllAuto() {
+        this.cryptoAllAutoEnabled = false;
+        this.recordAutoConfigEvent('cryptoall', 'stop', { enabled: false, ...this.cryptoAllAutoConfig });
+        if (this.cryptoAllAutoTimer) {
+            clearInterval(this.cryptoAllAutoTimer);
+            this.cryptoAllAutoTimer = null;
+        }
+        if (this.cryptoAllStoplossTimer) {
+            clearInterval(this.cryptoAllStoplossTimer);
+            this.cryptoAllStoplossTimer = null;
+        }
+        return this.getCryptoAllStatus();
+    }
+
+    private ensureCryptoAllSplitBuyLoop() {
+        if (this.cryptoAllSplitBuyTimer) return;
+        this.cryptoAllSplitBuyTimer = setInterval(() => {
+            this.tickCryptoAllSplitBuyOnce().catch(() => {});
+        }, 750);
+    }
+
+    private async tickCryptoAllSplitBuyOnce() {
+        if (!this.cryptoAllSplitBuyState.size) {
+            if (this.cryptoAllSplitBuyTimer) {
+                clearInterval(this.cryptoAllSplitBuyTimer);
+                this.cryptoAllSplitBuyTimer = null;
+            }
+            return;
+        }
+        const now = Date.now();
+        for (const [k, v] of Array.from(this.cryptoAllSplitBuyState.entries())) {
+            if (!v) { this.cryptoAllSplitBuyState.delete(k); continue; }
+            const expiresAtMs = Number(v.expiresAtMs || 0);
+            const remainingSec = Math.floor((expiresAtMs - now) / 1000);
+            if (!(remainingSec > 0)) { this.cryptoAllSplitBuyState.delete(k); continue; }
+            const lastAttemptAtMs = Number(v.lastAttemptAtMs || 0);
+            if (now - lastAttemptAtMs < 2000) continue;
+            const due3m = remainingSec <= 180 && remainingSec > 120;
+            const due2m = remainingSec <= 120 && remainingSec > 60;
+            const due1m = remainingSec <= 60;
+            const nextLeg =
+                !v.done3m && due3m ? '3m'
+                : !v.done2m && due2m ? '2m'
+                : !v.done1m && due1m ? '1m'
+                : null;
+            if (!nextLeg) continue;
+            const amt = nextLeg === '3m' ? Number(v.amount3mUsd) : nextLeg === '2m' ? Number(v.amount2mUsd) : Number(v.amount1mUsd);
+            if (!(amt > 0)) {
+                if (nextLeg === '3m') v.done3m = true;
+                if (nextLeg === '2m') v.done2m = true;
+                if (nextLeg === '1m') v.done1m = true;
+                v.lastAttemptAtMs = now;
+                this.cryptoAllSplitBuyState.set(k, v);
+                continue;
+            }
+            v.lastAttemptAtMs = now;
+            this.cryptoAllSplitBuyState.set(k, v);
+            if (this.cryptoAllAutoConfig.splitBuyTrendEnabled !== false) {
+                const needUpMin =
+                    nextLeg === '3m' ? this.cryptoAllAutoConfig.splitBuyTrendMinutes3m
+                    : nextLeg === '2m' ? this.cryptoAllAutoConfig.splitBuyTrendMinutes2m
+                    : this.cryptoAllAutoConfig.splitBuyTrendMinutes1m;
+                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
+                if (!up.ok) continue;
+            }
+            const r: any = await this.placeCryptoAllOrder({
+                conditionId: String(v.conditionId),
+                outcomeIndex: Number(v.outcomeIndex),
+                amountUsd: amt,
+                minPrice: Number(v.minPrice),
+                force: true,
+                source: 'addon',
+                symbol: v.symbol,
+                timeframe: '15m',
+                endDate: v.endDate,
+                secondsToExpire: remainingSec,
+            }).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+            if (r?.success === true) {
+                if (nextLeg === '3m') v.done3m = true;
+                if (nextLeg === '2m') v.done2m = true;
+                if (nextLeg === '1m') v.done1m = true;
+                this.cryptoAllSplitBuyState.set(k, v);
+            }
+            if (v.done3m && v.done2m && v.done1m) {
+                this.cryptoAllSplitBuyState.delete(k);
+            }
+        }
+    }
+
+    private async cryptoAllTryAutoOnce() {
+        if (!this.cryptoAllAutoEnabled) return;
+        if (Date.now() < this.cryptoAllNextScanAllowedAtMs) return;
+        if (this.cryptoAllAutoInFlight) return;
+        this.cryptoAllAutoInFlight = true;
+        if (!this.hasValidKey) {
+            this.cryptoAllLastError = 'Missing private key';
+            this.cryptoAllAutoInFlight = false;
+            return;
+        }
+        const cleanupLocks = () => {
+            const now = Date.now();
+            for (const [k, v] of this.cryptoAllOrderLocks.entries()) {
+                if (!v) { this.cryptoAllOrderLocks.delete(k); continue; }
+                if (now > Number(v.expiresAtMs || 0) + 10 * 60_000) this.cryptoAllOrderLocks.delete(k);
+                else if (now - Number(v.atMs || 0) > 60 * 60_000) this.cryptoAllOrderLocks.delete(k);
+            }
+        };
+        try {
+            cleanupLocks();
+            const candidates = await this.getCryptoAllCandidates({
+                minProb: this.cryptoAllAutoConfig.minProb,
+                expiresWithinSec: this.cryptoAllAutoConfig.expiresWithinSec,
+                limit: 5,
+                symbols: this.cryptoAllAutoConfig.symbols,
+            }).catch(() => []);
+            this.cryptoAllLastScanAt = new Date().toISOString();
+            if (!Array.isArray(candidates)) {
+                this.cryptoAllAutoInFlight = false;
+                return;
+            }
+            for (const c of candidates) {
+                if (!c.meetsMinProb || !c.meetsMinDelta || !c.chosen || c.riskScore >= this.cryptoAllAutoConfig.riskSkipScore) continue;
+                if (this.cryptoAllAutoConfig.dojiGuardEnabled && c.dojiLikely) continue;
+                if (this.cryptoAllAutoConfig.adaptiveDeltaEnabled) {
+                    const st = this.cryptoAllAdaptiveDeltaBySymbol.get(c.symbol) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
+                    if (st.overrideDelta != null && Number(st.overrideDelta) > Number(c.deltaAbs)) continue;
+                }
+                const lockKey = `${c.conditionId}:${c.chosen.outcome}`;
+                if (this.cryptoAllOrderLocks.has(lockKey)) continue;
+                this.cryptoAllOrderLocks.set(lockKey, { atMs: Date.now(), symbol: c.symbol, expiresAtMs: Date.now() + 60000, conditionId: c.conditionId, status: 'placing' });
+                const r: any = await this.placeCryptoAllOrder({
+                    conditionId: c.conditionId,
+                    outcomeIndex: c.chosenIndex,
+                    amountUsd: this.cryptoAllAutoConfig.amountUsd,
+                    minPrice: this.cryptoAllAutoConfig.minProb,
+                    force: false,
+                    source: 'auto',
+                    symbol: c.symbol,
+                    timeframe: '15m',
+                    endDate: c.endDateIso,
+                    secondsToExpire: c.secondsToExpire,
+                }).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+                if (r?.success) {
+                    this.cryptoAllOrderLocks.set(lockKey, { atMs: Date.now(), symbol: c.symbol, expiresAtMs: Date.now() + 300000, conditionId: c.conditionId, status: 'ordered' });
+                    if (this.cryptoAllAutoConfig.adaptiveDeltaEnabled) {
+                        const st = this.cryptoAllAdaptiveDeltaBySymbol.get(c.symbol) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
+                        if (Number(c.deltaAbs) >= (this.cryptoAllDeltaThresholds as any)[c.symbol.toLowerCase() + 'MinDelta'] * this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier) {
+                            st.lastBigMoveAt = new Date().toISOString();
+                            st.lastBigMoveDelta = Number(c.deltaAbs);
+                            st.overrideDelta = Number(c.deltaAbs) * 0.8; 
+                            st.noBuyCount = this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount;
+                            this.cryptoAllAdaptiveDeltaBySymbol.set(c.symbol, st);
+                        } else if (st.noBuyCount > 0) {
+                            st.noBuyCount--;
+                            if (st.noBuyCount <= 0) st.overrideDelta = null;
+                            this.cryptoAllAdaptiveDeltaBySymbol.set(c.symbol, st);
+                        }
+                    }
+                    if (this.cryptoAllAutoConfig.splitBuyEnabled) {
+                        const baseAmt = this.cryptoAllAutoConfig.amountUsd;
+                        const amt3m = Math.floor(baseAmt * (this.cryptoAllAutoConfig.splitBuyPct3m / 100));
+                        const amt2m = Math.floor(baseAmt * (this.cryptoAllAutoConfig.splitBuyPct2m / 100));
+                        const amt1m = Math.floor(baseAmt * (this.cryptoAllAutoConfig.splitBuyPct1m / 100));
+                        if (amt3m > 0 || amt2m > 0 || amt1m > 0) {
+                            const splitKey = `${c.conditionId}:${c.chosenIndex}`;
+                            this.cryptoAllSplitBuyState.set(splitKey, {
+                                conditionId: c.conditionId,
+                                outcomeIndex: c.chosenIndex,
+                                symbol: c.symbol,
+                                endDate: c.endDateIso,
+                                expiresAtMs: Date.now() + c.secondsToExpire * 1000,
+                                amount3mUsd: amt3m,
+                                amount2mUsd: amt2m,
+                                amount1mUsd: amt1m,
+                                done3m: false,
+                                done2m: false,
+                                done1m: false,
+                                lastAttemptAtMs: 0,
+                                direction: c.chosenOutcome,
+                                minPrice: this.cryptoAllAutoConfig.minProb,
+                                stoplossConfig: this.cryptoAllAutoConfig.stoplossEnabled ? {
+                                    enabled: true,
+                                    cut1DropCents: this.cryptoAllAutoConfig.stoplossCut1DropCents,
+                                    cut1SellPct: this.cryptoAllAutoConfig.stoplossCut1SellPct,
+                                    cut2DropCents: this.cryptoAllAutoConfig.stoplossCut2DropCents,
+                                    cut2SellPct: this.cryptoAllAutoConfig.stoplossCut2SellPct,
+                                    minSecToExit: this.cryptoAllAutoConfig.stoplossMinSecToExit,
+                                } : undefined,
+                            });
+                            this.ensureCryptoAllSplitBuyLoop();
+                        }
+                    }
+                } else {
+                    this.cryptoAllOrderLocks.delete(lockKey);
+                }
+            }
+        } catch (e: any) {
+            this.cryptoAllLastError = e?.message || String(e);
+        } finally {
+            this.cryptoAllAutoInFlight = false;
+            this.cryptoAllNextScanAllowedAtMs = Date.now() + 2000;
+        }
+    }
+
+    private getCryptoAllAddOnWindow(secondsToExpire: number): 'A' | 'B' | 'C' | null {
+        const s = Math.floor(Number(secondsToExpire) || 0);
+        const a = this.cryptoAllAutoConfig.addOn.windowA;
+        const b = this.cryptoAllAutoConfig.addOn.windowB;
+        const c = this.cryptoAllAutoConfig.addOn.windowC;
+        if (s >= a.minSec && s <= a.maxSec) return 'A';
+        if (s >= b.minSec && s <= b.maxSec) return 'B';
+        if (s >= c.minSec && s <= c.maxSec) return 'C';
+        return null;
+    }
+
+    private startCryptoAllStoplossLoop() {
+        if (this.cryptoAllStoplossTimer) return;
+        const tick = async () => {
+            await this.tickCryptoAllStoploss().catch(() => {});
+            if (!this.cryptoAllStoplossState.size && this.cryptoAllStoplossTimer) {
+                clearInterval(this.cryptoAllStoplossTimer);
+                this.cryptoAllStoplossTimer = null;
+            }
+        };
+        this.cryptoAllStoplossTimer = setInterval(tick, 250);
+        setTimeout(() => tick().catch(() => {}), 50);
+    }
+
+    private registerCryptoAllStoplossPosition(params: { strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall'; conditionId: string; tokenId: string; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; entryPrice: number; sizeEstimate: number; stoploss: { cut1DropCents: number; cut1SellPct: number; cut2DropCents: number; cut2SellPct: number; minSecToExit: number } }) {
+        const positionKey = `${String(params.conditionId)}:${String(params.tokenId)}`;
+        const prev = this.cryptoAllStoplossState.get(positionKey);
+        const entryPrice = Number(params.entryPrice);
+        const size = Math.max(0, Number(params.sizeEstimate) || 0);
+        if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(size) || size <= 0) return;
+        const stoploss = {
+            cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number(params.stoploss?.cut1DropCents) || 0))),
+            cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number(params.stoploss?.cut1SellPct) || 0))),
+            cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number(params.stoploss?.cut2DropCents) || 0))),
+            cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number(params.stoploss?.cut2SellPct) || 0))),
+            minSecToExit: Math.max(0, Math.min(600, Math.floor(Number(params.stoploss?.minSecToExit) || 0))),
+        };
+        if (!prev) {
+            this.cryptoAllStoplossState.set(positionKey, {
+                positionKey,
+                strategy: params.strategy,
+                conditionId: String(params.conditionId),
+                tokenId: String(params.tokenId),
+                symbol: String(params.symbol || '').toUpperCase(),
+                timeframe: params.timeframe,
+                endMs: Number(params.endMs) || Date.now() + 10_000,
+                entryPrice,
+                totalSize: size,
+                soldSize: 0,
+                soldCut1: false,
+                soldCut2: false,
+                lastAttemptAtMs: 0,
+                lastCancelAtMs: 0,
+                openOrderIds: [],
+                openOrderPlacedAtMs: 0,
+                lastBestBid: 0,
+                stoploss,
+            });
+            return;
+        }
+        const totalSize = Number(prev.totalSize) + size;
+        const avgEntry = ((Number(prev.entryPrice) * Number(prev.totalSize)) + (entryPrice * size)) / totalSize;
+        this.cryptoAllStoplossState.set(positionKey, { ...prev, endMs: Math.max(Number(prev.endMs), Number(params.endMs) || 0), entryPrice: avgEntry, totalSize, stoploss });
+    }
+
+    private async tickCryptoAllStoploss(): Promise<void> {
+        if (!this.cryptoAllStoplossState.size) return;
+        const now = Date.now();
+        const minAttemptGap = 250;
+
+        for (const [positionKey, pos] of Array.from(this.cryptoAllStoplossState.entries())) {
+            const cut1Drop = Math.max(0, Math.floor(Number(pos?.stoploss?.cut1DropCents) || 0)) / 100;
+            const cut2Drop = Math.max(0, Math.floor(Number(pos?.stoploss?.cut2DropCents) || 0)) / 100;
+            const cut1Pct = Math.max(0, Math.min(100, Math.floor(Number(pos?.stoploss?.cut1SellPct) || 0)));
+            const cut2Pct = Math.max(0, Math.min(100, Math.floor(Number(pos?.stoploss?.cut2SellPct) || 0)));
+            const minSecToExit = Math.max(0, Math.floor(Number(pos?.stoploss?.minSecToExit) || 0));
+            if (!cut1Drop && !cut2Drop) {
+                this.cryptoAllStoplossState.delete(positionKey);
+                continue;
+            }
+            const remainingSec = Math.floor((Number(pos.endMs) - now) / 1000);
+            if (remainingSec <= 0) {
+                this.cryptoAllStoplossState.delete(positionKey);
+                continue;
+            }
+            if (minSecToExit > 0 && remainingSec < minSecToExit) continue;
+            if (pos.lastAttemptAtMs && now - pos.lastAttemptAtMs < minAttemptGap) continue;
+            if (pos.soldCut2 || (cut2Pct > 0 && (Number(pos.soldSize) / Math.max(1e-9, Number(pos.totalSize))) * 100 >= cut2Pct)) continue;
+
+            let bestBid = 0;
+            let bestAsk = 0;
+            let bestBidStr = '';
+            let depthTop = 0;
+            try {
+                const ob = await this.sdk.clobApi.getOrderbook(pos.tokenId);
+                const bids = Array.isArray(ob?.bids) ? ob.bids : [];
+                bestBidStr = String(bids?.[0]?.price || '');
+                bestBid = Number(bestBidStr) || 0;
+                depthTop = bids
+                    .slice(0, 5)
+                    .map((b: any) => Number(b?.size) || 0)
+                    .reduce((s: number, x: number) => s + x, 0);
+                bestAsk = Number(ob?.asks?.[0]?.price) || 0;
+            } catch {
+                continue;
+            }
+            const current = bestBid > 0 ? bestBid : (bestAsk > 0 ? bestAsk : 0);
+            if (!(current > 0)) continue;
+
+            const entry = Number(pos.entryPrice) || 0;
+            const cut1Price = entry - cut1Drop;
+            const cut2Price = entry - cut2Drop;
+            const soldPct = (Number(pos.soldSize) / Math.max(1e-9, Number(pos.totalSize))) * 100;
+
+            let targetPct: number | null = null;
+            let reason: string | null = null;
+            if (cut2Drop > 0 && current <= cut2Price && soldPct < cut2Pct) {
+                targetPct = cut2Pct;
+                reason = 'cut2';
+            } else if (cut1Drop > 0 && current <= cut1Price && soldPct < cut1Pct) {
+                targetPct = cut1Pct;
+                reason = 'cut1';
+            }
+            if (targetPct == null || !reason) continue;
+
+            const sizeToHaveSold = (Math.max(0, Math.min(100, targetPct)) / 100) * Number(pos.totalSize);
+            const remainingToSellTarget = Math.max(0, sizeToHaveSold - Number(pos.soldSize));
+            if (!(remainingToSellTarget > 0)) continue;
+            const remainingPos = Math.max(0, Number(pos.totalSize) - Number(pos.soldSize));
+            const minSellSize = 1;
+            let sellAmount = remainingToSellTarget;
+            if (sellAmount < minSellSize) {
+                if (remainingPos >= minSellSize) {
+                    sellAmount = minSellSize;
+                } else if (reason === 'cut1' && cut2Pct > 0 && remainingPos > 0) {
+                    targetPct = cut2Pct;
+                    reason = 'cut2';
+                    sellAmount = remainingPos;
+                } else {
+                    const action =
+                        pos.strategy === 'crypto15m' ? 'crypto15m_stoploss_sell'
+                        : pos.strategy === 'cryptoall2' ? 'cryptoall2_stoploss_sell'
+                        : 'cryptoall_stoploss_sell';
+                    this.orderHistory.unshift({
+                        id: Date.now(),
+                        timestamp: new Date().toISOString(),
+                        mode: 'stoploss',
+                        action,
+                        marketId: pos.conditionId,
+                        symbol: pos.symbol,
+                        timeframe: pos.timeframe,
+                        tokenId: pos.tokenId,
+                        entryPrice: pos.entryPrice,
+                        currentBid: bestBid || null,
+                        currentAsk: bestAsk || null,
+                        secondsToExpire: remainingSec,
+                        reason: `${reason}_dust`,
+                        targetPct,
+                        remainingToSellTarget,
+                        sellAmount,
+                        result: { success: false, skipped: true, error: `dust_size:${sellAmount}` },
+                    });
+                    if (this.orderHistory.length > 300) this.orderHistory.pop();
+                    this.schedulePersistOrderHistory();
+                    continue;
+                }
+            }
+            if (!(sellAmount > 0)) continue;
+
+            const decimals = bestBidStr.includes('.') ? bestBidStr.split('.')[1].length : 2;
+            const tickApprox = Math.max(1e-6, Math.min(0.1, Math.pow(10, -Math.max(0, Math.min(6, decimals)))));
+            const prevBestBid = Number((pos as any).lastBestBid) || 0;
+            const bidMoved = prevBestBid > 0 && bestBid > 0 && Math.abs(bestBid - prevBestBid) >= tickApprox * 0.5;
+
+            const prevOpenOrderIds = Array.isArray((pos as any).openOrderIds) ? (pos as any).openOrderIds.map((x: any) => String(x)).filter(Boolean) : [];
+            const prevCancelAt = Number((pos as any).lastCancelAtMs) || 0;
+            const prevOpenPlacedAt = Number((pos as any).openOrderPlacedAtMs) || 0;
+            const openAgeMs = prevOpenPlacedAt > 0 ? now - prevOpenPlacedAt : 0;
+            const shouldCancelOpen = prevOpenOrderIds.length > 0 && (bidMoved || openAgeMs >= 1_500) && now - prevCancelAt >= 600;
+
+            if (shouldCancelOpen) {
+                for (const oid of prevOpenOrderIds) {
+                    try { await this.tradingClient.cancelOrder(oid); } catch { }
+                }
+                this.cryptoAllStoplossState.set(positionKey, { ...(pos as any), lastAttemptAtMs: now, lastCancelAtMs: now, openOrderIds: [], openOrderPlacedAtMs: 0, lastBestBid: bestBid });
+            } else {
+                this.cryptoAllStoplossState.set(positionKey, { ...(pos as any), lastAttemptAtMs: now, lastCancelAtMs: prevCancelAt, openOrderIds: prevOpenOrderIds, openOrderPlacedAtMs: prevOpenPlacedAt, lastBestBid: bestBid });
+            }
+            let sellResult: any = null;
+            try {
+                const p1 = bestBid > 0 ? bestBid : undefined;
+                const p2 = bestBid > 0 ? Math.max(tickApprox, bestBid - tickApprox) : undefined;
+                const p3 = bestBid > 0 ? Math.max(tickApprox, bestBid - 2 * tickApprox) : undefined;
+
+                const depthSafe = Number.isFinite(depthTop) && depthTop > 0 ? depthTop : 0;
+                const depthBased = depthSafe > 0 ? depthSafe * 0.6 : 0;
+                const maxChunk = Math.max(1, Math.min(200, depthSafe > 0 ? depthSafe : 1));
+                const chunk = depthBased > 0 ? Math.min(maxChunk, depthBased) : (sellAmount >= 3 ? 1 : sellAmount);
+                const sellChunk = Math.max(minSellSize, Math.min(sellAmount, Math.min(remainingPos, chunk)));
+
+                const attempt1 = await this.tradingClient.createMarketOrder({ tokenId: pos.tokenId, side: 'SELL', amount: sellChunk, price: p1, orderType: 'FAK' });
+                const attempt2 = attempt1?.success ? null : await this.tradingClient.createMarketOrder({ tokenId: pos.tokenId, side: 'SELL', amount: sellChunk, price: p2, orderType: 'FAK' });
+                const attempt3 = (attempt2?.success || attempt1?.success) ? null : await this.tradingClient.createMarketOrder({ tokenId: pos.tokenId, side: 'SELL', amount: sellChunk, price: p3, orderType: 'FAK' });
+                const sell = attempt3 || attempt2 || attempt1;
+                const fallbackLimit = sell?.success || !(bestBid > 0) ? null : await this.tradingClient.createOrder({ tokenId: pos.tokenId, side: 'SELL', price: bestBid, size: sellChunk, orderType: 'GTC' });
+                sellResult = fallbackLimit?.success ? { ...fallbackLimit, method: 'limit_best_bid' } : { ...sell, method: 'market_fak', fallbackLimit };
+
+                const next = this.cryptoAllStoplossState.get(positionKey);
+                if (fallbackLimit?.success && (fallbackLimit?.orderId || fallbackLimit?.id)) {
+                    const oid = String(fallbackLimit?.orderId || fallbackLimit?.id);
+                    this.cryptoAllStoplossState.set(positionKey, { ...(next as any), openOrderIds: [oid], openOrderPlacedAtMs: now, lastCancelAtMs: Number((next as any)?.lastCancelAtMs) || 0, lastBestBid: bestBid });
+                }
+                if (sell?.success && (sell?.orderId || sell?.id)) {
+                    let filled = 0;
+                    const oid = String(sell?.orderId || sell?.id);
+                    try {
+                        const o = await this.tradingClient.getOrder(oid);
+                        filled = Math.max(0, Math.min(sellChunk, Number(o?.filledSize) || 0));
+                    } catch {
+                        filled = sellChunk;
+                    }
+                    if (filled > 0) {
+                        const soldSize = (Number((next as any)?.soldSize) || 0) + filled;
+                        const soldCut1 = ((next as any)?.soldCut1 || false) || reason === 'cut1';
+                        const soldCut2 = ((next as any)?.soldCut2 || false) || reason === 'cut2' || (cut2Pct > 0 && (soldSize / Math.max(1e-9, Number((next as any)?.totalSize) || 0)) * 100 >= cut2Pct);
+                        this.cryptoAllStoplossState.set(positionKey, { ...(next as any), soldSize, soldCut1, soldCut2 });
+                    }
+                }
+            } catch (e: any) {
+                sellResult = { success: false, error: e?.message || String(e) };
+            }
+            const action =
+                pos.strategy === 'crypto15m' ? 'crypto15m_stoploss_sell'
+                : pos.strategy === 'cryptoall2' ? 'cryptoall2_stoploss_sell'
+                : 'cryptoall_stoploss_sell';
+            this.orderHistory.unshift({
+                id: Date.now(),
+                timestamp: new Date().toISOString(),
+                mode: 'stoploss',
+                action,
+                marketId: pos.conditionId,
+                symbol: pos.symbol,
+                timeframe: pos.timeframe,
+                tokenId: pos.tokenId,
+                entryPrice: pos.entryPrice,
+                currentBid: bestBid || null,
+                currentAsk: bestAsk || null,
+                secondsToExpire: remainingSec,
+                reason,
+                targetPct,
+                remainingToSellTarget,
+                sellAmount,
+                result: sellResult,
+            });
+            if (this.orderHistory.length > 300) this.orderHistory.pop();
+            this.schedulePersistOrderHistory();
+        }
+    }
+
+    private async computeCryptoAllAccelOk(options: { symbol: string; timeframeSec: number; endMs: number; direction: 'Up' | 'Down' }): Promise<boolean> {
+        const symbol = String(options.symbol || '').toUpperCase();
+        const tfSec = Number(options.timeframeSec) || 0;
+        const endMs = Number(options.endMs) || 0;
+        const direction = options.direction;
+        const binSymbol = this.getBinanceSymbol(symbol);
+        if (!binSymbol || !tfSec || !endMs) return false;
+        const startMsRaw = endMs - Math.floor(tfSec) * 1000;
+        const startMs = Math.floor(startMsRaw / 60_000) * 60_000;
+        const candle = await this.fetchBinance1mCandleWindow({ binSymbol, startMs, minutes: Math.min(60, Math.max(1, Math.floor(tfSec / 60))) });
+        const closes = Array.isArray(candle.closes1m) ? candle.closes1m : [];
+        if (closes.length < 4) return false;
+        const c0 = closes[closes.length - 4];
+        const c1 = closes[closes.length - 3];
+        const c2 = closes[closes.length - 2];
+        const c3 = closes[closes.length - 1];
+        if (![c0, c1, c2, c3].every((x) => Number.isFinite(x) && x > 0)) return false;
+        const r1 = (c1 - c0) / c0;
+        const r2 = (c2 - c1) / c1;
+        const r3 = (c3 - c2) / c2;
+        const s1 = r1 * (direction === 'Up' ? 1 : -1);
+        const s2 = r2 * (direction === 'Up' ? 1 : -1);
+        const s3 = r3 * (direction === 'Up' ? 1 : -1);
+        if (!(s1 > 0 && s2 > 0 && s3 > 0)) return false;
+        return Math.abs(s1) <= Math.abs(s2) && Math.abs(s2) <= Math.abs(s3);
+    }
+
+    private registerCryptoAllAddOnPosition(params: { conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; stakeUsd: number }) {
+        const positionKey = `${String(params.conditionId)}:${String(params.tokenId)}`;
+        const prev = this.cryptoAllAddOnState.get(positionKey);
+        const next = {
+            positionKey,
+            conditionId: String(params.conditionId),
+            tokenId: String(params.tokenId),
+            direction: params.direction,
+            outcomeIndex: Math.max(0, Math.floor(Number(params.outcomeIndex) || 0)),
+            symbol: String(params.symbol || '').toUpperCase(),
+            timeframe: params.timeframe,
+            endMs: Number(params.endMs) || Date.now() + 10_000,
+            placedA: prev?.placedA || false,
+            placedB: prev?.placedB || false,
+            placedC: prev?.placedC || false,
+            totalStakeUsd: (Number(prev?.totalStakeUsd) || 0) + (Number(params.stakeUsd) || 0),
+            lastAttemptAtMs: Number(prev?.lastAttemptAtMs) || 0,
+        };
+        this.cryptoAllAddOnState.set(positionKey, next);
+    }
+
+    private async tickCryptoAllAddOn(): Promise<void> {
+        if (!this.cryptoAllAutoConfig.addOn.enabled) return;
+        const now = Date.now();
+        const minAttemptIntervalMs = Math.max(200, Math.floor(Number(this.cryptoAllAutoConfig.addOn.minAttemptIntervalMs) || 1200));
+        const maxTotal = Math.max(1, Number(this.cryptoAllAutoConfig.addOn.maxTotalStakeUsdPerPosition) || 50);
+        const blockScore = Math.max(0, Math.min(100, Math.floor(Number(this.cryptoAllAutoConfig.dojiGuard.riskAddOnBlockScore) || 50)));
+        for (const [positionKey, st] of Array.from(this.cryptoAllAddOnState.entries())) {
+            const remainingSec = Math.floor((Number(st.endMs) - now) / 1000);
+            if (remainingSec <= 0) {
+                this.cryptoAllAddOnState.delete(positionKey);
+                continue;
+            }
+            if (st.timeframe !== '15m') continue;
+            const win = this.getCryptoAllAddOnWindow(remainingSec);
+            if (!win) continue;
+            if (win === 'A' && st.placedA) continue;
+            if (win === 'B' && st.placedB) continue;
+            if (win === 'C' && st.placedC) continue;
+            if (Number(st.totalStakeUsd) >= maxTotal) continue;
+            if (st.lastAttemptAtMs && now - st.lastAttemptAtMs < minAttemptIntervalMs) continue;
+            this.cryptoAllAddOnState.set(positionKey, { ...st, lastAttemptAtMs: now });
+
+            if (this.cryptoAllAutoConfig.addOn.trendEnabled !== false) {
+                const needUpMin =
+                    win === 'A' ? this.cryptoAllAutoConfig.addOn.trendMinutesA
+                    : win === 'B' ? this.cryptoAllAutoConfig.addOn.trendMinutesB
+                    : this.cryptoAllAutoConfig.addOn.trendMinutesC;
+                const up = await this.isBinanceUpPerMinute(st.symbol, needUpMin, st.direction).catch(() => ({ ok: false, closes: [], error: 'binance_error' }));
+                if (!up.ok) continue;
+            }
+
+            const tfSec = this.getCryptoAllTimeframeSec(st.timeframe);
+            const beat = await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: st.symbol, endMs: st.endMs, timeframeSec: tfSec }).catch((e: any) => ({ priceToBeat: null, currentPrice: null, deltaAbs: null, error: e?.message || String(e) }));
+            const books = await this.fetchClobBooks([st.tokenId]).catch(() => []);
+            const b0: any = Array.isArray(books) && books.length ? books[0] : null;
+            const asks = Array.isArray(b0?.asks) ? b0.asks : [];
+            const bids = Array.isArray(b0?.bids) ? b0.bids : [];
+            const bestAsk = asks.length ? Number(asks[0]?.price) : NaN;
+            const bestBid = bids.length ? Number(bids[0]?.price) : NaN;
+            const book = {
+                bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                asksCount: asks.length,
+                bidsCount: bids.length,
+            };
+            const risk = await this.computeCryptoAllRisk({ symbol: st.symbol, timeframeSec: tfSec, endMs: st.endMs, direction: st.direction, beat, book }).catch(() => null);
+            const riskScore = risk?.riskScore != null ? Number(risk.riskScore) : null;
+            if (riskScore == null || riskScore >= blockScore) continue;
+
+            const accelOk = this.cryptoAllAutoConfig.addOn.accelEnabled ? await this.computeCryptoAllAccelOk({ symbol: st.symbol, timeframeSec: tfSec, endMs: st.endMs, direction: st.direction }).catch(() => false) : false;
+            const mult =
+                accelOk
+                    ? (win === 'A' ? this.cryptoAllAutoConfig.addOn.multiplierA : win === 'B' ? this.cryptoAllAutoConfig.addOn.multiplierB : this.cryptoAllAutoConfig.addOn.multiplierC)
+                    : 1.0;
+            const amountUsd = Math.max(1, (Number(this.cryptoAllAutoConfig.amountUsd) || 1) * (Number(mult) || 1));
+            const res: any = await this.placeCryptoAllOrder({
+                conditionId: st.conditionId,
+                outcomeIndex: st.outcomeIndex,
+                amountUsd,
+                minPrice: this.cryptoAllAutoConfig.minProb,
+                force: false,
+                source: 'addon',
+                symbol: st.symbol,
+                timeframe: st.timeframe,
+                endDate: new Date(st.endMs).toISOString(),
+                secondsToExpire: remainingSec,
+                addonWindow: win,
+                addonRiskScore: riskScore,
+            } as any).catch(() => null);
+            if (res && res.success) {
+                const cur = this.cryptoAllAddOnState.get(positionKey);
+                if (!cur) continue;
+                const next = { ...cur };
+                next.totalStakeUsd = (Number(next.totalStakeUsd) || 0) + (Number(amountUsd) || 0);
+                if (win === 'A') next.placedA = true;
+                if (win === 'B') next.placedB = true;
+                if (win === 'C') next.placedC = true;
+                this.cryptoAllAddOnState.set(positionKey, next);
+            }
+        }
+    }
+
+    async placeCryptoAllOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi' | 'addon'; symbol?: string; timeframe?: '15m' | '1h' | '4h' | '1d'; endDate?: string; secondsToExpire?: number; addonWindow?: 'A' | 'B' | 'C'; addonRiskScore?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number }) {
+        if (!this.hasValidKey) throw new Error('Missing private key');
+        const conditionId = String(params.conditionId || '').trim();
+        if (!conditionId) throw new Error('Missing conditionId');
+        const requestedAmountUsd = params.amountUsd != null ? Number(params.amountUsd) : NaN;
+        const amountUsd = Math.max(1, Number.isFinite(requestedAmountUsd) ? requestedAmountUsd : this.cryptoAllAutoConfig.amountUsd);
+        const source = params.source || 'semi';
+        const force = params.force === true;
+        const requestedMinPrice = params.minPrice != null ? Number(params.minPrice) : NaN;
+        const effectiveMinPrice = Math.max(0, this.cryptoAllAutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
+        const stoplossEnabled = params.stoplossEnabled != null ? !!params.stoplossEnabled : (this.cryptoAllAutoConfig.stoploss?.enabled ?? this.cryptoAllAutoConfig.stoplossEnabled);
+        const stoplossCut1DropCents = params.stoplossCut1DropCents != null ? Number(params.stoplossCut1DropCents) : (this.cryptoAllAutoConfig.stoploss?.cut1DropCents ?? this.cryptoAllAutoConfig.stoplossCut1DropCents);
+        const stoplossCut1SellPct = params.stoplossCut1SellPct != null ? Number(params.stoplossCut1SellPct) : (this.cryptoAllAutoConfig.stoploss?.cut1SellPct ?? this.cryptoAllAutoConfig.stoplossCut1SellPct);
+        const stoplossCut2DropCents = params.stoplossCut2DropCents != null ? Number(params.stoplossCut2DropCents) : (this.cryptoAllAutoConfig.stoploss?.cut2DropCents ?? this.cryptoAllAutoConfig.stoplossCut2DropCents);
+        const stoplossCut2SellPct = params.stoplossCut2SellPct != null ? Number(params.stoplossCut2SellPct) : (this.cryptoAllAutoConfig.stoploss?.cut2SellPct ?? this.cryptoAllAutoConfig.stoplossCut2SellPct);
+        const stoplossMinSecToExit = params.stoplossMinSecToExit != null ? Number(params.stoplossMinSecToExit) : (this.cryptoAllAutoConfig.stoploss?.minSecToExit ?? this.cryptoAllAutoConfig.stoplossMinSecToExit);
+        const recordSkipEarly = (reason: string, errorMsg?: any) => {
+            try {
+                const orderStatus = `skipped:${reason}`;
+                const last = this.orderHistory[0];
+                if (last && String(last?.action || '') === 'cryptoall_order' && String(last?.marketId || '') === conditionId) {
+                    const lastStatus = Array.isArray(last?.results) && last.results.length ? String(last.results[0]?.orderStatus || '') : '';
+                    const lastTs = last?.timestamp ? Date.parse(String(last.timestamp)) : NaN;
+                    if (lastStatus === orderStatus && Number.isFinite(lastTs) && (Date.now() - lastTs) < 5000) return;
+                }
+                const tf0 = (params.timeframe || '15m') as any;
+                const sym0 = String(params.symbol || 'UNKNOWN').toUpperCase();
+                this.orderHistory.unshift({
+                    id: Date.now(),
+                    timestamp: new Date().toISOString(),
+                    mode: source,
+                    action: 'cryptoall_order',
+                    marketId: conditionId,
+                    symbol: sym0,
+                    timeframe: tf0,
+                    slug: null,
+                    marketQuestion: null,
+                    outcome: null,
+                    outcomeIndex: params.outcomeIndex != null ? Number(params.outcomeIndex) : null,
+                    tokenId: null,
+                    amountUsd,
+                    results: [{ success: false, orderId: null, tokenId: null, outcome: null, conditionId, orderStatus, errorMsg: errorMsg != null ? String(errorMsg) : '' }],
+                });
+                this.schedulePersistOrderHistory();
+            } catch {}
+        };
+
+        if (source !== 'addon' && this.cryptoAllTrackedByCondition.has(conditionId)) {
+            const tracked = this.cryptoAllTrackedByCondition.get(conditionId) || null;
+            const status = String(tracked?.status || '').toLowerCase();
+            const retryAfterMs = tracked?.retryAfterMs != null ? Number(tracked.retryAfterMs) : NaN;
+            if (status === 'failed' && Number.isFinite(retryAfterMs) && Date.now() >= retryAfterMs) {
+                this.cryptoAllTrackedByCondition.delete(conditionId);
+            } else if (status === 'failed' && Number.isFinite(retryAfterMs)) {
+                recordSkipEarly('retry_cooldown', `retryAfterMs=${retryAfterMs}`);
+                return { success: false, skipped: true, reason: 'retry_cooldown', conditionId, retryAfterMs };
+            } else {
+                recordSkipEarly('already_ordered_tracked');
+                return { success: false, skipped: true, reason: 'already_ordered_tracked', conditionId };
+            }
+        }
+        const alreadyInHistory = this.orderHistory.some((e: any) => {
+            if (!e) return false;
+            if (String(e?.action || '') !== 'cryptoall_order') return false;
+            const mid = String(e?.marketId || '').trim().toLowerCase();
+            if (!(mid && mid === conditionId.toLowerCase())) return false;
+            const res0 = Array.isArray(e?.results) && e.results.length ? e.results[0] : null;
+            const orderStatus = String(res0?.orderStatus || '').toLowerCase();
+            if (orderStatus.startsWith('skipped:')) return false;
+            const ok = res0?.success === true;
+            const orderId = res0?.orderId != null ? String(res0.orderId) : '';
+            return ok || !!orderId;
+        });
+        if (source !== 'addon' && alreadyInHistory) {
+            recordSkipEarly('already_ordered_history');
+            return { success: false, skipped: true, reason: 'already_ordered_history', conditionId };
+        }
+
+        const market = await withRetry(() => this.sdk.clobApi.getMarket(conditionId), { maxRetries: 2 });
+        const marketAny: any = market as any;
+        const marketSlug = String(marketAny?.marketSlug ?? marketAny?.market_slug ?? '');
+        const q = String(marketAny?.question || '');
+        const symbol = String(params.symbol || this.inferCryptoSymbolFromText(marketSlug, q) || 'UNKNOWN');
+        const tf = (params.timeframe || '15m') as any;
+        const timeframeSec = this.getCryptoAllTimeframeSec(tf);
+
+        let endDate: string | null = params.endDate != null ? String(params.endDate) : null;
+        if (!endDate) {
+            const endIso = marketAny?.endDateIso ?? marketAny?.end_date_iso ?? null;
+            const ms = endIso ? Date.parse(String(endIso)) : NaN;
+            if (Number.isFinite(ms)) endDate = new Date(ms).toISOString();
+        }
+        let expiresAtMs = endDate ? Date.parse(endDate) : NaN;
+        if (!Number.isFinite(expiresAtMs)) {
+            expiresAtMs = Date.now() + 20 * 60_000;
+            endDate = new Date(expiresAtMs).toISOString();
+        }
+
+        const upperSymbol = String(symbol || '').toUpperCase();
+        const orderLockKey = upperSymbol && upperSymbol !== 'UNKNOWN' ? `${tf}:${upperSymbol}:${expiresAtMs}` : null;
+        const recordSkip = (reason: string, fields?: Record<string, any>) => {
+            try {
+                const orderStatus = `skipped:${reason}`;
+                const last = this.orderHistory[0];
+                if (last && String(last?.action || '') === 'cryptoall_order' && String(last?.marketId || '') === conditionId) {
+                    const lastStatus = Array.isArray(last?.results) && last.results.length ? String(last.results[0]?.orderStatus || '') : '';
+                    const lastTs = last?.timestamp ? Date.parse(String(last.timestamp)) : NaN;
+                    if (lastStatus === orderStatus && Number.isFinite(lastTs) && (Date.now() - lastTs) < 5000) return;
+                }
+                this.orderHistory.unshift({
+                    id: Date.now(),
+                    timestamp: new Date().toISOString(),
+                    mode: source,
+                    action: 'cryptoall_order',
+                    marketId: conditionId,
+                    symbol: upperSymbol,
+                    timeframe: tf,
+                    slug: marketSlug || null,
+                    marketQuestion: q || null,
+                    outcome: fields?.outcome ?? null,
+                    outcomeIndex: fields?.outcomeIndex ?? null,
+                    tokenId: fields?.tokenId ?? null,
+                    amountUsd,
+                    price: fields?.bestAsk ?? null,
+                    bestAsk: fields?.bestAsk ?? null,
+                    limitPrice: fields?.limitPrice ?? null,
+                    results: [{ success: false, orderId: null, tokenId: fields?.tokenId ?? null, outcome: fields?.outcome ?? null, conditionId, orderStatus, errorMsg: fields?.errorMsg != null ? String(fields.errorMsg) : '' }],
+                });
+                this.schedulePersistOrderHistory();
+            } catch {}
+        };
+        let orderLockPlaced = false;
+        if (!force && orderLockKey) {
+            const key = `${tf}:${upperSymbol}`;
+            if (source !== 'addon' && this.cryptoAllActivesByKey.has(key)) {
+                recordSkip('already_active', { expiresAtMs });
+                return { success: false, skipped: true, reason: 'already_active', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
+            }
+            const locked = this.cryptoAllOrderLocks.get(orderLockKey);
+            if (locked && locked.status === 'placing') {
+                recordSkip('duplicate_inflight', { expiresAtMs });
+                return { success: false, skipped: true, reason: 'duplicate_inflight', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
+            }
+        }
+
+        const tokens: any[] = Array.isArray(marketAny?.tokens) ? marketAny.tokens : [];
+        if (tokens.length < 2) throw new Error('Invalid market tokens');
+        const requestedIdxRaw = params.outcomeIndex != null ? Math.floor(Number(params.outcomeIndex)) : NaN;
+        let idx = Number.isFinite(requestedIdxRaw) ? Math.max(0, Math.min(tokens.length - 1, requestedIdxRaw)) : 0;
+        const tokenOutcomeLc = String(tokens[idx]?.outcome || '').toLowerCase();
+        if (!tokenOutcomeLc.includes('up') && !tokenOutcomeLc.includes('down')) {
+            const upIdx = tokens.findIndex((t: any) => String(t?.outcome || '').toLowerCase().includes('up'));
+            const downIdx = tokens.findIndex((t: any) => String(t?.outcome || '').toLowerCase().includes('down'));
+            if (upIdx < 0 || downIdx < 0) throw new Error('Missing Up/Down outcomes');
+            idx = Number.isFinite(requestedIdxRaw) && requestedIdxRaw === downIdx ? downIdx : upIdx;
+        }
+        const tok: any = tokens[idx];
+        const tokenId = String(tok?.tokenId ?? tok?.token_id ?? tok?.id ?? '').trim();
+        if (!tokenId) throw new Error('Missing tokenId');
+        const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
+
+        if (!force && symbol && symbol !== 'UNKNOWN') {
+            const minDeltaRequired =
+                upperSymbol === 'BTC' ? this.cryptoAllDeltaThresholds.btcMinDelta
+                : upperSymbol === 'ETH' ? this.cryptoAllDeltaThresholds.ethMinDelta
+                : upperSymbol === 'SOL' ? this.cryptoAllDeltaThresholds.solMinDelta
+                : upperSymbol === 'XRP' ? this.cryptoAllDeltaThresholds.xrpMinDelta
+                : 0;
+            if (minDeltaRequired > 0) {
+                const beat = await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: upperSymbol, endMs: expiresAtMs, timeframeSec });
+                if (beat.deltaAbs == null) {
+                    recordSkip('delta_unavailable', { tokenId, outcome, outcomeIndex: idx, errorMsg: beat.error || 'Failed to compute delta' });
+                    return { success: false, skipped: true, reason: 'delta_unavailable', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, minDeltaRequired, error: beat.error || 'Failed to compute delta' };
+                }
+                if (beat.deltaAbs < minDeltaRequired) {
+                    recordSkip('delta_too_small', { tokenId, outcome, outcomeIndex: idx, errorMsg: `${beat.deltaAbs} < ${minDeltaRequired}` });
+                    return { success: false, skipped: true, reason: 'delta_too_small', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, minDeltaRequired, deltaAbs: beat.deltaAbs, priceToBeat: beat.priceToBeat, currentPrice: beat.currentPrice };
+                }
+            }
+        }
+
+        if (!force && orderLockKey) {
+            this.cryptoAllOrderLocks.set(orderLockKey, { atMs: Date.now(), key: `${tf}:${upperSymbol}`, expiresAtMs, conditionId, status: 'placing' });
+            orderLockPlaced = true;
+        }
+        try {
+            const books = await this.fetchClobBooks([tokenId]);
+            const b0: any = Array.isArray(books) && books.length ? books[0] : null;
+            const asks = Array.isArray(b0?.asks) ? b0.asks : [];
+            const bids = Array.isArray(b0?.bids) ? b0.bids : [];
+            const bestAsk = asks.length ? Number(asks[0]?.price) : NaN;
+            const bestBid = bids.length ? Number(bids[0]?.price) : NaN;
+            const chosenPrice = Number.isFinite(bestAsk) ? bestAsk : null;
+            if (chosenPrice == null) {
+                recordSkip('missing_book', { tokenId, outcome, outcomeIndex: idx });
+                return { success: false, skipped: true, reason: 'missing_book', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null };
+            }
+            const bidPrice = Number.isFinite(bestBid) ? bestBid : null;
+            if (!force && this.cryptoAllAutoConfig.stoploss?.spreadGuardCents != null && bidPrice != null) {
+                const spread = chosenPrice - bidPrice;
+                const guard = Math.max(0, Math.floor(Number(this.cryptoAllAutoConfig.stoploss.spreadGuardCents) || 0)) / 100;
+                if (guard > 0 && spread >= guard) {
+                    recordSkip('spread_guard', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, bestBid: bidPrice, errorMsg: `spread=${spread}` });
+                    return { success: false, skipped: true, reason: 'spread_guard', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, bestAsk: chosenPrice, bestBid: bidPrice, spread, guard };
+                }
+            }
+            if (!force && chosenPrice < effectiveMinPrice) {
+                recordSkip('min_prob', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, errorMsg: `bestAsk=${chosenPrice} min=${effectiveMinPrice}` });
+                return { success: false, skipped: true, reason: 'min_prob', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, bestAsk: chosenPrice, minPrice: effectiveMinPrice };
+            }
+
+            const globalKey = `cryptoall:${conditionId}`.toLowerCase();
+            if (!force) {
+                if (!this.tryAcquireGlobalOrderLock(globalKey, 'cryptoall')) {
+                    recordSkip('global_locked', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, expiresAtMs });
+                    return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
+                }
+                if (this.globalOrderPlaceInFlight) {
+                    this.markGlobalOrderLockDone(globalKey, false);
+                    recordSkip('global_inflight', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, expiresAtMs });
+                    return { success: false, skipped: true, reason: 'global_inflight', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
+                }
+                this.globalOrderPlaceInFlight = true;
+            }
+            let ok = false;
+            let orderId: string | null = null;
+            let orderErrorMsg: string | null = null;
+            try {
+                const result = await this.tradingClient.createMarketOrder({ tokenId, amountUsd, limitPrice: Math.min(0.999, chosenPrice + 0.02), side: 'BUY' });
+                ok = !!(result as any)?.success;
+                orderId = (result as any)?.orderId || null;
+                orderErrorMsg = (result as any)?.errorMsg != null ? String((result as any).errorMsg) : ((result as any)?.error != null ? String((result as any).error) : null);
+            } finally {
+                if (!force) {
+                    this.globalOrderPlaceInFlight = false;
+                    this.markGlobalOrderLockDone(globalKey, ok);
+                }
+            }
+
+            const historyEntry: any = {
+                id: Date.now(),
+                timestamp: new Date().toISOString(),
+                mode: source,
+                action: 'cryptoall_order',
+                marketId: conditionId,
+                symbol: upperSymbol,
+                timeframe: tf,
+                slug: marketSlug || null,
+                marketQuestion: q || null,
+                outcome,
+                outcomeIndex: idx,
+                tokenId,
+                price: chosenPrice,
+                bestAsk: chosenPrice,
+                limitPrice: Math.min(0.999, chosenPrice + 0.02),
+                amountUsd,
+                addonWindow: params.addonWindow || null,
+                addonRiskScore: params.addonRiskScore != null ? Number(params.addonRiskScore) : null,
+                results: [{ success: ok, orderId, tokenId, outcome, conditionId, errorMsg: ok ? '' : (orderErrorMsg || '') }],
+            };
+            this.orderHistory.unshift(historyEntry);
+            this.schedulePersistOrderHistory();
+
+            if (source !== 'addon') {
+                if (ok) {
+                    this.cryptoAllTrackedByCondition.set(conditionId, { orderedAt: new Date().toISOString(), symbol: upperSymbol, timeframe: tf, orderId, tokenId, outcome, status: 'ordered' });
+                } else {
+                    this.cryptoAllTrackedByCondition.set(conditionId, { orderedAt: new Date().toISOString(), symbol: upperSymbol, timeframe: tf, orderId, tokenId, outcome, status: 'failed', retryAfterMs: Date.now() + 20000 });
+                }
+            }
+            if (!force && orderLockKey) {
+                this.cryptoAllOrderLocks.set(orderLockKey, { atMs: Date.now(), key: `${tf}:${upperSymbol}`, expiresAtMs, conditionId, status: ok ? 'ordered' : 'failed' });
+            }
+            if (ok) {
+                if (source !== 'addon') {
+                    this.cryptoAllActivesByKey.set(`${tf}:${upperSymbol}`, { conditionId, orderId, tokenId, outcome, expiresAtMs, slug: marketSlug || null, placedAt: new Date().toISOString() });
+                }
+                const direction = String(outcome || '').toLowerCase().includes('down') ? 'Down' : 'Up';
+                if (source !== 'addon') {
+                    this.registerCryptoAllAddOnPosition({ conditionId, tokenId, direction: direction as any, outcomeIndex: idx, symbol: upperSymbol, timeframe: tf, endMs: expiresAtMs, stakeUsd: amountUsd });
+                } else {
+                    const positionKey = `${conditionId}:${tokenId}`;
+                    const cur = this.cryptoAllAddOnState.get(positionKey);
+                    const placedA = cur?.placedA || params.addonWindow === 'A';
+                    const placedB = cur?.placedB || params.addonWindow === 'B';
+                    const placedC = cur?.placedC || params.addonWindow === 'C';
+                    const next = cur || { positionKey, conditionId, tokenId, direction: direction as any, outcomeIndex: idx, symbol: upperSymbol, timeframe: tf, endMs: expiresAtMs, placedA: false, placedB: false, placedC: false, totalStakeUsd: 0, lastAttemptAtMs: 0 };
+                    this.cryptoAllAddOnState.set(positionKey, { ...next, placedA, placedB, placedC, totalStakeUsd: (Number(next.totalStakeUsd) || 0) + (Number(amountUsd) || 0) });
+                }
+                if (stoplossEnabled) {
+                    const sizeEstimate = chosenPrice > 0 ? amountUsd / chosenPrice : 0;
+                    this.registerCryptoAllStoplossPosition({
+                        strategy: 'cryptoall',
+                        conditionId,
+                        tokenId,
+                        symbol: upperSymbol,
+                        timeframe: tf,
+                        endMs: expiresAtMs,
+                        entryPrice: chosenPrice,
+                        sizeEstimate,
+                        stoploss: {
+                            cut1DropCents: Math.max(0, Math.min(50, Math.floor(Number(stoplossCut1DropCents) || 0))),
+                            cut1SellPct: Math.max(0, Math.min(100, Math.floor(Number(stoplossCut1SellPct) || 0))),
+                            cut2DropCents: Math.max(0, Math.min(50, Math.floor(Number(stoplossCut2DropCents) || 0))),
+                            cut2SellPct: Math.max(0, Math.min(100, Math.floor(Number(stoplossCut2SellPct) || 0))),
+                            minSecToExit: Math.max(0, Math.min(600, Math.floor(Number(stoplossMinSecToExit) || 0))),
+                        }
+                    });
+                }
+            }
+            return { success: ok, orderId, slug: marketSlug || null, conditionId, symbol: upperSymbol, timeframe: tf, bestAsk: chosenPrice, minPrice: effectiveMinPrice, tokenId, outcomeIndex: idx, outcome };
+        } catch (e: any) {
+            const errMsg = e?.message || String(e);
+            try {
+                const historyEntry: any = {
+                    id: Date.now(),
+                    timestamp: new Date().toISOString(),
+                    mode: source,
+                    action: 'cryptoall_order',
+                    marketId: conditionId,
+                    symbol: upperSymbol,
+                    timeframe: tf,
+                    slug: marketSlug || null,
+                    marketQuestion: q || null,
+                    outcome,
+                    outcomeIndex: idx,
+                    tokenId,
+                    amountUsd,
+                    addonWindow: params.addonWindow || null,
+                    addonRiskScore: params.addonRiskScore != null ? Number(params.addonRiskScore) : null,
+                    results: [{ success: false, orderId: null, tokenId, outcome, conditionId, errorMsg: errMsg }],
+                };
+                this.orderHistory.unshift(historyEntry);
+                this.schedulePersistOrderHistory();
+            } catch {}
+            if (!force && orderLockKey) {
+                this.cryptoAllOrderLocks.set(orderLockKey, { atMs: Date.now(), key: `${tf}:${upperSymbol}`, expiresAtMs, conditionId, status: 'failed' });
+            }
+            return { success: false, error: e?.message || String(e) };
+        } finally {
+            if (!force && orderLockKey && orderLockPlaced) {
+                const locked = this.cryptoAllOrderLocks.get(orderLockKey);
+                if (locked && locked.status === 'placing') {
+                    this.cryptoAllOrderLocks.set(orderLockKey, { ...locked, atMs: Date.now(), status: 'failed' });
+                }
+            }
+        }
+    }
+
     async refreshHistoryStatuses(options?: { maxEntries?: number; minIntervalMs?: number }): Promise<any[]> {
         const maxEntries = Number(options?.maxEntries ?? 20);
         const minIntervalMs = Number(options?.minIntervalMs ?? 1000);
@@ -4299,9 +9261,17 @@ export class GroupArbitrageScanner {
                     this.redeemInFlight.set(c.conditionId, inflight as any);
                     if (inflight.status === 'confirmed') {
                         try {
-                            const recipients = Array.isArray((inflight as any)?.payoutRecipients) && (inflight as any).payoutRecipients.length
-                                ? (inflight as any).payoutRecipients
-                                : [this.getFunderAddress()];
+                            const funder = this.getFunderAddress();
+                            const signer = this.tradingClient.getSignerAddress();
+                            const proxy = String(process.env.POLY_PROXY_ADDRESS || '').trim();
+                            const baseRecipients = Array.isArray((inflight as any)?.payoutRecipients)
+                                ? (inflight as any).payoutRecipients.map((x: any) => String(x || '').trim())
+                                : [];
+                            const recipients: string[] = Array.from(new Set<string>(baseRecipients
+                                .concat([funder, signer, proxy])
+                                .map((x: any) => String(x || '').trim())
+                                .filter((s: string) => s.startsWith('0x') && s.length >= 42)
+                            ));
                             const payout = await this.computeUsdcTransfersFromTxHash(txHash, { recipients });
                             (inflight as any).txStatus = payout.txStatus;
                             (inflight as any).payoutUsdc = payout.netUsdc;
@@ -4310,7 +9280,7 @@ export class GroupArbitrageScanner {
                             (inflight as any).payoutNetUsdc = payout.netUsdc;
                             (inflight as any).payoutRecipients = payout.recipients;
                             (inflight as any).usdcTransfers = payout.transfers;
-                            (inflight as any).paid = payout.txStatus === 0 ? false : Number(payout.netUsdc) > 0;
+                            (inflight as any).paid = payout.txStatus === 0 ? false : Number(payout.receivedUsdc) > 0;
                             (inflight as any).payoutComputedAt = new Date().toISOString();
                         } catch {
                         }

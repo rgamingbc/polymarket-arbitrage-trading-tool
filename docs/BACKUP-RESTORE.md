@@ -13,6 +13,11 @@
     auto-redeem.json
     relayer.json
     crypto15m-delta-thresholds.json
+    crypto15m-config.json
+    cryptoall2-delta-thresholds.json
+    cryptoall-delta-thresholds.json
+    crypto_all_2.json
+    crypto_all_v2.json
     pnl-snapshots.json
 
 ### 2) 服務配置（建議備份）
@@ -81,4 +86,3 @@ EC2 上執行：
 ## 備份保留建議
 
 簡單策略：本機保留最近 10 份，雲端 /var/backups/fktools 亦保留最近 3 份即可。
-

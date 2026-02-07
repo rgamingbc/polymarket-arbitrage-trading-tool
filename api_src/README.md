@@ -5,17 +5,17 @@ Polymarket API 后端服务，基于 Fastify 构建。
 ## 快速开始
 
 ```bash
-# 安装依赖
-pnpm install
+# 安装依赖（推荐：可复现）
+npm ci
 
 # 开发模式
-pnpm dev
+API_PORT=3001 npm run dev
 
 # 构建
-pnpm build
+npm run build
 
 # 生产模式
-pnpm start
+API_PORT=3001 npm run start
 ```
 
 ## API 端点
@@ -49,17 +49,17 @@ pnpm start
 
 | 路径 | 描述 |
 |------|------|
-| `ws://localhost:3000/ws/market/:conditionId` | 实时市场数据推送 |
+| `ws://localhost:3001/ws/market/:conditionId` | 实时市场数据推送 |
 
 ## 环境变量
 
 | 变量 | 默认值 | 描述 |
 |------|--------|------|
-| `API_PORT` | `3000` | API 端口 |
+| `API_PORT` | `3001` | API 端口 |
 | `API_HOST` | `0.0.0.0` | 监听地址 |
 | `CORS_ORIGIN` | `*` | CORS 来源 |
 | `POLY_PRIVKEY` | - | Polymarket 私钥（交易用） |
 
 ## API 文档
 
-启动服务后访问: http://localhost:3000/docs
+启动服务后访问: http://localhost:3001/docs
