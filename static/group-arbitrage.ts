@@ -2137,7 +2137,13 @@ export class GroupArbitrageScanner {
             'accept': 'application/json, text/plain, */*',
             'user-agent': 'Mozilla/5.0 (compatible; polymarket-tools/1.0)',
         };
-        const res = await fetch(url, { headers });
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 3_000);
+        const res = await this.withTimeout(
+            fetch(url, { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
+            3_500,
+            `Gamma fetch ${url}`
+        );
         if (!res.ok) {
             const retryAfter = res.headers?.get ? res.headers.get('retry-after') : null;
             const err: any = new Error(`Gamma API failed (${res.status})`);
@@ -2147,7 +2153,7 @@ export class GroupArbitrageScanner {
             }
             throw err;
         }
-        return await res.json();
+        return await this.withTimeout(res.json(), 2_000, `Gamma json ${url}`);
     }
 
     private tryParseJsonArray(raw: any): any[] {
@@ -2175,6 +2181,8 @@ export class GroupArbitrageScanner {
     }
 
     private async fetchCrypto15mSlugsFromSite(limit: number): Promise<string[]> {
+        const cached = (this as any).crypto15mSlugsCache as { atMs: number; slugs: string[] } | undefined;
+        if (cached && Date.now() - cached.atMs < 30_000) return cached.slugs.slice(0, limit);
         try {
             const headers: any = {
                 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -2183,16 +2191,24 @@ export class GroupArbitrageScanner {
                 'cache-control': 'no-cache',
                 'pragma': 'no-cache',
             };
-            const res = await fetch('https://polymarket.com/crypto/15M', { headers });
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 2_000);
+            const res = await this.withTimeout(
+                fetch('https://polymarket.com/crypto/15M', { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
+                2_500,
+                'Site crypto/15M'
+            );
             if (!res.ok) return [];
-            const html = await res.text();
+            const html = await this.withTimeout(res.text(), 2_000, 'Site crypto/15M html');
             const slugs: string[] = [];
             const re = /\/event\/([a-z0-9-]{6,})/gi;
             let m: RegExpExecArray | null;
             while ((m = re.exec(html)) && slugs.length < limit * 3) {
                 slugs.push(String(m[1]).toLowerCase());
             }
-            return Array.from(new Set(slugs)).slice(0, limit);
+            const uniq = Array.from(new Set(slugs));
+            (this as any).crypto15mSlugsCache = { atMs: Date.now(), slugs: uniq };
+            return uniq.slice(0, limit);
         } catch {
             return [];
         }
@@ -2220,6 +2236,9 @@ export class GroupArbitrageScanner {
     }
 
     private async fetchEventMarketFromSite(eventSlug: string): Promise<any | null> {
+        const cache = (this as any).crypto15mEventCache as Map<string, { atMs: number; market: any | null }> | undefined;
+        const c = cache?.get(eventSlug);
+        if (c && Date.now() - c.atMs < 60_000) return c.market;
         try {
             const url = `https://polymarket.com/event/${encodeURIComponent(eventSlug)}`;
             const headers: any = {
@@ -2229,13 +2248,25 @@ export class GroupArbitrageScanner {
                 'cache-control': 'no-cache',
                 'pragma': 'no-cache',
             };
-            const res = await fetch(url, { headers });
-            if (!res.ok) return null;
-            const html = await res.text();
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 2_000);
+            const res = await this.withTimeout(
+                fetch(url, { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
+                2_500,
+                `Site event ${eventSlug}`
+            );
+            if (!res.ok) {
+                if (!(this as any).crypto15mEventCache) (this as any).crypto15mEventCache = new Map();
+                (this as any).crypto15mEventCache.set(eventSlug, { atMs: Date.now(), market: null });
+                return null;
+            }
+            const html = await this.withTimeout(res.text(), 2_000, `Site event html ${eventSlug}`);
             const m = html.match(/id=\"__NEXT_DATA__\"[^>]*>([\s\S]*?)<\/script>/i);
             if (!m || !m[1]) return null;
             const data = JSON.parse(m[1]);
             const found = this.findObjectDeep(data, (x: any) => x?.slug === eventSlug && x?.conditionId && x?.outcomes && x?.outcomePrices && x?.clobTokenIds);
+            if (!(this as any).crypto15mEventCache) (this as any).crypto15mEventCache = new Map();
+            (this as any).crypto15mEventCache.set(eventSlug, { atMs: Date.now(), market: found });
             return found;
         } catch {
             return null;
@@ -2258,7 +2289,6 @@ export class GroupArbitrageScanner {
 
         const markets: any[] = [];
 
-        const slugs = await this.fetchCrypto15mSlugsFromSite(30);
         const priorityPrefixes = ['btc-updown-15m', 'eth-updown-15m', 'sol-updown-15m'];
         const nowSec = Math.floor(now / 1000);
         const getSymbolFromSlug = (slug: string): string | null => {
@@ -2276,35 +2306,53 @@ export class GroupArbitrageScanner {
             if (n < 1_500_000_000) return null;
             return Math.floor(n);
         };
-        const uniqueSlugs = Array.from(new Set(slugs));
-        const candidateSlugs = uniqueSlugs
-            .filter(s => priorityPrefixes.some(p => s.startsWith(p)))
-            .map(s => {
-                const startSec = parseStartSecFromSlug(s);
-                const endSec = startSec != null ? startSec + 15 * 60 : null;
-                return { slug: s, startSec, endSec };
-            })
-            .filter(x => x.endSec != null && (x.endSec as number) >= nowSec - 60)
-            .sort((a, b) => (a.endSec as number) - (b.endSec as number));
+        const baseStart = Math.floor(nowSec / (15 * 60)) * (15 * 60);
+        const starts = [baseStart - 15 * 60, baseStart, baseStart + 15 * 60, baseStart + 30 * 60];
+        const predictedSlugs = Array.from(new Set(priorityPrefixes.flatMap((p) => starts.map((s) => `${p}-${s}`))));
+        const orderedSlugs = predictedSlugs.slice(0, 12);
 
-        const picked: string[] = [];
-        for (const prefix of priorityPrefixes) {
-            const next = candidateSlugs.find(x => x.slug.startsWith(prefix) && (x.endSec as number) >= nowSec);
-            if (next) picked.push(next.slug);
-        }
-        const orderedSlugs = Array.from(new Set(picked.concat(candidateSlugs.slice(0, 6).map(x => x.slug)))).slice(0, 8);
-
-        for (const eventSlug of orderedSlugs) {
-            const m = await this.fetchEventMarketFromSite(eventSlug);
-            if (m) markets.push(m);
+        {
+            const settled = await Promise.allSettled(orderedSlugs.map((eventSlug) => this.fetchEventMarketFromSite(eventSlug)));
+            for (const r of settled) {
+                if (r.status !== 'fulfilled') continue;
+                if (r.value) markets.push(r.value);
+            }
         }
 
         if (!markets.length) {
-            const tagId = await this.resolveCryptoTagId();
-            const tagParam = tagId ? `&tag_id=${encodeURIComponent(tagId)}` : '';
-            const url = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&offset=0${tagParam}`;
-            const data = await this.fetchGammaJson(url);
-            if (Array.isArray(data)) markets.push(...data);
+            const slugs = await this.fetchCrypto15mSlugsFromSite(30);
+            const uniqueSlugs = Array.from(new Set(slugs));
+            const candidateSlugs = uniqueSlugs
+                .filter(s => priorityPrefixes.some(p => s.startsWith(p)))
+                .map(s => {
+                    const startSec = parseStartSecFromSlug(s);
+                    const endSec = startSec != null ? startSec + 15 * 60 : null;
+                    return { slug: s, startSec, endSec };
+                })
+                .filter(x => x.endSec != null && (x.endSec as number) >= nowSec - 60)
+                .sort((a, b) => (a.endSec as number) - (b.endSec as number));
+            const picked: string[] = [];
+            for (const prefix of priorityPrefixes) {
+                const next = candidateSlugs.find(x => x.slug.startsWith(prefix) && (x.endSec as number) >= nowSec);
+                if (next) picked.push(next.slug);
+            }
+            const slugs2 = Array.from(new Set(picked.concat(candidateSlugs.slice(0, 6).map(x => x.slug)))).slice(0, 8);
+            const settled = await Promise.allSettled(slugs2.map((eventSlug) => this.fetchEventMarketFromSite(eventSlug)));
+            for (const r of settled) {
+                if (r.status !== 'fulfilled') continue;
+                if (r.value) markets.push(r.value);
+            }
+        }
+
+        if (!markets.length) {
+            try {
+                const tagId = await this.withTimeout(this.resolveCryptoTagId(), 600, 'Crypto tag id');
+                const tagParam = tagId ? `&tag_id=${encodeURIComponent(tagId)}` : '';
+                const url = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&offset=0${tagParam}`;
+                const data = await this.withTimeout(this.fetchGammaJson(url), 1_500, 'Gamma markets');
+                if (Array.isArray(data)) markets.push(...data);
+            } catch {
+            }
         }
 
         const candidates: any[] = [];
@@ -2331,7 +2379,7 @@ export class GroupArbitrageScanner {
             const books = await Promise.allSettled(tokenIds.slice(0, 2).map((t: any) => {
                 const tokenId = String(t ?? '').trim();
                 if (!tokenId) return Promise.resolve(null as any);
-                return withRetry(() => this.sdk.clobApi.getOrderbook(tokenId), { maxRetries: 1 });
+                return this.withTimeout(withRetry(() => this.sdk.clobApi.getOrderbook(tokenId), { maxRetries: 1 }), 2_500, `CLOB orderbook ${tokenId}`);
             }));
             const prices = books.map((r: any) => {
                 if (r?.status !== 'fulfilled') return NaN;
@@ -2539,8 +2587,9 @@ export class GroupArbitrageScanner {
         return this.getCrypto15mStatus();
     }
 
-    async placeCrypto15mOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; source?: 'auto' | 'semi'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number }) {
-        if (!this.hasValidKey) throw new Error('Missing private key');
+    async placeCrypto15mOrder(params: { conditionId: string; outcomeIndex?: number; amountUsd?: number; minPrice?: number; force?: boolean; dryRun?: boolean; source?: 'auto' | 'semi'; symbol?: string; endDate?: string; secondsToExpire?: number; chosenPrice?: number }) {
+        const dryRun = params.dryRun === true;
+        if (!dryRun && !this.hasValidKey) throw new Error('Missing private key');
         const conditionId = String(params.conditionId || '').trim();
         if (!conditionId) throw new Error('Missing conditionId');
         const amountUsd = params.amountUsd != null ? Number(params.amountUsd) : this.crypto15mAutoConfig.amountUsd;
@@ -2553,7 +2602,7 @@ export class GroupArbitrageScanner {
         if (tokens.length < 2) throw new Error('Invalid market tokens');
         const idx = params.outcomeIndex != null ? Math.max(0, Math.min(tokens.length - 1, Math.floor(Number(params.outcomeIndex)))) : 0;
         const tok = tokens[idx];
-        const tokenId = String(tok?.token_id ?? tok?.tokenId ?? tok?.id ?? '').trim();
+        const tokenId = String(tok?.tokenId ?? tok?.token_id ?? tok?.id ?? '').trim();
         if (!tokenId) throw new Error('Missing tokenId');
         const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
         const ob = await withRetry(() => this.sdk.clobApi.getOrderbook(tokenId), { maxRetries: 1 }).catch(() => null);
@@ -2562,13 +2611,6 @@ export class GroupArbitrageScanner {
         if (!force && Number.isFinite(minPrice) && minPrice > 0 && (!Number.isFinite(price) || price < minPrice)) {
             throw new Error(`Price below threshold: bestAsk=${Number.isFinite(price) ? price : 'N/A'} < minPrice=${minPrice}`);
         }
-
-        const order = await this.tradingClient.createMarketOrder({
-            tokenId,
-            side: 'BUY',
-            amount: Math.max(0.5, amountUsd),
-            orderType: 'FOK',
-        });
 
         const marketSlug = String(market?.market_slug ?? market?.marketSlug ?? '');
         const q = String(market?.question || '');
@@ -2584,9 +2626,39 @@ export class GroupArbitrageScanner {
             }
         }
         const expiresAtMs = endDate ? Date.parse(endDate) : NaN;
-        if (symbol && symbol !== 'UNKNOWN') {
+        if (!dryRun && symbol && symbol !== 'UNKNOWN') {
             if (this.crypto15mActivesBySymbol.has(symbol)) throw new Error(`Crypto15m already has an active order for ${symbol}`);
         }
+        if (dryRun) {
+            const amt = Math.max(0.5, amountUsd);
+            return {
+                success: true,
+                dryRun: true,
+                check: {
+                    conditionId,
+                    symbol,
+                    slug: marketSlug || undefined,
+                    marketQuestion: market?.question,
+                    outcome,
+                    tokenId,
+                    bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                    price: Number.isFinite(price) ? price : null,
+                    minPrice: Number.isFinite(minPrice) ? minPrice : null,
+                    amountUsd: amt,
+                    side: 'BUY',
+                    orderType: 'FOK',
+                    endDate,
+                    expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : null,
+                },
+            };
+        }
+
+        const order = await this.tradingClient.createMarketOrder({
+            tokenId,
+            side: 'BUY',
+            amount: Math.max(0.5, amountUsd),
+            orderType: 'FOK',
+        });
 
         const entry = {
             id: Date.now(),

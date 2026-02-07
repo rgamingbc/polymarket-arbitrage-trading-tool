@@ -953,7 +953,10 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 properties: {
                     conditionId: { type: 'string' },
                     outcomeIndex: { type: 'number' },
-                    amountUsd: { type: 'number' }
+                    amountUsd: { type: 'number' },
+                    minPrice: { type: 'number' },
+                    force: { type: 'boolean' },
+                    dryRun: { type: 'boolean' }
                 },
                 required: ['conditionId']
             }
@@ -965,6 +968,9 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     conditionId: String(b.conditionId),
                     outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
                     amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    force: b.force === true,
+                    dryRun: b.dryRun === true,
                     source: 'semi',
                 });
                 return r;
