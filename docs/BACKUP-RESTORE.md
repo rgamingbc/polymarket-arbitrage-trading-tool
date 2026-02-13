@@ -10,6 +10,7 @@
 
 常見檔案會包括：
     history.json
+    follow-paper-history.json
     auto-redeem.json
     relayer.json
     crypto15m-delta-thresholds.json

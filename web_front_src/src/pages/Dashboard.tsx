@@ -1,8 +1,9 @@
 import { Card, Typography, Row, Col, Table, Tag, Button, Alert, Space, Switch, InputNumber, Tabs, Select, Input } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { createChart } from 'lightweight-charts';
 import api from '../api/client';
+import { AccountContext } from '../account/AccountContext';
 
 const { Title } = Typography;
 
@@ -38,6 +39,12 @@ const bucketStatus = (raw: any): Exclude<StatusFilter, 'all'> => {
 };
 
 export default function Dashboard() {
+    const { activeAccountId, setActiveAccountId } = useContext(AccountContext);
+    const [accounts, setAccounts] = useState<any[]>([]);
+    const [accountsLoading, setAccountsLoading] = useState(false);
+    const [createAccountName, setCreateAccountName] = useState('');
+    const [renameAccountName, setRenameAccountName] = useState('');
+
     const [history, setHistory] = useState<any[]>([]);
     const [openOrders, setOpenOrders] = useState<any[]>([]);
     const [trades, setTrades] = useState<any[]>([]);
@@ -60,7 +67,8 @@ export default function Dashboard() {
     const [setupSaveSuccess, setSetupSaveSuccess] = useState<string | null>(null);
     const [builderKeys, setBuilderKeys] = useState<any[]>(() => {
         try {
-            const raw = localStorage.getItem('builder_relayer_keys_v1');
+            const k = `builder_relayer_keys_v1:${activeAccountId || 'default'}`;
+            const raw = localStorage.getItem(k) || localStorage.getItem('builder_relayer_keys_v1');
             const parsed = raw ? JSON.parse(raw) : [];
             return Array.isArray(parsed) ? parsed : [];
         } catch {
@@ -94,10 +102,61 @@ export default function Dashboard() {
     const pnlChartRef = useRef<any>(null);
     const pnlSeriesRef = useRef<any>(null);
 
+    const accountPrefix = useMemo(() => (activeAccountId ? `/accounts/${activeAccountId}` : ''), [activeAccountId]);
+    const apiPath = (p: string) => `${accountPrefix}${p}`;
+
+    const fetchAccounts = async () => {
+        setAccountsLoading(true);
+        try {
+            const res = await api.get('/accounts');
+            const list = Array.isArray(res.data?.accounts) ? res.data.accounts : [];
+            setAccounts(list);
+            const ids = new Set(list.map((a: any) => String(a?.id || '').trim()).filter(Boolean));
+            const nextActive = ids.has(activeAccountId) ? activeAccountId : (list[0]?.id ? String(list[0].id) : 'default');
+            if (nextActive !== activeAccountId) setActiveAccountId(nextActive);
+        } finally {
+            setAccountsLoading(false);
+        }
+    };
+
+    const createAccount = async () => {
+        const name = String(createAccountName || '').trim();
+        const res = await api.post('/accounts', { name: name || undefined });
+        const acc = res.data?.account;
+        await fetchAccounts();
+        if (acc?.id) setActiveAccountId(String(acc.id));
+        setCreateAccountName('');
+    };
+
+    const renameActiveAccount = async () => {
+        const name = String(renameAccountName || '').trim();
+        if (!name) return;
+        await api.patch(`/accounts/${encodeURIComponent(activeAccountId)}`, { name });
+        await fetchAccounts();
+        setRenameAccountName('');
+    };
+
+    useEffect(() => {
+        fetchAccounts();
+    }, []);
+
+    useEffect(() => {
+        const acc = accounts.find((a: any) => String(a?.id || '') === String(activeAccountId || ''));
+        if (acc?.name != null) setRenameAccountName(String(acc.name));
+        try {
+            const k = `builder_relayer_keys_v1:${activeAccountId || 'default'}`;
+            const raw = localStorage.getItem(k) || (activeAccountId === 'default' ? localStorage.getItem('builder_relayer_keys_v1') : null);
+            const parsed = raw ? JSON.parse(raw) : [];
+            setBuilderKeys(Array.isArray(parsed) ? parsed : []);
+        } catch {
+            setBuilderKeys([]);
+        }
+    }, [activeAccountId, accounts]);
+
     const fetchPortfolio = async () => {
         setLoadingPortfolio(true);
         try {
-            const res = await api.get('/group-arb/portfolio-summary', { params: { positionsLimit: 50 } });
+            const res = await api.get(apiPath('/group-arb/portfolio-summary'), { params: { positionsLimit: 50 } });
             setPortfolio(res.data?.summary || null);
         } finally {
             setLoadingPortfolio(false);
@@ -107,7 +166,7 @@ export default function Dashboard() {
     const fetchHistory = async () => {
         setLoadingHistory(true);
         try {
-            const res = await api.get('/group-arb/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
+            const res = await api.get(apiPath('/group-arb/history'), { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
             setHistory(Array.isArray(res.data.history) ? res.data.history : []);
         } finally {
             setLoadingHistory(false);
@@ -117,7 +176,7 @@ export default function Dashboard() {
     const fetchOpenOrders = async () => {
         setLoadingOrders(true);
         try {
-            const res = await api.get('/group-arb/open-orders');
+            const res = await api.get(apiPath('/group-arb/open-orders'));
             setOpenOrders(Array.isArray(res.data.orders) ? res.data.orders : []);
         } finally {
             setLoadingOrders(false);
@@ -127,7 +186,7 @@ export default function Dashboard() {
     const fetchTrades = async () => {
         setLoadingTrades(true);
         try {
-            const res = await api.get('/group-arb/trades');
+            const res = await api.get(apiPath('/group-arb/trades'));
             setTrades(Array.isArray(res.data.trades) ? res.data.trades : []);
         } finally {
             setLoadingTrades(false);
@@ -137,7 +196,7 @@ export default function Dashboard() {
     const fetchPnl = async (r: Range) => {
         setLoadingPnl(true);
         try {
-            const res = await api.get('/group-arb/pnl', { params: { range: r } });
+            const res = await api.get(apiPath('/group-arb/pnl'), { params: { range: r } });
             setPnl(res.data);
         } catch {
             setPnl(null);
@@ -149,7 +208,7 @@ export default function Dashboard() {
     const fetchCashflow = async (r: Range) => {
         setLoadingCashflow(true);
         try {
-            const res = await api.get('/group-arb/performance', { params: { range: r } });
+            const res = await api.get(apiPath('/group-arb/performance'), { params: { range: r } });
             setCashflow(res.data);
         } catch {
             setCashflow(null);
@@ -161,7 +220,7 @@ export default function Dashboard() {
     const fetchRedeemStatus = async () => {
         setLoadingRedeem(true);
         try {
-            const res = await api.get('/group-arb/auto-redeem/status');
+            const res = await api.get(apiPath('/group-arb/auto-redeem/status'));
             setRedeemStatus(res.data);
             const cfg = res.data?.status?.config;
             if (cfg) {
@@ -177,14 +236,15 @@ export default function Dashboard() {
 
     const persistLocalBuilderKeys = (keys: any[]) => {
         try {
-            localStorage.setItem('builder_relayer_keys_v1', JSON.stringify(keys));
+            const k = `builder_relayer_keys_v1:${activeAccountId || 'default'}`;
+            localStorage.setItem(k, JSON.stringify(keys));
         } catch {
         }
     };
 
     const fetchRelayerStatus = async () => {
         try {
-            const res = await api.get('/group-arb/relayer/status');
+            const res = await api.get(apiPath('/group-arb/relayer/status'));
             const st = res.data?.status || null;
             setRelayerStatus(st);
             if (st?.relayerUrl) setRelayerUrl(String(st.relayerUrl));
@@ -196,7 +256,7 @@ export default function Dashboard() {
 
     const fetchSetupStatus = async () => {
         try {
-            const res = await api.get('/group-arb/setup/status');
+            const res = await api.get(apiPath('/group-arb/setup/status'));
             const st = res.data?.status || null;
             setSetupStatus(st);
             if (st?.proxyAddress != null) setSetupProxyAddress(String(st.proxyAddress || ''));
@@ -210,7 +270,7 @@ export default function Dashboard() {
         setSetupSaveError(null);
         setSetupSaveSuccess(null);
         try {
-            const res = await api.post('/group-arb/setup/config', { privateKey: setupPrivateKey || undefined, proxyAddress: setupProxyAddress || undefined });
+            const res = await api.post(apiPath('/group-arb/setup/config'), { privateKey: setupPrivateKey || undefined, proxyAddress: setupProxyAddress || undefined });
             setSetupStatus(res.data?.status || null);
             setSetupPrivateKey('');
             setSetupSaveSuccess('Saved and applied.');
@@ -237,7 +297,7 @@ export default function Dashboard() {
                 },
             ];
             const nextActive = nextKeys.length - 1;
-            const res = await api.post('/group-arb/relayer/config', {
+            const res = await api.post(apiPath('/group-arb/relayer/config'), {
                 keys: nextKeys,
                 activeIndex: nextActive,
                 relayerUrl: relayerUrl || undefined,
@@ -270,7 +330,7 @@ export default function Dashboard() {
         setRelayerSaveError(null);
         setRelayerSaveSuccess(null);
         try {
-            const res = await api.post('/group-arb/relayer/config', {
+            const res = await api.post(apiPath('/group-arb/relayer/config'), {
                 keys: builderKeys,
                 activeIndex: activeIndex != null ? activeIndex : builderActiveIndex,
                 relayerUrl: relayerUrl || undefined,
@@ -292,7 +352,7 @@ export default function Dashboard() {
         persistLocalBuilderKeys(next);
         if (builderActiveIndex >= next.length) setBuilderActiveIndex(Math.max(0, next.length - 1));
         try {
-            await api.post('/group-arb/relayer/config', { keys: next, activeIndex: Math.min(builderActiveIndex, Math.max(0, next.length - 1)), relayerUrl: relayerUrl || undefined, persist: true, testRedeem: false });
+            await api.post(apiPath('/group-arb/relayer/config'), { keys: next, activeIndex: Math.min(builderActiveIndex, Math.max(0, next.length - 1)), relayerUrl: relayerUrl || undefined, persist: true, testRedeem: false });
             await fetchRelayerStatus();
         } catch {
         }
@@ -315,7 +375,7 @@ export default function Dashboard() {
             fetchSetupStatus();
         }, 15000);
         return () => clearInterval(t);
-    }, []);
+    }, [activeAccountId]);
 
     useEffect(() => {
         if (!pnlChartElRef.current || pnlChartRef.current) return;
@@ -430,12 +490,45 @@ export default function Dashboard() {
     const topPortfolioValue = portfolio?.portfolioValue;
     const topCash = portfolio?.cash;
     const topProfitLoss = pnlMode === 'portfolio' ? Number(pnl?.profitLoss || 0) : Number(cashflow?.total?.netCashflow || 0);
+    const accountOptions = useMemo(() => {
+        const list = Array.isArray(accounts) ? accounts : [];
+        return list.map((a: any) => {
+            const id = String(a?.id || '').trim();
+            const name = String(a?.name || 'Account').trim();
+            const funder = a?.status?.funderAddress ? String(a.status.funderAddress) : '';
+            const tail = funder ? `${funder.slice(0, 6)}…${funder.slice(-4)}` : 'not configured';
+            return { value: id, label: `${name} (${tail})` };
+        });
+    }, [accounts]);
 
     return (
         <div style={{ padding: 24 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
                 <Title level={2} style={{ color: 'white', margin: 0 }}>Portfolio</Title>
-                <Button icon={<ReloadOutlined />} onClick={refreshAll}>Refresh</Button>
+                <Space size={8} wrap>
+                    <Select
+                        value={activeAccountId}
+                        loading={accountsLoading}
+                        style={{ minWidth: 260 }}
+                        options={accountOptions}
+                        onChange={(v) => setActiveAccountId(String(v))}
+                    />
+                    <Input
+                        placeholder="New account name"
+                        value={createAccountName}
+                        onChange={(e) => setCreateAccountName(e.target.value)}
+                        style={{ width: 180 }}
+                    />
+                    <Button onClick={createAccount} disabled={accountsLoading}>Add</Button>
+                    <Input
+                        placeholder="Rename account"
+                        value={renameAccountName}
+                        onChange={(e) => setRenameAccountName(e.target.value)}
+                        style={{ width: 180 }}
+                    />
+                    <Button onClick={renameActiveAccount} disabled={!renameAccountName.trim()}>Rename</Button>
+                    <Button icon={<ReloadOutlined />} onClick={refreshAll}>Refresh</Button>
+                </Space>
             </div>
 
             <Row gutter={16} style={{ marginBottom: 16 }}>
@@ -483,7 +576,7 @@ export default function Dashboard() {
                                     onClick={async () => {
                                         setLoadingRedeem(true);
                                         try {
-                                            await api.post('/group-arb/redeem-drain', { maxTotal: Math.max(1, Math.min(50, claimableCount || 1)) });
+                                            await api.post(apiPath('/group-arb/redeem-drain'), { maxTotal: Math.max(1, Math.min(50, claimableCount || 1)) });
                                             await Promise.all([fetchPortfolio(), fetchRedeemStatus(), fetchHistory()]);
                                         } finally {
                                             setLoadingRedeem(false);
@@ -611,7 +704,7 @@ export default function Dashboard() {
                                                             onClick={async () => {
                                                                 const idx = Number(r.index);
                                                                 setBuilderActiveIndex(idx);
-                                                                await api.post('/group-arb/relayer/active', { activeIndex: idx, persist: true });
+                                                                await api.post(apiPath('/group-arb/relayer/active'), { activeIndex: idx, persist: true });
                                                                 await fetchRelayerStatus();
                                                             }}
                                                         >
@@ -681,7 +774,7 @@ export default function Dashboard() {
                                     checked={autoRedeemEnabled}
                                     onChange={async (v) => {
                                         setAutoRedeemEnabled(v);
-                                        await api.post('/group-arb/auto-redeem/config', { enabled: v, maxPerCycle: autoRedeemMaxPerCycle });
+                                        await api.post(apiPath('/group-arb/auto-redeem/config'), { enabled: v, maxPerCycle: autoRedeemMaxPerCycle });
                                         await fetchRedeemStatus();
                                         await fetchHistory();
                                     }}
@@ -696,7 +789,7 @@ export default function Dashboard() {
                                 onClick={async () => {
                                     setLoadingRedeem(true);
                                     try {
-                                        await api.post('/group-arb/auto-redeem/config', { enabled: autoRedeemEnabled, maxPerCycle: autoRedeemMaxPerCycle });
+                                        await api.post(apiPath('/group-arb/auto-redeem/config'), { enabled: autoRedeemEnabled, maxPerCycle: autoRedeemMaxPerCycle });
                                         await fetchRedeemStatus();
                                     } finally {
                                         setLoadingRedeem(false);
@@ -711,7 +804,7 @@ export default function Dashboard() {
                                 onClick={async () => {
                                     setLoadingRedeem(true);
                                     try {
-                                        await api.post('/group-arb/redeem-drain', { maxTotal: autoRedeemMaxPerCycle });
+                                        await api.post(apiPath('/group-arb/redeem-drain'), { maxTotal: autoRedeemMaxPerCycle });
                                         await fetchRedeemStatus();
                                         await fetchHistory();
                                         await fetchPortfolio();

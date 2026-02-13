@@ -64,3 +64,13 @@ body {
   padding: 16px;
   border: 1px solid #333;
 }
+
+.compact-antd-table .ant-table-thead > tr > th,
+.compact-antd-table .ant-table-tbody > tr > td {
+  padding: 4px 6px !important;
+}
+
+.compact-antd-table .ant-tag {
+  margin-inline-end: 4px !important;
+  line-height: 16px !important;
+}

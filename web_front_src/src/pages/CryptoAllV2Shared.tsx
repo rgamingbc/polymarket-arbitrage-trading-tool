@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Card, Checkbox, InputNumber, Modal, Select, Space, Table, Tag, Tooltip, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import axios from 'axios';
+import { useAccountApiPath } from '../api/apiPath';
 
 const { Title } = Typography;
 
@@ -26,6 +27,28 @@ const TF_OPTIONS = [
 
 export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryptoall2'; title: string; storageKey: string }) {
     const { strategy, title, storageKey } = props;
+    const apiPath = useAccountApiPath();
+    const abortersRef = useRef<Map<string, AbortController>>(new Map());
+    const apiGet = useCallback((key: string, p: string, config?: any) => {
+        const prev = abortersRef.current.get(key);
+        if (prev) prev.abort();
+        const controller = new AbortController();
+        abortersRef.current.set(key, controller);
+        return api.get(apiPath(p), { ...(config || {}), signal: controller.signal }).finally(() => {
+            const cur = abortersRef.current.get(key);
+            if (cur === controller) abortersRef.current.delete(key);
+        });
+    }, [apiPath]);
+    const apiPost = useCallback((key: string, p: string, data?: any, config?: any) => {
+        const prev = abortersRef.current.get(key);
+        if (prev) prev.abort();
+        const controller = new AbortController();
+        abortersRef.current.set(key, controller);
+        return api.post(apiPath(p), data, { ...(config || {}), signal: controller.signal }).finally(() => {
+            const cur = abortersRef.current.get(key);
+            if (cur === controller) abortersRef.current.delete(key);
+        });
+    }, [apiPath]);
     const [candidates, setCandidates] = useState<any[]>([]);
     const [status, setStatus] = useState<any>(null);
     const [watchdog, setWatchdog] = useState<any>(null);
@@ -181,13 +204,13 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     }, [status, pollMs, minProb, expiresWithinSec, amountUsd, symbols, splitBuyEnabled, splitBuyPct3m, splitBuyPct2m, splitBuyPct1m, dojiGuardEnabled, riskSkipScore, stoplossEnabled, adaptiveDeltaEnabled]);
 
     const fetchStatus = async () => {
-        const res = await api.get(`/group-arb/${strategy}/status`);
+        const res = await apiGet('status', `/group-arb/${strategy}/status`);
         const data = res.data || null;
         setStatus(data?.status ?? data);
     };
 
     const fetchWatchdog = async () => {
-        const r = await api.get('/group-arb/crypto15m/watchdog/status');
+        const r = await apiGet('watchdog', '/group-arb/crypto15m/watchdog/status');
         const data = r.data || null;
         setWatchdog(data?.status ?? data);
     };
@@ -196,7 +219,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
         setReportOpen(true);
         setReportLoading(true);
         try {
-            const r = await api.get('/group-arb/crypto15m/watchdog/report/latest');
+            const r = await apiGet('report', '/group-arb/crypto15m/watchdog/report/latest');
             const md = r.data?.md ?? '';
             const json = r.data?.json ?? null;
             setReportText(md || (json ? JSON.stringify(json, null, 2) : ''));
@@ -206,9 +229,10 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     };
 
     const fetchCandidates = async () => {
-        const res = await api.get(`/group-arb/${strategy}/candidates`, {
+        const res = await apiGet('candidates', `/group-arb/${strategy}/candidates`, {
             params: {
                 symbols: symbols.join(','),
+                timeframes: TF_OPTIONS.map((t) => t.value).join(','),
                 minProb,
                 expiresWithinSec,
                 limit: 40,
@@ -222,8 +246,44 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
         }
     };
 
+    const matrixRows = useMemo(() => {
+        const list = Array.isArray(candidates) ? candidates : [];
+        const byKey = new Map<string, any>();
+        for (const c of list) {
+            const sym = String(c?.symbol || '').toUpperCase();
+            const tf = String(c?.timeframe || '15m');
+            if (!sym) continue;
+            const key = `${sym}:${tf}`;
+            const prev = byKey.get(key);
+            const sec = Number(c?.secondsToExpire);
+            const prevSec = prev?.secondsToExpire != null ? Number(prev.secondsToExpire) : NaN;
+            if (!prev || (Number.isFinite(sec) && (!Number.isFinite(prevSec) || sec < prevSec))) {
+                byKey.set(key, c);
+            }
+        }
+        const rows: any[] = [];
+        for (const s of SYMBOL_OPTIONS) {
+            for (const t of TF_OPTIONS) {
+                const key = `${s.value}:${t.value}`;
+                const c = byKey.get(key) || null;
+                rows.push({
+                    key,
+                    symbol: s.value,
+                    timeframe: t.value,
+                    secondsToExpire: c?.secondsToExpire ?? null,
+                    chosenOutcome: c?.chosenOutcome ?? null,
+                    chosenPrice: c?.chosenPrice ?? null,
+                    riskScore: c?.riskScore ?? null,
+                    slug: c?.slug ?? null,
+                    conditionId: c?.conditionId ?? null,
+                });
+            }
+        }
+        return rows;
+    }, [candidates]);
+
     const fetchHistory = async () => {
-        const res = await api.get(`/group-arb/${strategy}/history`, { params: { refresh: true, intervalMs: 1000, maxEntries: 50, includeSkipped: showSkipped } });
+        const res = await apiGet('history', `/group-arb/${strategy}/history`, { params: { refresh: true, intervalMs: 1000, maxEntries: 50, includeSkipped: showSkipped } });
         const h = Array.isArray(res.data?.history) ? res.data.history : [];
         setHistory(h.map((x: any) => ({ ...x, strategy })));
         setHistorySummary(res.data?.summary || null);
@@ -233,7 +293,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const fetchStoplossHistory = async () => {
         setStoplossLoading(true);
         try {
-            const res = await api.get(`/group-arb/${strategy}/stoploss/history`, { params: { maxEntries: 200 } });
+            const res = await apiGet('stoploss', `/group-arb/${strategy}/stoploss/history`, { params: { maxEntries: 200 } });
             const h = Array.isArray(res.data?.history) ? res.data.history : [];
             setStoplossHistory(h);
             setStoplossSummary(res.data?.summary || null);
@@ -250,7 +310,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onPersistConfig = async () => {
         setThresholdsSaving(true);
         try {
-            await api.post(`/group-arb/${strategy}/config`, {
+            await apiPost('config', `/group-arb/${strategy}/config`, {
                 pollMs,
                 expiresWithinSec,
                 minProb,
@@ -285,7 +345,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onStart = async () => {
         setStartLoading(true);
         try {
-            const res = await api.post(`/group-arb/${strategy}/auto/start`, {
+            const res = await apiPost('auto_start', `/group-arb/${strategy}/auto/start`, {
                 pollMs,
                 expiresWithinSec,
                 minProb,
@@ -320,7 +380,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onStop = async () => {
         setStopLoading(true);
         try {
-            const res = await api.post(`/group-arb/${strategy}/auto/stop`, {});
+            const res = await apiPost('auto_stop', `/group-arb/${strategy}/auto/stop`, {});
             setStatus(res.data || null);
         } finally {
             setStopLoading(false);
@@ -330,7 +390,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onQuickRefresh = async () => {
         setRefreshLoading(true);
         try {
-            await Promise.all([
+            await Promise.allSettled([
                 fetchStatus(),
                 fetchCandidates(),
                 fetchHistory(),
@@ -344,7 +404,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onSaveThresholds = async () => {
         setThresholdsSaving(true);
         try {
-            await api.post(`/group-arb/${strategy}/delta-thresholds`, {
+            await apiPost('thresholds_save', `/group-arb/${strategy}/delta-thresholds`, {
                 btcMinDelta,
                 ethMinDelta,
                 solMinDelta,
@@ -359,7 +419,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const fetchThresholds = async () => {
         setThresholdsLoading(true);
         try {
-            const res = await api.get(`/group-arb/${strategy}/delta-thresholds`);
+            const res = await apiGet('thresholds', `/group-arb/${strategy}/delta-thresholds`);
             const t = res.data?.thresholds || {};
             if (t.btcMinDelta != null) setBtcMinDelta(Number(t.btcMinDelta));
             if (t.ethMinDelta != null) setEthMinDelta(Number(t.ethMinDelta));
@@ -373,7 +433,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onStartWatchdog = async () => {
         setWatchdogStartLoading(true);
         try {
-            await api.post('/group-arb/crypto15m/watchdog/start', { durationHours: 12, pollMs: 30000 });
+            await apiPost('watchdog_start', '/group-arb/crypto15m/watchdog/start', { durationHours: 12, pollMs: 30000 });
             await fetchWatchdog();
         } finally {
             setWatchdogStartLoading(false);
@@ -383,7 +443,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     const onStopWatchdog = async () => {
         setWatchdogStopLoading(true);
         try {
-            await api.post('/group-arb/crypto15m/watchdog/stop', { reason: 'manual_ui_stop', stopAuto: false });
+            await apiPost('watchdog_stop', '/group-arb/crypto15m/watchdog/stop', { reason: 'manual_ui_stop', stopAuto: false });
             await fetchWatchdog();
         } finally {
             setWatchdogStopLoading(false);
@@ -396,7 +456,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
         const outcomeIndex = row?.chosenIndex != null ? Number(row.chosenIndex) : (row?.chosenOutcome === 'Down' ? 1 : 0);
         setBidLoadingId(conditionId);
         try {
-            await api.post(`/group-arb/${strategy}/order`, {
+            await apiPost('order', `/group-arb/${strategy}/order`, {
                 conditionId,
                 outcomeIndex,
                 amountUsd,
@@ -423,6 +483,20 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
     };
 
     useEffect(() => {
+        for (const c of abortersRef.current.values()) {
+            try { c.abort(); } catch {}
+        }
+        abortersRef.current.clear();
+        candidatesSigRef.current = '';
+        setCandidates([]);
+        setStatus(null);
+        setWatchdog(null);
+        setHistory([]);
+        setConfigEvents([]);
+        setHistorySummary(null);
+        setStoplossHistory([]);
+        setStoplossSummary(null);
+        setReportText('');
         onQuickRefresh().catch(() => {});
         fetchThresholds().catch(() => {});
         if (timerRef.current) clearInterval(timerRef.current);
@@ -436,7 +510,7 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
         return () => {
             try { if (timerRef.current) clearInterval(timerRef.current); } catch {}
         };
-    }, [autoRefresh, pollMs, strategy]);
+    }, [apiPath, autoRefresh, pollMs, strategy]);
 
     const columns = useMemo(() => {
         return [
@@ -510,7 +584,18 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
                             <InputNumber min={500} step={100} value={pollMs} onChange={(v) => setPollMs(Math.max(500, Math.floor(Number(v) || 2000)))} />
                         </Tooltip>
                         <Tooltip title="Min probability">
-                            <InputNumber min={0} max={1} step={0.01} value={minProb} onChange={(v) => setMinProb(Math.max(0, Math.min(1, Number(v) || 0.9)))} />
+                            <InputNumber
+                                min={0.001}
+                                max={0.999}
+                                step={0.001}
+                                precision={3}
+                                value={minProb}
+                                onChange={(v) => {
+                                    const n = Number(v);
+                                    if (!Number.isFinite(n)) return;
+                                    setMinProb(Math.max(0.001, Math.min(0.999, Math.round(n * 1000) / 1000)));
+                                }}
+                            />
                         </Tooltip>
                         <Tooltip title="Seconds to expiry (<=)">
                             <InputNumber min={10} max={9999} step={1} value={expiresWithinSec} onChange={(v) => setExpiresWithinSec(Math.max(10, Math.floor(Number(v) || 180)))} />
@@ -580,6 +665,8 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
                         columns={columns as any}
                         dataSource={candidates}
                         pagination={{ pageSize: 20 }}
+                        virtual
+                        scroll={{ y: 420 }}
                     />
                 </Card>
 
@@ -612,6 +699,8 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
                         size="small"
                         dataSource={history}
                         pagination={{ pageSize: 20 }}
+                        virtual
+                        scroll={{ y: 520 }}
                         columns={[
                             { title: 'At', dataIndex: 'timestamp', key: 'timestamp', width: 180, render: (v: any) => <Tag>{String(v || '-')}</Tag> },
                             { title: 'Action', dataIndex: 'action', key: 'action', width: 140, render: (v: any) => <Tag>{String(v || '-')}</Tag> },
@@ -643,6 +732,8 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
                         loading={stoplossLoading}
                         dataSource={stoplossHistory}
                         pagination={{ pageSize: 20 }}
+                        virtual
+                        scroll={{ y: 520 }}
                         columns={[
                             { title: 'At', dataIndex: 'timestamp', key: 'timestamp', width: 180, render: (v: any) => <Tag>{String(v || '-')}</Tag> },
                             { title: 'Symbol', dataIndex: 'symbol', key: 'symbol', width: 80, render: (v: any) => <Tag>{String(v || '-')}</Tag> },
@@ -670,11 +761,30 @@ export default function CryptoAllV2Shared(props: { strategy: 'cryptoall' | 'cryp
                         {TF_OPTIONS.map((t) => <Tag key={t.value}>{t.value}</Tag>)}
                     </Space>
                     <Table
-                        rowKey={(r: any) => String(r?.conditionId || '') + ':' + String(r?.chosenTokenId || '')}
+                        rowKey={(r: any) => String(r?.key || '')}
                         size="small"
-                        dataSource={candidates}
-                        pagination={{ pageSize: 50 }}
-                        columns={columns as any}
+                        dataSource={matrixRows}
+                        pagination={false}
+                        tableLayout="fixed"
+                        scroll={{ x: 900 }}
+                        columns={[
+                            { title: 'Symbol', dataIndex: 'symbol', key: 'symbol', width: 90, render: (v: any) => <Tag>{String(v || '-')}</Tag> },
+                            { title: 'TF', dataIndex: 'timeframe', key: 'timeframe', width: 70, render: (v: any) => <Tag>{String(v || '15m')}</Tag> },
+                            { title: 'Expire(s)', dataIndex: 'secondsToExpire', key: 'secondsToExpire', width: 95, render: (v: any) => v != null ? <Tag color={Number(v) <= 60 ? 'red' : Number(v) <= 180 ? 'orange' : 'green'}>{Number(v) || 0}</Tag> : <Tag>-</Tag> },
+                            { title: 'Pick', dataIndex: 'chosenOutcome', key: 'chosenOutcome', width: 80, render: (v: any) => v ? <Tag color={String(v) === 'Down' ? 'red' : 'green'}>{String(v)}</Tag> : <Tag>-</Tag> },
+                            { title: 'Price', dataIndex: 'chosenPrice', key: 'chosenPrice', width: 90, render: (v: any) => v != null ? <Tag>{Number(v).toFixed(4)}</Tag> : <Tag>-</Tag> },
+                            { title: 'Risk', dataIndex: 'riskScore', key: 'riskScore', width: 85, render: (v: any) => v != null ? <Tag color={Number(v) >= 70 ? 'red' : Number(v) >= 50 ? 'orange' : 'green'}>{Number(v)}</Tag> : <Tag>-</Tag> },
+                            {
+                                title: 'Market',
+                                key: 'market',
+                                render: (_: any, r: any) => {
+                                    const slug = String(r?.slug || '').trim();
+                                    const cid = String(r?.conditionId || '').trim();
+                                    if (slug) return <a href={`https://polymarket.com/event/${encodeURIComponent(slug)}`} target="_blank" rel="noreferrer">{slug}</a>;
+                                    return cid ? <Tooltip title={cid}><Tag>ID</Tag></Tooltip> : '-';
+                                }
+                            }
+                        ]}
                     />
                 </Modal>
             </Space>

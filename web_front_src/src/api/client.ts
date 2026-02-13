@@ -57,4 +57,99 @@ export const versionApi = {
     getVersion: () => api.get('/version'),
 };
 
+export const followActivityApi = {
+    confirm: (config: {
+        address: string;
+        limit?: number;
+        queryMode?: 'user' | 'proxyWallet' | 'auto';
+        types?: string[];
+        sides?: string[];
+        includeKeywords?: string[];
+        excludeKeywords?: string[];
+        ratio?: number;
+        maxUsdcPerOrder?: number;
+        maxUsdcPerDay?: number;
+    }) => api.post('/follow-activity/confirm', config),
+    start: (config: {
+        address: string;
+        pollMs?: number;
+        limit?: number;
+        queryMode?: 'user' | 'proxyWallet' | 'auto';
+        types?: string[];
+        sides?: string[];
+        includeKeywords?: string[];
+        excludeKeywords?: string[];
+        ratio?: number;
+        maxUsdcPerOrder?: number;
+        maxUsdcPerDay?: number;
+    }) => api.post('/follow-activity/start', config),
+    stop: () => api.post('/follow-activity/stop'),
+    getStatus: () => api.get('/follow-activity/status'),
+    getActivities: (limit = 100, beforeTs?: number | null) => api.get(`/follow-activity/activities?limit=${limit}${beforeTs != null ? `&beforeTs=${encodeURIComponent(String(beforeTs))}` : ''}`),
+    getSuggestions: (limit = 100, beforeAt?: number | null) => api.get(`/follow-activity/suggestions?limit=${limit}${beforeAt != null ? `&beforeAt=${encodeURIComponent(String(beforeAt))}` : ''}`),
+    getActivitiesPage: (params: { address: string; limit?: number; offset?: number; queryMode?: 'user' | 'proxyWallet' | 'auto' }) => {
+        const limit = params.limit != null ? Number(params.limit) : 100;
+        const offset = params.offset != null ? Number(params.offset) : 0;
+        const queryMode = params.queryMode || 'auto';
+        return api.get(`/follow-activity/activities?address=${encodeURIComponent(params.address)}&limit=${limit}&offset=${offset}&queryMode=${encodeURIComponent(queryMode)}`);
+    },
+    getSuggestionsPage: (params: {
+        address: string;
+        limit?: number;
+        offset?: number;
+        queryMode?: 'user' | 'proxyWallet' | 'auto';
+        types?: string[];
+        sides?: string[];
+        includeKeywords?: string[];
+        excludeKeywords?: string[];
+        ratio?: number;
+        maxUsdcPerOrder?: number;
+        maxUsdcPerDay?: number;
+    }) => {
+        const limit = params.limit != null ? Number(params.limit) : 100;
+        const offset = params.offset != null ? Number(params.offset) : 0;
+        const queryMode = params.queryMode || 'auto';
+        const q = new URLSearchParams();
+        q.set('address', params.address);
+        q.set('limit', String(limit));
+        q.set('offset', String(offset));
+        q.set('queryMode', queryMode);
+        for (const t of (Array.isArray(params.types) ? params.types : [])) q.append('types', String(t));
+        for (const s of (Array.isArray(params.sides) ? params.sides : [])) q.append('sides', String(s));
+        for (const k of (Array.isArray(params.includeKeywords) ? params.includeKeywords : [])) q.append('includeKeywords', String(k));
+        for (const k of (Array.isArray(params.excludeKeywords) ? params.excludeKeywords : [])) q.append('excludeKeywords', String(k));
+        if (params.ratio != null) q.set('ratio', String(params.ratio));
+        if (params.maxUsdcPerOrder != null) q.set('maxUsdcPerOrder', String(params.maxUsdcPerOrder));
+        if (params.maxUsdcPerDay != null) q.set('maxUsdcPerDay', String(params.maxUsdcPerDay));
+        return api.get(`/follow-activity/suggestions?${q.toString()}`);
+    },
+    getAutoTradeStatus: () => api.get('/follow-activity/autotrade/status'),
+    updateAutoTradeConfig: (config: {
+        enabled?: boolean;
+        mode?: 'queue' | 'auto';
+        executionStyle?: 'copy' | 'sweep';
+        allowConditionIds?: string[];
+        denyConditionIds?: string[];
+        allowCategories?: string[];
+        priceBufferCents?: number;
+        maxOrdersPerHour?: number;
+        paperTradeEnabled?: boolean;
+        paperFillRule?: 'touch' | 'sweep';
+        paperBookLevels?: number;
+        paperMinFillPct?: number;
+        sweepPriceCapCents?: number;
+        sweepMinTriggerCents?: number;
+        sweepMaxUsdcPerEvent?: number;
+        sweepMaxOrdersPerEvent?: number;
+        sweepMinIntervalMs?: number;
+    }) => api.post('/follow-activity/autotrade/config', config),
+    getAutoTradePending: (limit = 200) => api.get(`/follow-activity/autotrade/pending?limit=${limit}`),
+    clearAutoTradePending: (keep = 50) => api.post('/follow-activity/autotrade/pending/clear', { keep }),
+    executeAutoTradePending: (id: string) => api.post(`/follow-activity/autotrade/pending/${encodeURIComponent(id)}/execute`),
+    getAutoTradeHistory: (limit = 200) => api.get(`/follow-activity/autotrade/history?limit=${limit}`),
+    getPaperTradeStatus: () => api.get('/follow-activity/autotrade/paper/status'),
+    getPaperTradeHistory: (limit = 200) => api.get(`/follow-activity/autotrade/paper/history?limit=${limit}`),
+    clearPaperTradeHistory: (keep = 50) => api.post('/follow-activity/autotrade/paper/clear', { keep }),
+};
+
 export default api;

@@ -16,6 +16,8 @@ import { groupArbRoutes } from './routes/group-arb.js';
 import { thetaFarmerRoutes } from './routes/theta-farmer.js';
 import { walletRoutes } from './routes/wallets.js';
 import { whaleDiscoveryRoutes } from './routes/whale-discovery.js';
+import { followActivityRoutes } from './routes/follow-activity.js';
+import { accountsRoutes } from './routes/accounts.js';
 import { realtimeRoutes } from './websocket/realtime.js';
 import { API_VERSION } from './version.js';
 
@@ -50,6 +52,7 @@ export async function buildApp(): Promise<FastifyInstance> {
                 { name: '套利', description: '套利检测接口' },
                 { name: '钱包', description: '钱包分析接口' },
                 { name: '鲸鱼发现', description: '链上鲸鱼发现接口' },
+                { name: '跟單', description: '跟单追踪与建议' },
             ],
         },
     });
@@ -78,10 +81,13 @@ export async function buildApp(): Promise<FastifyInstance> {
     // 注册路由
     await app.register(marketRoutes, { prefix: '/api/markets' });
     await app.register(arbitrageRoutes, { prefix: '/api/arbitrage' });
+    await app.register(accountsRoutes, { prefix: '/api/accounts' });
     await app.register(groupArbRoutes, { prefix: '/api/group-arb' });
+    await app.register(groupArbRoutes, { prefix: '/api/accounts/:accountId/group-arb' });
     await app.register(thetaFarmerRoutes, { prefix: '/api/theta' });
     await app.register(walletRoutes, { prefix: '/api/wallets' });
     await app.register(whaleDiscoveryRoutes, { prefix: '/api/whale' });
+    await app.register(followActivityRoutes, { prefix: '/api/follow-activity' });
     await app.register(realtimeRoutes, { prefix: '/ws' });
 
     return app;

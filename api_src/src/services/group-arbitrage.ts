@@ -11,6 +11,9 @@ import { createWalletClient, http, encodeFunctionData, parseAbi, type Hex } from
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { computeAskDepthUsd } from '../utils/orderbook-depth.js';
+import { buildOrderbookSnapshot } from '../utils/orderbook-replay.js';
+import { runSweepBuyLive, runSweepBuyLiveBurst } from './sweep-buy.js';
+import { getSharedMarketData, type SharedMarketData } from './shared-market-data.js';
 
 export interface GroupArbOpportunity {
     marketId: string;
@@ -93,6 +96,10 @@ export class GroupArbitrageScanner {
     private orderStatusCache: Map<string, { updatedAtMs: number; data: any }> = new Map();
     private systemCanceledOrderIds: Set<string> = new Set();
     private marketMetaCache: Map<string, { title?: string; slug?: string; eventSlug?: string }> = new Map();
+    private dataApiPositionsCache: Map<string, { atMs: number; data: any[] }> = new Map();
+    private dataApiPositionsInFlight: Map<string, Promise<any[]>> = new Map();
+    private dataApiValueCache: Map<string, { atMs: number; value: number }> = new Map();
+    private dataApiValueInFlight: Map<string, Promise<number>> = new Map();
     private pnlSnapshots: Array<{ ts: number; equity: number; cash: number; positionsValue: number }> = [];
     private pnlTimer: any = null;
     private pnlPersistencePath: string;
@@ -110,6 +117,7 @@ export class GroupArbitrageScanner {
     private autoRedeemConfigPersistedAt: string | null = null;
     private autoRedeemConfigPersistLastError: string | null = null;
     private crypto15mAutoEnabled = false;
+    private crypto15mAutoDryRun = false;
     private crypto15mAutoTimer: any = null;
     private crypto15mAutoInFlight = false;
     private crypto15mAutoConfigPath: string | null = null;
@@ -122,6 +130,11 @@ export class GroupArbitrageScanner {
         minProb: number;
         amountUsd: number;
         buySizingMode: 'fixed' | 'orderbook_max' | 'all_capital';
+        sweepEnabled: boolean;
+        sweepWindowSec: number;
+        sweepMaxOrdersPerMarket: number;
+        sweepMaxTotalUsdPerMarket: number;
+        sweepMinIntervalMs: number;
         trendEnabled: boolean;
         trendMinutes: number;
         staleMsThreshold: number;
@@ -140,6 +153,11 @@ export class GroupArbitrageScanner {
         minProb: 0.9,
         amountUsd: 1,
         buySizingMode: 'fixed',
+        sweepEnabled: true,
+        sweepWindowSec: 30,
+        sweepMaxOrdersPerMarket: 10,
+        sweepMaxTotalUsdPerMarket: 600,
+        sweepMinIntervalMs: 400,
         trendEnabled: true,
         trendMinutes: 1,
         staleMsThreshold: 5_000,
@@ -159,6 +177,7 @@ export class GroupArbitrageScanner {
     private crypto15mLastCandidateStats: any = null;
     private crypto15mLastOrderAttempt: any = null;
     private crypto15mOrderLocks: Map<string, { atMs: number; symbol: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
+    private crypto15mSweepStateByConditionId: Map<string, { conditionId: string; symbol: string; expiresAtMs: number; ordersCount: number; totalUsd: number; lastOrderAtMs: number }> = new Map();
     private crypto15mDeltaThresholdsPath: string | null = null;
     private crypto15mDeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
         btcMinDelta: 600,
@@ -230,20 +249,99 @@ export class GroupArbitrageScanner {
         issues: [],
         reportPaths: {},
     };
+    private crypto15mHedgeAutoEnabled = false;
+    private crypto15mHedgeAutoTimer: any = null;
+    private crypto15mHedgeAutoInFlight = false;
+    private crypto15mHedgeLastScanAt: string | null = null;
+    private crypto15mHedgeLastError: string | null = null;
+    private crypto15mHedgeLastDecision: any = null;
+    private crypto15mHedgeLastOrderAttempt: any = null;
+    private crypto15mHedgeConfigPath: string | null = null;
+    private crypto15mHedgeConfigLoadedAt: string | null = null;
+    private crypto15mHedgeConfigPersistedAt: string | null = null;
+    private crypto15mHedgeConfigPersistLastError: string | null = null;
+    private crypto15mHedgeActivesBySymbol: Map<string, any> = new Map();
+    private crypto15mHedgeTrackedByCondition: Map<string, any> = new Map();
+    private crypto15mHedgeOrderLocks: Map<string, { atMs: number; symbol: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
+    private crypto15mHedgeAttemptLogState: Map<string, { atMs: number; reason: string }> = new Map();
+    private crypto15mHedgeAutoConfig: {
+        pollMs: number;
+        expiresWithinSec: number;
+        minProb: number;
+        amountUsd: number;
+        entryRemainingMinSec: number;
+        entryRemainingMaxSec: number;
+        entryCheapMinCents: number;
+        entryCheapMaxCents: number;
+        targetProfitCents: number;
+        profitDecayEnabled: boolean;
+        profitDecayMode: 'linear' | 'per_minute';
+        profitDecayPerMinCents: number;
+        profitStartCents: number;
+        profitEndCents: number;
+        profitDecayStartSec: number;
+        profitDecayEndSec: number;
+        profitStepCents: number;
+        mode: 'conservative' | 'balanced' | 'aggressive';
+        bufferCents: number;
+        maxSpreadCents: number;
+        minDepthPct: number;
+        minSecToHedge: number;
+        hedgeIgnoreSpread: boolean;
+        panicHedgeEnabled: boolean;
+        panicHedgeStartSec: number;
+        panicMaxLossCents: number;
+    } = {
+        pollMs: 2_000,
+        expiresWithinSec: 900,
+        minProb: 0,
+        amountUsd: 200,
+        entryRemainingMinSec: 480,
+        entryRemainingMaxSec: 900,
+        entryCheapMinCents: 8,
+        entryCheapMaxCents: 15,
+        targetProfitCents: 10,
+        profitDecayEnabled: false,
+        profitDecayMode: 'linear',
+        profitDecayPerMinCents: 1,
+        profitStartCents: 10,
+        profitEndCents: 9,
+        profitDecayStartSec: 300,
+        profitDecayEndSec: 60,
+        profitStepCents: 0.1,
+        mode: 'balanced',
+        bufferCents: 1.5,
+        maxSpreadCents: 3,
+        minDepthPct: 70,
+        minSecToHedge: 90,
+        hedgeIgnoreSpread: false,
+        panicHedgeEnabled: false,
+        panicHedgeStartSec: 120,
+        panicMaxLossCents: 20,
+    };
     private crypto15mActivesBySymbol: Map<string, any> = new Map();
     private crypto15mTrackedByCondition: Map<string, any> = new Map();
     private crypto15mCooldownUntilBySymbol: Map<string, number> = new Map();
     private crypto15mBeatCache: Map<string, { atMs: number; priceToBeat: number | null; currentPrice: number | null; deltaAbs: number | null; error: string | null }> = new Map();
     private crypto15mCryptoTagId: string | null = null;
     private crypto15mNextScanAllowedAtMs = 0;
-    private crypto15mMarketSnapshot: { atMs: number; markets: any[]; lastError: string | null } = { atMs: 0, markets: [], lastError: null };
-    private crypto15mBooksSnapshot: { atMs: number; byTokenId: Record<string, any>; lastError: string | null; lastAttemptAtMs: number; lastAttemptError: string | null } = { atMs: 0, byTokenId: {}, lastError: null, lastAttemptAtMs: 0, lastAttemptError: null };
-    private crypto15mMarketInFlight: Promise<void> | null = null;
-    private crypto15mBooksInFlight: Promise<void> | null = null;
-    private crypto15mMarketBackoffMs = 0;
-    private crypto15mMarketNextAllowedAtMs = 0;
-    private crypto15mBooksBackoffMs = 0;
-    private crypto15mBooksNextAllowedAtMs = 0;
+    private sharedMarketData: SharedMarketData = getSharedMarketData();
+    private get crypto15mMarketSnapshot() { return this.sharedMarketData.crypto15mMarketSnapshot; }
+    private set crypto15mMarketSnapshot(v) { this.sharedMarketData.crypto15mMarketSnapshot = v; }
+    private get crypto15mBooksSnapshot() { return this.sharedMarketData.crypto15mBooksSnapshot; }
+    private set crypto15mBooksSnapshot(v) { this.sharedMarketData.crypto15mBooksSnapshot = v; }
+    private get crypto15mMarketInFlight() { return this.sharedMarketData.crypto15mMarketInFlight; }
+    private set crypto15mMarketInFlight(v) { this.sharedMarketData.crypto15mMarketInFlight = v; }
+    private get crypto15mBooksInFlight() { return this.sharedMarketData.crypto15mBooksInFlight; }
+    private set crypto15mBooksInFlight(v) { this.sharedMarketData.crypto15mBooksInFlight = v; }
+    private get crypto15mMarketBackoffMs() { return this.sharedMarketData.crypto15mMarketBackoffMs; }
+    private set crypto15mMarketBackoffMs(v) { this.sharedMarketData.crypto15mMarketBackoffMs = v; }
+    private get crypto15mMarketNextAllowedAtMs() { return this.sharedMarketData.crypto15mMarketNextAllowedAtMs; }
+    private set crypto15mMarketNextAllowedAtMs(v) { this.sharedMarketData.crypto15mMarketNextAllowedAtMs = v; }
+    private get crypto15mBooksBackoffMs() { return this.sharedMarketData.crypto15mBooksBackoffMs; }
+    private set crypto15mBooksBackoffMs(v) { this.sharedMarketData.crypto15mBooksBackoffMs = v; }
+    private get crypto15mBooksNextAllowedAtMs() { return this.sharedMarketData.crypto15mBooksNextAllowedAtMs; }
+    private set crypto15mBooksNextAllowedAtMs(v) { this.sharedMarketData.crypto15mBooksNextAllowedAtMs = v; }
     private crypto15mWsClients: Map<any, { minProb: number; expiresWithinSec: number; limit: number }> = new Map();
     private crypto15mWsTimer: any = null;
     private cryptoAll2LastError: string | null = null;
@@ -318,6 +416,7 @@ export class GroupArbitrageScanner {
     private cryptoAll2SplitBuyState: Map<string, any> = new Map();
     private cryptoAll2SplitBuyTimer: any = null;
     private cryptoAllAutoEnabled = false;
+    private cryptoAllAutoDryRun = false;
     private cryptoAllAutoTimer: any = null;
     private cryptoAllAutoInFlight = false;
     private cryptoAllStoplossTimer: any = null;
@@ -332,10 +431,11 @@ export class GroupArbitrageScanner {
     private cryptoAllAutoConfig: {
         pollMs: number;
         expiresWithinSec: number;
+        expiresWithinSecByTimeframe: Record<'5m' | '15m' | '1h' | '4h' | '1d', number>;
         minProb: number;
         amountUsd: number;
         symbols: string[];
-        timeframes: Array<'15m' | '1h' | '4h' | '1d'>;
+        timeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
         dojiGuard: { enabled: boolean; riskSkipScore: number; riskAddOnBlockScore: number };
         addOn: {
             enabled: boolean;
@@ -384,6 +484,7 @@ export class GroupArbitrageScanner {
     } = {
         pollMs: 2_000,
         expiresWithinSec: 180,
+        expiresWithinSecByTimeframe: { '5m': 180, '15m': 180, '1h': 180, '4h': 180, '1d': 180 },
         minProb: 0.9,
         amountUsd: 1,
         symbols: ['BTC', 'ETH', 'SOL', 'XRP'],
@@ -439,11 +540,21 @@ export class GroupArbitrageScanner {
     private cryptoAllLastError: string | null = null;
     private cryptoAllOrderLocks: Map<string, { atMs: number; symbol?: string; key?: string; expiresAtMs: number; conditionId: string; status: 'placing' | 'ordered' | 'failed' }> = new Map();
     private cryptoAllDeltaThresholdsPath: string | null = null;
-    private cryptoAllDeltaThresholds: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number; updatedAt: string | null; loadedAt: string | null; persistLastError: string | null } = {
-        btcMinDelta: 600,
-        ethMinDelta: 30,
-        solMinDelta: 0.8,
-        xrpMinDelta: 0.0065,
+    private cryptoAllDeltaThresholds: {
+        legacy: { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number };
+        byTimeframe: Record<'5m' | '15m' | '1h' | '4h' | '1d', { btcMinDelta: number; ethMinDelta: number; solMinDelta: number; xrpMinDelta: number }>;
+        updatedAt: string | null;
+        loadedAt: string | null;
+        persistLastError: string | null;
+    } = {
+        legacy: { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+        byTimeframe: {
+            '5m': { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+            '15m': { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+            '1h': { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+            '4h': { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+            '1d': { btcMinDelta: 600, ethMinDelta: 30, solMinDelta: 0.8, xrpMinDelta: 0.0065 },
+        },
         updatedAt: null,
         loadedAt: null,
         persistLastError: null,
@@ -496,14 +607,14 @@ export class GroupArbitrageScanner {
     };
     private cryptoAllActivesByKey: Map<string, any> = new Map();
     private cryptoAllTrackedByCondition: Map<string, any> = new Map();
-    private cryptoAllAddOnState: Map<string, { positionKey: string; conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; placedA: boolean; placedB: boolean; placedC: boolean; totalStakeUsd: number; lastAttemptAtMs: number }> = new Map();
+    private cryptoAllAddOnState: Map<string, { positionKey: string; conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '5m' | '15m' | '1h' | '4h' | '1d'; endMs: number; placedA: boolean; placedB: boolean; placedC: boolean; totalStakeUsd: number; lastAttemptAtMs: number }> = new Map();
     private cryptoAllStoplossState: Map<string, {
         positionKey: string;
         strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall';
         conditionId: string;
         tokenId: string;
         symbol: string;
-        timeframe: '15m' | '1h' | '4h' | '1d';
+        timeframe: '5m' | '15m' | '1h' | '4h' | '1d';
         endMs: number;
         entryPrice: number;
         totalSize: number;
@@ -520,17 +631,34 @@ export class GroupArbitrageScanner {
     private cryptoAllBeatCache: Map<string, { atMs: number; priceToBeat: number | null; currentPrice: number | null; deltaAbs: number | null; error: string | null }> = new Map();
     private cryptoAllBinanceCandleCache: Map<string, { atMs: number; startMs: number; open: number | null; high: number | null; low: number | null; close: number | null; closes1m: number[]; error: string | null }> = new Map();
     private cryptoAllBinanceSpotCache: Map<string, { atMs: number; price: number | null; error: string | null }> = new Map();
-    private cryptoAllMarketSnapshot: { atMs: number; markets: any[]; lastError: string | null; lastAttemptAtMs: number; lastAttemptError: string | null } = { atMs: 0, markets: [], lastError: null, lastAttemptAtMs: 0, lastAttemptError: null };
-    private cryptoAllBooksSnapshot: { atMs: number; byTokenId: Record<string, any>; lastError: string | null; lastAttemptAtMs: number; lastAttemptError: string | null } = { atMs: 0, byTokenId: {}, lastError: null, lastAttemptAtMs: 0, lastAttemptError: null };
-    private cryptoAllMarketInFlight: Promise<void> | null = null;
-    private cryptoAllBooksInFlight: Promise<void> | null = null;
-    private cryptoAllMarketBackoffMs = 0;
-    private cryptoAllMarketNextAllowedAtMs = 0;
-    private cryptoAllBooksBackoffMs = 0;
-    private cryptoAllBooksNextAllowedAtMs = 0;
-    private cryptoAllWsClients: Map<any, { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; limit: number; includeCandidates: boolean }> = new Map();
+    private get cryptoAllMarketSnapshot() { return this.sharedMarketData.cryptoAllMarketSnapshot; }
+    private set cryptoAllMarketSnapshot(v) { this.sharedMarketData.cryptoAllMarketSnapshot = v; }
+    private get cryptoAllBooksSnapshot() { return this.sharedMarketData.cryptoAllBooksSnapshot; }
+    private set cryptoAllBooksSnapshot(v) { this.sharedMarketData.cryptoAllBooksSnapshot = v; }
+    private get cryptoAllMarketInFlight() { return this.sharedMarketData.cryptoAllMarketInFlight; }
+    private set cryptoAllMarketInFlight(v) { this.sharedMarketData.cryptoAllMarketInFlight = v; }
+    private get cryptoAllBooksInFlight() { return this.sharedMarketData.cryptoAllBooksInFlight; }
+    private set cryptoAllBooksInFlight(v) { this.sharedMarketData.cryptoAllBooksInFlight = v; }
+    private get cryptoAllMarketBackoffMs() { return this.sharedMarketData.cryptoAllMarketBackoffMs; }
+    private set cryptoAllMarketBackoffMs(v) { this.sharedMarketData.cryptoAllMarketBackoffMs = v; }
+    private get cryptoAllMarketNextAllowedAtMs() { return this.sharedMarketData.cryptoAllMarketNextAllowedAtMs; }
+    private set cryptoAllMarketNextAllowedAtMs(v) { this.sharedMarketData.cryptoAllMarketNextAllowedAtMs = v; }
+    private get cryptoAllBooksBackoffMs() { return this.sharedMarketData.cryptoAllBooksBackoffMs; }
+    private set cryptoAllBooksBackoffMs(v) { this.sharedMarketData.cryptoAllBooksBackoffMs = v; }
+    private get cryptoAllBooksNextAllowedAtMs() { return this.sharedMarketData.cryptoAllBooksNextAllowedAtMs; }
+    private set cryptoAllBooksNextAllowedAtMs(v) { this.sharedMarketData.cryptoAllBooksNextAllowedAtMs = v; }
+    private cryptoAllWsClients: Map<any, { symbols: string[]; timeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; expiresWithinSecByTimeframe?: Record<'5m' | '15m' | '1h' | '4h' | '1d', number>; limit: number; includeCandidates: boolean }> = new Map();
     private cryptoAllWsTimer: any = null;
     private cryptoAllSnapshotTimer: any = null;
+    private deltaBoxTimer: any = null;
+    private deltaBoxBinanceHist: Map<string, Array<{ endMs: number; open: number; close: number; deltaAbs: number }>> = new Map();
+    private deltaBoxPmHist: Map<string, Array<{ endMs: number; lastOffsetsSec: Array<number | null>; lastDeltaAtOffsets: Array<number | null> }>> = new Map();
+    private deltaBoxPmMarkets: Map<string, { key: string; symbol: string; timeframe: '5m' | '15m' | '1h' | '4h' | '1d'; endMs: number; startMs: number; upTokenId: string; downTokenId: string; lastHasRange: boolean; events: Array<{ atMs: number; deltaAbs: number | null }> }> = new Map();
+    private deltaBoxBinanceMeta: Map<string, { lastEndMs: number; nextAllowedAtMs: number }> = new Map();
+    private deltaBoxPmNextSampleAtMs = 0;
+    private deltaBoxPmNextMarketRefreshAtMs = 0;
+    private deltaBoxWantedSymbols: Array<'BTC' | 'ETH' | 'SOL' | 'XRP'> = ['BTC', 'ETH', 'SOL', 'XRP'];
+    private deltaBoxWantedTimeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'> = ['5m', '15m', '1h', '4h', '1d'];
     private globalOrderLocks: Map<string, { atMs: number; strategy: 'crypto15m' | 'cryptoall' | 'other'; status: 'placing' | 'done' | 'failed'; expiresAtMs: number }> = new Map();
     private globalOrderPlaceInFlight = false;
     private redeemDrainRunning = false;
@@ -551,8 +679,44 @@ export class GroupArbitrageScanner {
     private isRunning = false;
     private hasValidKey = false;
     private rpcPrivateKey: string = '';
+    private accountId: string = 'default';
 
-    constructor(privateKey?: string) {
+    constructor(arg?: string | { privateKey?: string; proxyAddress?: string; accountId?: string }) {
+        const opts: { privateKey?: string; proxyAddress?: string; accountId?: string } =
+            (arg != null && typeof arg === 'object') ? (arg as any) : ({ privateKey: arg as any } as any);
+        const privateKey = opts.privateKey;
+        this.accountId = opts.accountId != null ? String(opts.accountId).trim() || 'default' : 'default';
+        const legacyMode = !(arg != null && typeof arg === 'object');
+        const stateDirEnv = process.env.POLY_STATE_DIR != null ? String(process.env.POLY_STATE_DIR).trim() : '';
+        const stateDirBaseRaw = stateDirEnv || path.join(os.tmpdir(), 'polymarket-tools');
+        const stateDirBase = path.isAbsolute(stateDirBaseRaw) ? stateDirBaseRaw : path.resolve(process.cwd(), stateDirBaseRaw);
+        const baseDir = legacyMode ? stateDirBase : path.join(stateDirBase, 'accounts', this.accountId);
+        try { fs.mkdirSync(baseDir, { recursive: true }); } catch {}
+        const maybeMigrateLegacyFile = (filename: string, destPath: string) => {
+            if (legacyMode) return;
+            if (this.accountId !== 'default') return;
+            const srcPath = path.join(stateDirBase, filename);
+            try {
+                if (fs.existsSync(destPath)) return;
+                if (!fs.existsSync(srcPath)) return;
+                fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                fs.copyFileSync(srcPath, destPath);
+                try { fs.chmodSync(destPath, 0o600); } catch {}
+            } catch {
+            }
+        };
+        const resolvePath = (envValue: any, filename: string): string => {
+            const v = envValue != null ? String(envValue).trim() : '';
+            if (v) {
+                if (!legacyMode) {
+                    if (v.includes('{accountId}')) return v.split('{accountId}').join(this.accountId);
+                    if (v.includes('{id}')) return v.split('{id}').join(this.accountId);
+                    return path.join(baseDir, filename);
+                }
+                return v;
+            }
+            return path.join(baseDir, filename);
+        };
         this.sdk = new PolymarketSDK({
             privateKey,
         } as any);
@@ -564,7 +728,7 @@ export class GroupArbitrageScanner {
         // Initialize Trading Client manually since SDK doesn't expose it publically
         const rateLimiter = new RateLimiter(); 
         
-        const proxyAddress = process.env.POLY_PROXY_ADDRESS;
+        const proxyAddress = opts.proxyAddress != null ? String(opts.proxyAddress).trim() : process.env.POLY_PROXY_ADDRESS;
 
         this.tradingClient = new TradingClient(rateLimiter, {
             privateKey: effectiveKey,
@@ -573,33 +737,27 @@ export class GroupArbitrageScanner {
         });
 
         if (this.hasValidKey) {
-            this.relayerConfigPath = process.env.POLY_RELAYER_CONFIG_PATH
-                ? String(process.env.POLY_RELAYER_CONFIG_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'relayer.json');
-            this.autoRedeemConfigPath = process.env.POLY_AUTO_REDEEM_CONFIG_PATH
-                ? String(process.env.POLY_AUTO_REDEEM_CONFIG_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'auto-redeem.json');
-            this.orderHistoryPath = process.env.POLY_ORDER_HISTORY_PATH
-                ? String(process.env.POLY_ORDER_HISTORY_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'history.json');
-            this.crypto15mDeltaThresholdsPath = process.env.POLY_CRYPTO15M_DELTA_THRESHOLDS_PATH
-                ? String(process.env.POLY_CRYPTO15M_DELTA_THRESHOLDS_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto15m-delta-thresholds.json');
-            this.crypto15mAutoConfigPath = process.env.POLY_CRYPTO15M_CONFIG_PATH
-                ? String(process.env.POLY_CRYPTO15M_CONFIG_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto15m-config.json');
-            this.cryptoAll2DeltaThresholdsPath = process.env.POLY_CRYPTOALL2_DELTA_THRESHOLDS_PATH
-                ? String(process.env.POLY_CRYPTOALL2_DELTA_THRESHOLDS_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall2-delta-thresholds.json');
-            this.cryptoAll2AutoConfigPath = process.env.POLY_CRYPTOALL2_CONFIG_PATH
-                ? String(process.env.POLY_CRYPTOALL2_CONFIG_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto_all_2.json');
-            this.cryptoAllAutoConfigPath = process.env.POLY_CRYPTOALL_CONFIG_PATH
-                ? String(process.env.POLY_CRYPTOALL_CONFIG_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'crypto_all_v2.json');
-            this.cryptoAllDeltaThresholdsPath = process.env.POLY_CRYPTOALL_DELTA_THRESHOLDS_PATH
-                ? String(process.env.POLY_CRYPTOALL_DELTA_THRESHOLDS_PATH)
-                : path.join(os.tmpdir(), 'polymarket-tools', 'cryptoall-delta-thresholds.json');
+            this.relayerConfigPath = resolvePath(process.env.POLY_RELAYER_CONFIG_PATH, 'relayer.json');
+            this.autoRedeemConfigPath = resolvePath(process.env.POLY_AUTO_REDEEM_CONFIG_PATH, 'auto-redeem.json');
+            this.orderHistoryPath = resolvePath(process.env.POLY_ORDER_HISTORY_PATH, 'history.json');
+            this.crypto15mDeltaThresholdsPath = resolvePath(process.env.POLY_CRYPTO15M_DELTA_THRESHOLDS_PATH, 'crypto15m-delta-thresholds.json');
+            this.crypto15mAutoConfigPath = resolvePath(process.env.POLY_CRYPTO15M_CONFIG_PATH, 'crypto15m-config.json');
+            this.crypto15mHedgeConfigPath = resolvePath(process.env.POLY_CRYPTO15M_HEDGE_CONFIG_PATH, 'crypto15m-hedge.json');
+            this.cryptoAll2DeltaThresholdsPath = resolvePath(process.env.POLY_CRYPTOALL2_DELTA_THRESHOLDS_PATH, 'cryptoall2-delta-thresholds.json');
+            this.cryptoAll2AutoConfigPath = resolvePath(process.env.POLY_CRYPTOALL2_CONFIG_PATH, 'crypto_all_2.json');
+            this.cryptoAllAutoConfigPath = resolvePath(process.env.POLY_CRYPTOALL_CONFIG_PATH, 'crypto_all_v2.json');
+            this.cryptoAllDeltaThresholdsPath = resolvePath(process.env.POLY_CRYPTOALL_DELTA_THRESHOLDS_PATH, 'cryptoall-delta-thresholds.json');
+
+            maybeMigrateLegacyFile('relayer.json', this.relayerConfigPath);
+            maybeMigrateLegacyFile('auto-redeem.json', this.autoRedeemConfigPath);
+            maybeMigrateLegacyFile('history.json', this.orderHistoryPath);
+            maybeMigrateLegacyFile('crypto15m-delta-thresholds.json', this.crypto15mDeltaThresholdsPath);
+            maybeMigrateLegacyFile('crypto15m-config.json', this.crypto15mAutoConfigPath);
+            maybeMigrateLegacyFile('crypto15m-hedge.json', this.crypto15mHedgeConfigPath);
+            maybeMigrateLegacyFile('cryptoall2-delta-thresholds.json', this.cryptoAll2DeltaThresholdsPath);
+            maybeMigrateLegacyFile('crypto_all_2.json', this.cryptoAll2AutoConfigPath);
+            maybeMigrateLegacyFile('crypto_all_v2.json', this.cryptoAllAutoConfigPath);
+            maybeMigrateLegacyFile('cryptoall-delta-thresholds.json', this.cryptoAllDeltaThresholdsPath);
             const envList = process.env.POLY_RPC_URLS || process.env.POLY_CTF_RPC_URLS || process.env.POLY_RPC_FALLBACK_URLS;
             const urls = (envList ? String(envList).split(',') : [
                 process.env.POLY_CTF_RPC_URL,
@@ -631,13 +789,15 @@ export class GroupArbitrageScanner {
             this.loadCryptoAll2DeltaThresholdsFromFile();
             this.loadCryptoAllDeltaThresholdsFromFile();
             this.loadCrypto15mAutoConfigFromFile();
+            this.loadCrypto15mHedgeConfigFromFile();
             this.loadCryptoAll2AutoConfigFromFile();
             this.loadCryptoAllAutoConfigFromFile();
         }
 
         this.pnlPersistencePath = process.env.POLY_PNL_SNAPSHOT_PATH
-            ? String(process.env.POLY_PNL_SNAPSHOT_PATH)
-            : path.join(os.tmpdir(), 'polymarket-tools', 'pnl-snapshots.json');
+            ? resolvePath(process.env.POLY_PNL_SNAPSHOT_PATH, 'pnl-snapshots.json')
+            : path.join(baseDir, 'pnl-snapshots.json');
+        maybeMigrateLegacyFile('pnl-snapshots.json', this.pnlPersistencePath);
         
         this.startTradingInitRetry();
         
@@ -1661,6 +1821,85 @@ export class GroupArbitrageScanner {
         return enriched;
     }
 
+    private async probeRecentBuyState(options: { conditionId: string; tokenId: string; orderId?: string | null; maxWaitMs?: number }) {
+        const conditionId = String(options.conditionId || '').trim();
+        const tokenId = String(options.tokenId || '').trim();
+        const orderId0 = options.orderId != null ? String(options.orderId).trim() : '';
+        const maxWaitMs = Math.max(0, Math.floor(Number(options.maxWaitMs) || 0));
+        const startedAtMs = Date.now();
+        const deadlineMs = maxWaitMs > 0 ? (startedAtMs + maxWaitMs) : startedAtMs;
+        const normalizeTsMs = (v: any) => {
+            const n = typeof v === 'number' ? v : (v != null ? Date.parse(String(v)) : NaN);
+            if (!Number.isFinite(n)) return null;
+            if (n > 2_000_000_000_000) return n;
+            if (n > 2_000_000_000) return n * 1000;
+            if (n > 1_000_000_000) return n * 1000;
+            return n;
+        };
+        const probeOnce = async () => {
+            let orderId: string | null = orderId0 || null;
+            let filledSize: number | null = null;
+            let filledUsd: number | null = null;
+            let orderStatus: string | null = null;
+            let orderFetched = false;
+            let hasOpen = false;
+            let openOrderId: string | null = null;
+            let openRemainingUsd: number | null = null;
+            if (orderId) {
+                try {
+                    const o: any = await this.tradingClient.getOrder(orderId);
+                    orderFetched = true;
+                    orderStatus = o?.status != null ? String(o.status).toUpperCase() : null;
+                    const fs = o?.filledSize != null ? Number(o.filledSize) : NaN;
+                    const p = o?.price != null ? Number(o.price) : NaN;
+                    filledSize = Number.isFinite(fs) ? fs : null;
+                    if (filledSize != null && Number.isFinite(p)) {
+                        const v = filledSize * p;
+                        filledUsd = Number.isFinite(v) ? v : null;
+                    }
+                } catch {
+                }
+            }
+            try {
+                const nowMs = Date.now();
+                const recentWindowMs = 120_000;
+                const openOrders = await this.tradingClient.getOpenOrders(conditionId).catch(() => []);
+                const list = Array.isArray(openOrders) ? openOrders : [];
+                for (const o of list) {
+                    const tid = String(o?.tokenId || '').trim();
+                    if (tid !== tokenId) continue;
+                    const side = String(o?.side || '').toUpperCase();
+                    if (side && side !== 'BUY') continue;
+                    const createdAtMs = normalizeTsMs(o?.createdAt);
+                    if (createdAtMs != null && nowMs - createdAtMs > recentWindowMs) continue;
+                    const id = String(o?.id || o?.orderId || '').trim();
+                    if (id) {
+                        hasOpen = true;
+                        openOrderId = id;
+                        if (!orderId) orderId = id;
+                    }
+                    const size = o?.originalSize != null ? Number(o.originalSize) : (o?.size != null ? Number(o.size) : NaN);
+                    const fs = o?.filledSize != null ? Number(o.filledSize) : (o?.filled != null ? Number(o.filled) : 0);
+                    const price = o?.price != null ? Number(o.price) : NaN;
+                    const remaining = Number.isFinite(size) ? Math.max(0, size - (Number.isFinite(fs) ? fs : 0)) : NaN;
+                    if (Number.isFinite(remaining) && Number.isFinite(price)) {
+                        const remUsd = remaining * price;
+                        openRemainingUsd = Number.isFinite(remUsd) ? remUsd : openRemainingUsd;
+                    }
+                }
+            } catch {
+            }
+            return { orderId, filledSize, filledUsd, orderStatus, orderFetched, hasOpen, openOrderId, openRemainingUsd };
+        };
+        while (true) {
+            const r = await probeOnce();
+            const hasEvidence = (r.filledUsd != null && r.filledUsd > 0) || r.hasOpen === true || r.orderFetched === true;
+            if (hasEvidence) return r;
+            if (Date.now() >= deadlineMs) return r;
+            await new Promise((res) => setTimeout(res, 250));
+        }
+    }
+
     private buildOrderIdToStrategyMap(): Map<string, string> {
         const m = new Map<string, string>();
         for (const entry of this.orderHistory) {
@@ -1761,6 +2000,16 @@ export class GroupArbitrageScanner {
                 nextAllowedAtMs: this.crypto15mBooksNextAllowedAtMs || 0,
                 nextAllowedAt: this.crypto15mBooksNextAllowedAtMs ? new Date(this.crypto15mBooksNextAllowedAtMs).toISOString() : null,
             },
+            booksGlobal: (() => {
+                const s: any = (this as any).clobBooksGlobalState || null;
+                return s ? {
+                    nextAllowedAtMs: Number(s.nextAllowedAtMs || 0),
+                    blockedUntilMs: Number(s.blockedUntilMs || 0),
+                    blockedBackoffMs: Number(s.blockedBackoffMs || 0),
+                    lastStatus: s.lastStatus ?? null,
+                    lastError: s.lastError ?? null,
+                } : null;
+            })(),
             marketSnapshot: {
                 atMs: this.crypto15mMarketSnapshot.atMs,
                 at: this.crypto15mMarketSnapshot.atMs ? new Date(this.crypto15mMarketSnapshot.atMs).toISOString() : null,
@@ -1769,6 +2018,7 @@ export class GroupArbitrageScanner {
                 nextAllowedAtMs: this.crypto15mMarketNextAllowedAtMs || 0,
                 nextAllowedAt: this.crypto15mMarketNextAllowedAtMs ? new Date(this.crypto15mMarketNextAllowedAtMs).toISOString() : null,
                 marketCount: Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets.length : 0,
+                diag: (this.crypto15mMarketSnapshot as any)?.diag ?? null,
             },
             dns: {},
             markets: {},
@@ -1828,12 +2078,25 @@ export class GroupArbitrageScanner {
             await this.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries: Math.max(50, maxEntries) });
         }
         const funder = this.getFunderAddress();
-        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
-        const byCondition = new Map(
-            (Array.isArray(positions) ? positions : [])
-                .map((p: any) => [String(p?.conditionId || '').trim().toLowerCase(), p] as const)
-                .filter(([k]) => !!k)
-        );
+        const signer = this.tradingClient.getSignerAddress();
+        const positions0 = await this.fetchDataApiPositions(funder).catch(() => []);
+        const positions1 =
+            (!Array.isArray(positions0) || positions0.length === 0) && signer && signer.toLowerCase() !== funder.toLowerCase()
+                ? await this.fetchDataApiPositions(signer).catch(() => [])
+                : [];
+        const positions = (Array.isArray(positions0) ? positions0 : []).concat(Array.isArray(positions1) ? positions1 : []);
+        const byCondition = new Map<string, any>();
+        for (const p of positions) {
+            const k = String(p?.conditionId || '').trim().toLowerCase();
+            if (!k) continue;
+            const prev = byCondition.get(k);
+            if (!prev) { byCondition.set(k, p); continue; }
+            const prevScore = Number(prev?.currentValue ?? prev?.size ?? 0);
+            const curScore = Number(p?.currentValue ?? p?.size ?? 0);
+            if (!Number.isFinite(prevScore) || (Number.isFinite(curScore) && curScore >= prevScore)) {
+                byCondition.set(k, p);
+            }
+        }
 
         const latestRedeemByCondition = new Map<string, any>();
         for (const e of this.orderHistory) {
@@ -1891,11 +2154,17 @@ export class GroupArbitrageScanner {
                     : redeemable ? 'redeemable'
                     : pos ? 'open'
                     : 'position_missing';
-                const stakeUsd = Number(e?.amountUsd) || 0;
+                const filledShares = res0?.filledSize != null && Number.isFinite(Number(res0.filledSize)) ? Number(res0.filledSize) : 0;
+                const pxHint = (res0 as any)?.orderPrice ?? e?.limitPrice ?? e?.bestAsk ?? e?.price ?? null;
+                const px = pxHint != null && Number.isFinite(Number(pxHint)) ? Number(pxHint) : null;
+                const filledUsd = filledShares > 0 && px != null ? (filledShares * px) : 0;
+                const stakeUsd = filledUsd > 0 ? filledUsd : (Number(e?.amountUsd) || 0);
                 const realizedPnlUsdc =
                     redeemConfirmed
                         ? (payoutNetUsdc != null ? Number(payoutNetUsdc) - stakeUsd : (paid === false ? 0 - stakeUsd : null))
                         : null;
+                const orderStatusNorm = String(res0?.orderStatus || '').toUpperCase();
+                const errorMsg = (filledShares > 0 || orderStatusNorm === 'MATCHED' || orderStatusNorm === 'FILLED') ? null : (res0?.errorMsg ?? null);
                 return {
                     id: e?.id,
                     timestamp: e?.timestamp,
@@ -1906,7 +2175,7 @@ export class GroupArbitrageScanner {
                     outcome: e?.outcome,
                     buySizingMode: e?.buySizingMode ?? null,
                     requestedAmountUsd: e?.requestedAmountUsd ?? null,
-                    amountUsd: e?.amountUsd,
+                    amountUsd: stakeUsd,
                     sizingDepthUsd: e?.sizingDepthUsd ?? null,
                     sizingDepthCap: e?.sizingDepthCap ?? null,
                     sizingAskLevelsUsed: e?.sizingAskLevelsUsed ?? null,
@@ -1915,6 +2184,14 @@ export class GroupArbitrageScanner {
                     orderId: res0?.orderId ?? res0?.id ?? e?.orderId ?? null,
                     orderStatus: res0?.orderStatus ?? (res0?.success === false ? `failed:${String(res0?.errorMsg || 'order_failed').slice(0, 160)}` : null),
                     filledSize: res0?.filledSize ?? null,
+                    error: errorMsg,
+                    sweepOrders: e?.sweepLog?.summary?.totalOrders ?? null,
+                    sweepAttemptedUsd: e?.sweepLog?.summary?.totalAttemptedUsd ?? null,
+                    sweepFilledUsd: e?.sweepLog?.summary?.totalFilledUsd ?? null,
+                    sweepFilledShares: e?.sweepLog?.summary?.totalFilledShares ?? null,
+                    sweepAvgFillPrice: e?.sweepLog?.summary?.avgFillPrice ?? null,
+                    sweepStopReason: e?.sweepLog?.summary?.stopReason ?? null,
+                    sweepLastLatencyMs: Array.isArray(e?.sweepLog?.orders) ? Math.max(0, ...e.sweepLog.orders.map((o: any) => Number(o?.statusLatencyMs) || 0)) : null,
                     result,
                     state,
                     curPrice,
@@ -1952,9 +2229,59 @@ export class GroupArbitrageScanner {
             openCount: items.filter((x: any) => x.result === 'OPEN').length,
             redeemableCount: items.filter((x: any) => x.redeemable === true).length,
             redeemedCount: items.filter((x: any) => x.redeemStatus === 'confirmed' && x.paid === true).length,
+            ...(function () {
+                const now = Date.now();
+                const within1h = items.filter((x: any) => {
+                    const ts = Date.parse(String(x?.timestamp || ''));
+                    return Number.isFinite(ts) ? (now - ts) <= 60 * 60_000 : false;
+                });
+                const totalOrders1h = within1h.length;
+                const filledOrders1h = within1h.filter((x: any) => {
+                    const fs = Number(x?.filledSize);
+                    const st = String(x?.orderStatus || '').toUpperCase();
+                    return (Number.isFinite(fs) && fs > 0) || st === 'MATCHED' || st === 'FILLED';
+                }).length;
+                const filledUsd1h = within1h.reduce((s: number, x: any) => {
+                    const fs = Number(x?.filledSize);
+                    const st = String(x?.orderStatus || '').toUpperCase();
+                    const filled = (Number.isFinite(fs) && fs > 0) || st === 'MATCHED' || st === 'FILLED';
+                    return s + (filled ? (Number(x?.amountUsd) || 0) : 0);
+                }, 0);
+                const fillRate1h = totalOrders1h > 0 ? (filledOrders1h / totalOrders1h) : 0;
+                return { totalOrders1h, filledOrders1h, filledUsd1h, fillRate1h };
+            })(),
         };
 
         return { success: true, summary, history: items, configEvents, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
+    }
+
+    async getCrypto15mReplay(idRaw: any) {
+        const id = Math.floor(Number(idRaw));
+        if (!Number.isFinite(id) || id <= 0) return { success: false, error: 'invalid_id' };
+        const e: any = this.orderHistory.find((x: any) => x && Math.floor(Number(x?.id)) === id && String(x?.action || '') === 'crypto15m_order') || null;
+        if (!e) return { success: false, error: 'not_found' };
+        const replay = e?.replay ?? null;
+        if (!replay) return { success: false, error: 'replay_not_available' };
+        return {
+            success: true,
+            entry: {
+                id: e?.id,
+                timestamp: e?.timestamp,
+                symbol: e?.symbol,
+                conditionId: e?.marketId,
+                tokenId: e?.results?.[0]?.tokenId ?? null,
+                outcome: e?.outcome ?? null,
+                bestAsk: e?.bestAsk ?? e?.price ?? null,
+                limitPrice: e?.limitPrice ?? null,
+                amountUsd: e?.amountUsd ?? null,
+                buySizingMode: e?.buySizingMode ?? null,
+                orderId: e?.results?.[0]?.orderId ?? null,
+                orderStatus: e?.results?.[0]?.orderStatus ?? null,
+                filledSize: e?.results?.[0]?.filledSize ?? null,
+                errorMsg: e?.results?.[0]?.errorMsg ?? null,
+            },
+            replay
+        };
     }
 
     async getCryptoAll2History(options?: { refresh?: boolean; intervalMs?: number; maxEntries?: number; includeSkipped?: boolean }) {
@@ -1966,12 +2293,25 @@ export class GroupArbitrageScanner {
             await this.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries: Math.max(50, maxEntries) });
         }
         const funder = this.getFunderAddress();
-        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
-        const byCondition = new Map(
-            (Array.isArray(positions) ? positions : [])
-                .map((p: any) => [String(p?.conditionId || '').trim().toLowerCase(), p] as const)
-                .filter(([k]) => !!k)
-        );
+        const signer = this.tradingClient.getSignerAddress();
+        const positions0 = await this.fetchDataApiPositions(funder).catch(() => []);
+        const positions1 =
+            (!Array.isArray(positions0) || positions0.length === 0) && signer && signer.toLowerCase() !== funder.toLowerCase()
+                ? await this.fetchDataApiPositions(signer).catch(() => [])
+                : [];
+        const positions = (Array.isArray(positions0) ? positions0 : []).concat(Array.isArray(positions1) ? positions1 : []);
+        const byCondition = new Map<string, any>();
+        for (const p of positions) {
+            const k = String(p?.conditionId || '').trim().toLowerCase();
+            if (!k) continue;
+            const prev = byCondition.get(k);
+            if (!prev) { byCondition.set(k, p); continue; }
+            const prevScore = Number(prev?.currentValue ?? prev?.size ?? 0);
+            const curScore = Number(p?.currentValue ?? p?.size ?? 0);
+            if (!Number.isFinite(prevScore) || (Number.isFinite(curScore) && curScore >= prevScore)) {
+                byCondition.set(k, p);
+            }
+        }
 
         const latestRedeemByCondition = new Map<string, any>();
         for (const e of this.orderHistory) {
@@ -2223,12 +2563,25 @@ export class GroupArbitrageScanner {
             await this.refreshHistoryStatuses({ minIntervalMs: intervalMs, maxEntries: Math.max(50, maxEntries) });
         }
         const funder = this.getFunderAddress();
-        const positions = await this.fetchDataApiPositions(funder).catch(() => []);
-        const byCondition = new Map(
-            (Array.isArray(positions) ? positions : [])
-                .map((p: any) => [String(p?.conditionId || '').trim().toLowerCase(), p] as const)
-                .filter(([k]) => !!k)
-        );
+        const signer = this.tradingClient.getSignerAddress();
+        const positions0 = await this.fetchDataApiPositions(funder).catch(() => []);
+        const positions1 =
+            (!Array.isArray(positions0) || positions0.length === 0) && signer && signer.toLowerCase() !== funder.toLowerCase()
+                ? await this.fetchDataApiPositions(signer).catch(() => [])
+                : [];
+        const positions = (Array.isArray(positions0) ? positions0 : []).concat(Array.isArray(positions1) ? positions1 : []);
+        const byCondition = new Map<string, any>();
+        for (const p of positions) {
+            const k = String(p?.conditionId || '').trim().toLowerCase();
+            if (!k) continue;
+            const prev = byCondition.get(k);
+            if (!prev) { byCondition.set(k, p); continue; }
+            const prevScore = Number(prev?.currentValue ?? prev?.size ?? 0);
+            const curScore = Number(p?.currentValue ?? p?.size ?? 0);
+            if (!Number.isFinite(prevScore) || (Number.isFinite(curScore) && curScore >= prevScore)) {
+                byCondition.set(k, p);
+            }
+        }
 
         const latestRedeemByCondition = new Map<string, any>();
         for (const e of this.orderHistory) {
@@ -2343,6 +2696,36 @@ export class GroupArbitrageScanner {
         return { success: true, summary, history: items, historyPersist: { path: this.orderHistoryPath, lastError: this.orderHistoryPersistLastError } };
     }
 
+    async getCryptoAllReplay(idRaw: any) {
+        const id = Math.floor(Number(idRaw));
+        if (!Number.isFinite(id) || id <= 0) return { success: false, error: 'invalid_id' };
+        const e: any = this.orderHistory.find((x: any) => x && Math.floor(Number(x?.id)) === id && String(x?.action || '') === 'cryptoall_order') || null;
+        if (!e) return { success: false, error: 'not_found' };
+        const replay = e?.replay ?? null;
+        if (!replay) return { success: false, error: 'replay_not_available' };
+        const res0 = Array.isArray(e?.results) && e.results.length ? e.results[0] : null;
+        return {
+            success: true,
+            entry: {
+                id: e?.id,
+                timestamp: e?.timestamp,
+                symbol: e?.symbol,
+                timeframe: e?.timeframe ?? null,
+                conditionId: e?.marketId,
+                tokenId: e?.tokenId ?? res0?.tokenId ?? null,
+                outcome: e?.outcome ?? null,
+                bestAsk: e?.bestAsk ?? e?.price ?? null,
+                limitPrice: e?.limitPrice ?? null,
+                amountUsd: e?.amountUsd ?? null,
+                orderId: res0?.orderId ?? null,
+                orderStatus: res0?.orderStatus ?? null,
+                filledSize: res0?.filledSize ?? null,
+                errorMsg: res0?.errorMsg ?? null,
+            },
+            replay
+        };
+    }
+
     private loadOrderHistoryFromFile() {
         if (!this.orderHistoryPath) return;
         try {
@@ -2435,6 +2818,11 @@ export class GroupArbitrageScanner {
                 minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.crypto15mAutoConfig.minProb,
                 amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.crypto15mAutoConfig.amountUsd,
                 buySizingMode: parsed?.buySizingMode != null ? String(parsed.buySizingMode) : this.crypto15mAutoConfig.buySizingMode,
+                sweepEnabled: parsed?.sweepEnabled != null ? !!parsed.sweepEnabled : this.crypto15mAutoConfig.sweepEnabled,
+                sweepWindowSec: parsed?.sweepWindowSec != null ? Number(parsed.sweepWindowSec) : this.crypto15mAutoConfig.sweepWindowSec,
+                sweepMaxOrdersPerMarket: parsed?.sweepMaxOrdersPerMarket != null ? Number(parsed.sweepMaxOrdersPerMarket) : this.crypto15mAutoConfig.sweepMaxOrdersPerMarket,
+                sweepMaxTotalUsdPerMarket: parsed?.sweepMaxTotalUsdPerMarket != null ? Number(parsed.sweepMaxTotalUsdPerMarket) : this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket,
+                sweepMinIntervalMs: parsed?.sweepMinIntervalMs != null ? Number(parsed.sweepMinIntervalMs) : this.crypto15mAutoConfig.sweepMinIntervalMs,
                 trendEnabled: parsed?.trendEnabled != null ? !!parsed.trendEnabled : this.crypto15mAutoConfig.trendEnabled,
                 trendMinutes: parsed?.trendMinutes != null ? Number(parsed.trendMinutes) : this.crypto15mAutoConfig.trendMinutes,
                 staleMsThreshold: parsed?.staleMsThreshold != null ? Number(parsed.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold,
@@ -2454,6 +2842,11 @@ export class GroupArbitrageScanner {
                 minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0.9)),
                 amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
                 buySizingMode: next.buySizingMode === 'orderbook_max' ? 'orderbook_max' : next.buySizingMode === 'all_capital' ? 'all_capital' : 'fixed',
+                sweepEnabled: next.sweepEnabled === true,
+                sweepWindowSec: Math.max(0, Math.min(900, Math.floor(Number.isFinite(next.sweepWindowSec) ? next.sweepWindowSec : 30))),
+                sweepMaxOrdersPerMarket: Math.max(1, Math.min(200, Math.floor(Number.isFinite(next.sweepMaxOrdersPerMarket) ? next.sweepMaxOrdersPerMarket : 10))),
+                sweepMaxTotalUsdPerMarket: Math.max(1, Math.min(50_000, Number.isFinite(next.sweepMaxTotalUsdPerMarket) ? next.sweepMaxTotalUsdPerMarket : 600)),
+                sweepMinIntervalMs: Math.max(50, Math.min(30_000, Math.floor(Number.isFinite(next.sweepMinIntervalMs) ? next.sweepMinIntervalMs : 400))),
                 trendEnabled: next.trendEnabled,
                 trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(next.trendMinutes) ? next.trendMinutes : 1))),
                 staleMsThreshold: Math.max(500, Math.floor(Number.isFinite(next.staleMsThreshold) ? next.staleMsThreshold : 5_000)),
@@ -2498,6 +2891,132 @@ export class GroupArbitrageScanner {
             this.crypto15mAutoConfigPersistLastError = null;
         } catch (e: any) {
             this.crypto15mAutoConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write crypto15m config file';
+        }
+    }
+
+    private applyCrypto15mHedgeMode(modeRaw: unknown, overrides?: Partial<{ bufferCents: number; maxSpreadCents: number; minDepthPct: number }>) {
+        const m = String(modeRaw || '').toLowerCase();
+        const mode: 'conservative' | 'balanced' | 'aggressive' = m === 'conservative' ? 'conservative' : m === 'aggressive' ? 'aggressive' : 'balanced';
+        const base =
+            mode === 'conservative' ? { bufferCents: 3, maxSpreadCents: 2, minDepthPct: 100 }
+            : mode === 'aggressive' ? { bufferCents: 1, maxSpreadCents: 5, minDepthPct: 50 }
+            : { bufferCents: 1.5, maxSpreadCents: 3, minDepthPct: 70 };
+        const bufferCents = overrides?.bufferCents != null && Number.isFinite(Number(overrides.bufferCents)) ? Number(overrides.bufferCents) : base.bufferCents;
+        const maxSpreadCents = overrides?.maxSpreadCents != null && Number.isFinite(Number(overrides.maxSpreadCents)) ? Number(overrides.maxSpreadCents) : base.maxSpreadCents;
+        const minDepthPct = overrides?.minDepthPct != null && Number.isFinite(Number(overrides.minDepthPct)) ? Number(overrides.minDepthPct) : base.minDepthPct;
+        return { mode, bufferCents, maxSpreadCents, minDepthPct };
+    }
+
+    private loadCrypto15mHedgeConfigFromFile() {
+        if (!this.crypto15mHedgeConfigPath) return;
+        try {
+            if (!fs.existsSync(this.crypto15mHedgeConfigPath)) return;
+            const raw = fs.readFileSync(this.crypto15mHedgeConfigPath, 'utf8');
+            const parsed = JSON.parse(String(raw || '{}'));
+            const modeInfo = this.applyCrypto15mHedgeMode(parsed?.mode ?? this.crypto15mHedgeAutoConfig.mode, {
+                bufferCents: parsed?.bufferCents,
+                maxSpreadCents: parsed?.maxSpreadCents,
+                minDepthPct: parsed?.minDepthPct,
+            });
+            const next = {
+                pollMs: parsed?.pollMs != null ? Number(parsed.pollMs) : this.crypto15mHedgeAutoConfig.pollMs,
+                expiresWithinSec: parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.crypto15mHedgeAutoConfig.expiresWithinSec,
+                minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.crypto15mHedgeAutoConfig.minProb,
+                amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.crypto15mHedgeAutoConfig.amountUsd,
+                entryRemainingMinSec: parsed?.entryRemainingMinSec != null ? Number(parsed.entryRemainingMinSec) : this.crypto15mHedgeAutoConfig.entryRemainingMinSec,
+                entryRemainingMaxSec: parsed?.entryRemainingMaxSec != null ? Number(parsed.entryRemainingMaxSec) : this.crypto15mHedgeAutoConfig.entryRemainingMaxSec,
+                entryCheapMinCents: parsed?.entryCheapMinCents != null ? Number(parsed.entryCheapMinCents) : this.crypto15mHedgeAutoConfig.entryCheapMinCents,
+                entryCheapMaxCents: parsed?.entryCheapMaxCents != null ? Number(parsed.entryCheapMaxCents) : this.crypto15mHedgeAutoConfig.entryCheapMaxCents,
+                targetProfitCents: parsed?.targetProfitCents != null ? Number(parsed.targetProfitCents) : this.crypto15mHedgeAutoConfig.targetProfitCents,
+                profitDecayEnabled: parsed?.profitDecayEnabled != null ? !!parsed.profitDecayEnabled : this.crypto15mHedgeAutoConfig.profitDecayEnabled,
+                profitDecayMode: parsed?.profitDecayMode != null ? String(parsed.profitDecayMode) : this.crypto15mHedgeAutoConfig.profitDecayMode,
+                profitDecayPerMinCents: parsed?.profitDecayPerMinCents != null ? Number(parsed.profitDecayPerMinCents) : this.crypto15mHedgeAutoConfig.profitDecayPerMinCents,
+                profitStartCents: parsed?.profitStartCents != null ? Number(parsed.profitStartCents) : this.crypto15mHedgeAutoConfig.profitStartCents,
+                profitEndCents: parsed?.profitEndCents != null ? Number(parsed.profitEndCents) : this.crypto15mHedgeAutoConfig.profitEndCents,
+                profitDecayStartSec: parsed?.profitDecayStartSec != null ? Number(parsed.profitDecayStartSec) : this.crypto15mHedgeAutoConfig.profitDecayStartSec,
+                profitDecayEndSec: parsed?.profitDecayEndSec != null ? Number(parsed.profitDecayEndSec) : this.crypto15mHedgeAutoConfig.profitDecayEndSec,
+                profitStepCents: parsed?.profitStepCents != null ? Number(parsed.profitStepCents) : this.crypto15mHedgeAutoConfig.profitStepCents,
+                mode: modeInfo.mode,
+                bufferCents: modeInfo.bufferCents,
+                maxSpreadCents: modeInfo.maxSpreadCents,
+                minDepthPct: modeInfo.minDepthPct,
+                minSecToHedge: parsed?.minSecToHedge != null ? Number(parsed.minSecToHedge) : this.crypto15mHedgeAutoConfig.minSecToHedge,
+                hedgeIgnoreSpread: parsed?.hedgeIgnoreSpread != null ? !!parsed.hedgeIgnoreSpread : this.crypto15mHedgeAutoConfig.hedgeIgnoreSpread,
+                panicHedgeEnabled: parsed?.panicHedgeEnabled != null ? !!parsed.panicHedgeEnabled : this.crypto15mHedgeAutoConfig.panicHedgeEnabled,
+                panicHedgeStartSec: parsed?.panicHedgeStartSec != null ? Number(parsed.panicHedgeStartSec) : this.crypto15mHedgeAutoConfig.panicHedgeStartSec,
+                panicMaxLossCents: parsed?.panicMaxLossCents != null ? Number(parsed.panicMaxLossCents) : this.crypto15mHedgeAutoConfig.panicMaxLossCents,
+            };
+            const entryRemainingMinSec = Math.max(60, Math.min(900, Math.floor(Number.isFinite(next.entryRemainingMinSec) ? next.entryRemainingMinSec : 480)));
+            const entryRemainingMaxSec = Math.max(entryRemainingMinSec, Math.min(900, Math.floor(Number.isFinite(next.entryRemainingMaxSec) ? next.entryRemainingMaxSec : 900)));
+            const profitStartCents = Math.max(0, Math.min(30, Number.isFinite(next.profitStartCents) ? Number(next.profitStartCents) : Number(next.targetProfitCents)));
+            const profitEndCents = Math.max(0, Math.min(30, Number.isFinite(next.profitEndCents) ? Number(next.profitEndCents) : Math.max(0, profitStartCents - 1)));
+            const profitDecayStartSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(next.profitDecayStartSec) ? Number(next.profitDecayStartSec) : 300)));
+            const profitDecayEndSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(next.profitDecayEndSec) ? Number(next.profitDecayEndSec) : 60)));
+            const profitStepCents = Math.max(0.05, Math.min(5, Number.isFinite(next.profitStepCents) ? Number(next.profitStepCents) : 0.1));
+            const profitDecayMode: 'linear' | 'per_minute' = String(next.profitDecayMode || '').toLowerCase() === 'per_minute' ? 'per_minute' : 'linear';
+            const profitDecayPerMinCents = Math.max(0.05, Math.min(30, Number.isFinite(next.profitDecayPerMinCents) ? Number(next.profitDecayPerMinCents) : 1));
+            const panicHedgeEnabled = next.panicHedgeEnabled === true;
+            const panicHedgeStartSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(next.panicHedgeStartSec) ? next.panicHedgeStartSec : 120)));
+            const panicMaxLossCents = Math.max(0, Math.min(200, Number.isFinite(next.panicMaxLossCents) ? next.panicMaxLossCents : 20));
+            this.crypto15mHedgeAutoConfig = {
+                pollMs: Math.max(500, Math.floor(Number.isFinite(next.pollMs) ? next.pollMs : 2_000)),
+                expiresWithinSec: 900,
+                minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0)),
+                amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
+                entryRemainingMinSec,
+                entryRemainingMaxSec,
+                entryCheapMinCents: Math.max(1, Math.min(49, Number.isFinite(next.entryCheapMinCents) ? next.entryCheapMinCents : 8)),
+                entryCheapMaxCents: Math.max(1, Math.min(49, Number.isFinite(next.entryCheapMaxCents) ? next.entryCheapMaxCents : 15)),
+                targetProfitCents: Math.max(1, Math.min(30, Number.isFinite(next.targetProfitCents) ? next.targetProfitCents : 10)),
+                profitDecayEnabled: next.profitDecayEnabled === true,
+                profitDecayMode,
+                profitDecayPerMinCents,
+                profitStartCents,
+                profitEndCents,
+                profitDecayStartSec,
+                profitDecayEndSec,
+                profitStepCents,
+                mode: next.mode,
+                bufferCents: Math.max(0, Math.min(10, Number.isFinite(next.bufferCents) ? next.bufferCents : 1.5)),
+                maxSpreadCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(next.maxSpreadCents) ? next.maxSpreadCents : 3))),
+                minDepthPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(next.minDepthPct) ? next.minDepthPct : 70))),
+                minSecToHedge: Math.max(0, Math.min(900, Math.floor(Number.isFinite(next.minSecToHedge) ? next.minSecToHedge : 90))),
+                hedgeIgnoreSpread: next.hedgeIgnoreSpread === true,
+                panicHedgeEnabled,
+                panicHedgeStartSec,
+                panicMaxLossCents,
+            };
+            this.crypto15mHedgeConfigLoadedAt = new Date().toISOString();
+            this.crypto15mHedgeConfigPersistLastError = null;
+        } catch {
+        }
+    }
+
+    private persistCrypto15mHedgeConfigToFile() {
+        if (!this.crypto15mHedgeConfigPath) return;
+        const writeAtomic = (targetPath: string, payload: string) => {
+            const dir = path.dirname(targetPath);
+            fs.mkdirSync(dir, { recursive: true });
+            const bakPath = `${targetPath}.bak`;
+            const tmpPath = `${targetPath}.tmp`;
+            try {
+                if (fs.existsSync(targetPath)) {
+                    fs.copyFileSync(targetPath, bakPath);
+                    try { fs.chmodSync(bakPath, 0o600); } catch {}
+                }
+            } catch {
+            }
+            fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
+            try { fs.chmodSync(tmpPath, 0o600); } catch {}
+            fs.renameSync(tmpPath, targetPath);
+            try { fs.chmodSync(targetPath, 0o600); } catch {}
+        };
+        try {
+            writeAtomic(this.crypto15mHedgeConfigPath, JSON.stringify({ ...this.crypto15mHedgeAutoConfig }));
+            this.crypto15mHedgeConfigPersistedAt = new Date().toISOString();
+            this.crypto15mHedgeConfigPersistLastError = null;
+        } catch (e: any) {
+            this.crypto15mHedgeConfigPersistLastError = e?.message ? String(e.message) : 'Failed to write crypto15m-hedge config file';
         }
     }
 
@@ -2597,7 +3116,7 @@ export class GroupArbitrageScanner {
             const timeframesRaw = tfInput.length
                 ? tfInput.map((x: any) => String(x || '').toLowerCase()).filter(Boolean)
                 : Array.isArray(this.cryptoAllAutoConfig.timeframes) && this.cryptoAllAutoConfig.timeframes.length ? this.cryptoAllAutoConfig.timeframes : ['15m'];
-            const timeframes = Array.from(new Set(timeframesRaw)).filter((t) => ['15m', '1h', '4h', '1d'].includes(String(t))) as Array<'15m' | '1h' | '4h' | '1d'>;
+            const timeframes = Array.from(new Set(timeframesRaw)).filter((t) => ['5m', '15m', '1h', '4h', '1d'].includes(String(t))) as Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
             const dojiGuardEnabledRaw =
                 parsed?.dojiGuardEnabled != null ? !!parsed.dojiGuardEnabled
                 : parsed?.dojiGuard?.enabled != null ? !!parsed.dojiGuard.enabled
@@ -2618,9 +3137,15 @@ export class GroupArbitrageScanner {
                 parsed?.stoplossEnabled != null ? !!parsed.stoplossEnabled
                 : parsed?.stoploss?.enabled != null ? !!parsed.stoploss.enabled
                 : this.cryptoAllAutoConfig.stoploss.enabled;
+            const expiresWithinSecByTimeframeRaw = (parsed?.expiresWithinSecByTimeframe && typeof parsed.expiresWithinSecByTimeframe === 'object') ? parsed.expiresWithinSecByTimeframe : null;
             const next = {
                 pollMs: parsed?.pollMs != null ? Number(parsed.pollMs) : this.cryptoAllAutoConfig.pollMs,
                 expiresWithinSec: parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec,
+                expiresWithinSecByTimeframe: (['5m', '15m', '1h', '4h', '1d'] as const).reduce((acc: any, tf) => {
+                    const v = expiresWithinSecByTimeframeRaw && (expiresWithinSecByTimeframeRaw as any)[tf] != null ? Number((expiresWithinSecByTimeframeRaw as any)[tf]) : (parsed?.expiresWithinSec != null ? Number(parsed.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec);
+                    acc[tf] = Math.max(5, Math.floor(Number.isFinite(v) ? v : this.cryptoAllAutoConfig.expiresWithinSec));
+                    return acc;
+                }, {}),
                 minProb: parsed?.minProb != null ? Number(parsed.minProb) : this.cryptoAllAutoConfig.minProb,
                 amountUsd: parsed?.amountUsd != null ? Number(parsed.amountUsd) : this.cryptoAllAutoConfig.amountUsd,
                 symbols,
@@ -2651,6 +3176,7 @@ export class GroupArbitrageScanner {
             this.cryptoAllAutoConfig = {
                 pollMs: Math.max(500, Math.floor(Number.isFinite(next.pollMs) ? next.pollMs : 2_000)),
                 expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(next.expiresWithinSec) ? next.expiresWithinSec : 180)),
+                expiresWithinSecByTimeframe: (next as any).expiresWithinSecByTimeframe,
                 minProb: Math.max(0, Math.min(1, Number.isFinite(next.minProb) ? next.minProb : 0.9)),
                 amountUsd: Math.max(1, Number.isFinite(next.amountUsd) ? next.amountUsd : 1),
                 symbols,
@@ -2825,6 +3351,13 @@ export class GroupArbitrageScanner {
     private async fetchDataApiPositions(user: string): Promise<any[]> {
         const u = String(user || '').trim();
         if (!u) return [];
+        const key = u.toLowerCase();
+        const now = Date.now();
+        const ttlMs = 15_000;
+        const cached = this.dataApiPositionsCache.get(key) || null;
+        if (cached && (now - cached.atMs) < ttlMs) return cached.data;
+        const inflight = this.dataApiPositionsInFlight.get(key) || null;
+        if (inflight) return await inflight;
         const url = `https://data-api.polymarket.com/positions?user=${encodeURIComponent(u)}`;
         const headers: any = {
             'accept': 'application/json, text/plain, */*',
@@ -2838,21 +3371,48 @@ export class GroupArbitrageScanner {
             const data = await this.withTimeout(res.json().catch(() => [] as any), 2_000, 'Data API positions json');
             return Array.isArray(data) ? data : [];
         };
-        try {
-            return await this.withTimeout(tryOnce(), 2_500, 'Data API positions');
-        } catch {
-            await new Promise(r => setTimeout(r, 300));
+        const run = (async () => {
             try {
-                return await this.withTimeout(tryOnce(), 2_500, 'Data API positions retry');
+                const data = await this.withTimeout(tryOnce(), 2_500, 'Data API positions');
+                this.dataApiPositionsCache.set(key, { atMs: Date.now(), data });
+                while (this.dataApiPositionsCache.size > 100) {
+                    const k = this.dataApiPositionsCache.keys().next().value;
+                    if (!k) break;
+                    this.dataApiPositionsCache.delete(k);
+                }
+                return data;
             } catch {
-                return [];
+                await new Promise(r => setTimeout(r, 300));
+                try {
+                    const data = await this.withTimeout(tryOnce(), 2_500, 'Data API positions retry');
+                    this.dataApiPositionsCache.set(key, { atMs: Date.now(), data });
+                    while (this.dataApiPositionsCache.size > 100) {
+                        const k = this.dataApiPositionsCache.keys().next().value;
+                        if (!k) break;
+                        this.dataApiPositionsCache.delete(k);
+                    }
+                    return data;
+                } catch {
+                    return cached ? cached.data : [];
+                }
             }
-        }
+        })().finally(() => {
+            this.dataApiPositionsInFlight.delete(key);
+        });
+        this.dataApiPositionsInFlight.set(key, run);
+        return await run;
     }
 
     private async fetchDataApiPositionsValue(user: string): Promise<number> {
         const u = String(user || '').trim();
         if (!u) return 0;
+        const key = u.toLowerCase();
+        const now = Date.now();
+        const ttlMs = 15_000;
+        const cached = this.dataApiValueCache.get(key) || null;
+        if (cached && (now - cached.atMs) < ttlMs) return cached.value;
+        const inflight = this.dataApiValueInFlight.get(key) || null;
+        if (inflight) return await inflight;
         const url = `https://data-api.polymarket.com/value?user=${encodeURIComponent(u)}`;
         const headers: any = {
             'accept': 'application/json, text/plain, */*',
@@ -2869,14 +3429,38 @@ export class GroupArbitrageScanner {
             return Number.isFinite(v) ? v : 0;
         };
         try {
-            return await this.withTimeout(tryOnce(), 2_500, 'Data API value');
+            const run = (async () => {
+                try {
+                    const v = await this.withTimeout(tryOnce(), 2_500, 'Data API value');
+                    this.dataApiValueCache.set(key, { atMs: Date.now(), value: v });
+                    while (this.dataApiValueCache.size > 100) {
+                        const k = this.dataApiValueCache.keys().next().value;
+                        if (!k) break;
+                        this.dataApiValueCache.delete(k);
+                    }
+                    return v;
+                } catch {
+                    await new Promise(r => setTimeout(r, 300));
+                    try {
+                        const v = await this.withTimeout(tryOnce(), 2_500, 'Data API value retry');
+                        this.dataApiValueCache.set(key, { atMs: Date.now(), value: v });
+                        while (this.dataApiValueCache.size > 100) {
+                            const k = this.dataApiValueCache.keys().next().value;
+                            if (!k) break;
+                            this.dataApiValueCache.delete(k);
+                        }
+                        return v;
+                    } catch {
+                        return cached ? cached.value : 0;
+                    }
+                }
+            })().finally(() => {
+                this.dataApiValueInFlight.delete(key);
+            });
+            this.dataApiValueInFlight.set(key, run);
+            return await run;
         } catch {
-            await new Promise(r => setTimeout(r, 300));
-            try {
-                return await this.withTimeout(tryOnce(), 2_500, 'Data API value retry');
-            } catch {
-                return 0;
-            }
+            return cached ? cached.value : 0;
         }
     }
 
@@ -3420,11 +4004,14 @@ export class GroupArbitrageScanner {
     }
 
     getCryptoAllDeltaThresholds() {
+        const legacy = this.cryptoAllDeltaThresholds.legacy || { btcMinDelta: 0, ethMinDelta: 0, solMinDelta: 0, xrpMinDelta: 0 };
         return {
-            btcMinDelta: this.cryptoAllDeltaThresholds.btcMinDelta,
-            ethMinDelta: this.cryptoAllDeltaThresholds.ethMinDelta,
-            solMinDelta: this.cryptoAllDeltaThresholds.solMinDelta,
-            xrpMinDelta: this.cryptoAllDeltaThresholds.xrpMinDelta,
+            btcMinDelta: legacy.btcMinDelta,
+            ethMinDelta: legacy.ethMinDelta,
+            solMinDelta: legacy.solMinDelta,
+            xrpMinDelta: legacy.xrpMinDelta,
+            legacy,
+            byTimeframe: this.cryptoAllDeltaThresholds.byTimeframe,
             updatedAt: this.cryptoAllDeltaThresholds.updatedAt,
             loadedAt: this.cryptoAllDeltaThresholds.loadedAt,
             persistLastError: this.cryptoAllDeltaThresholds.persistLastError,
@@ -3433,17 +4020,59 @@ export class GroupArbitrageScanner {
         };
     }
 
-    setCryptoAllDeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; xrpMinDelta?: number; persist?: boolean }) {
-        const btc = input.btcMinDelta != null ? Number(input.btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta;
-        const eth = input.ethMinDelta != null ? Number(input.ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta;
-        const sol = input.solMinDelta != null ? Number(input.solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta;
-        const xrp = input.xrpMinDelta != null ? Number(input.xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta;
+    private getCryptoAllMinDeltaRequired(symbol: string, timeframe: '5m' | '15m' | '1h' | '4h' | '1d'): number {
+        const sym = String(symbol || '').toUpperCase();
+        const tf = String(timeframe || '').toLowerCase() as any;
+        const legacy = this.cryptoAllDeltaThresholds.legacy || { btcMinDelta: 0, ethMinDelta: 0, solMinDelta: 0, xrpMinDelta: 0 };
+        const byTf = (this.cryptoAllDeltaThresholds.byTimeframe && (this.cryptoAllDeltaThresholds.byTimeframe as any)[tf]) ? (this.cryptoAllDeltaThresholds.byTimeframe as any)[tf] : null;
+        const src = byTf && typeof byTf === 'object' ? byTf : legacy;
+        if (sym === 'BTC') return Number(src.btcMinDelta) || 0;
+        if (sym === 'ETH') return Number(src.ethMinDelta) || 0;
+        if (sym === 'SOL') return Number(src.solMinDelta) || 0;
+        if (sym === 'XRP') return Number(src.xrpMinDelta) || 0;
+        return 0;
+    }
+
+    setCryptoAllDeltaThresholds(input: { btcMinDelta?: number; ethMinDelta?: number; solMinDelta?: number; xrpMinDelta?: number; byTimeframe?: any; persist?: boolean }) {
+        const legacyPrev = this.cryptoAllDeltaThresholds.legacy || { btcMinDelta: 0, ethMinDelta: 0, solMinDelta: 0, xrpMinDelta: 0 };
+        const legacyNext = {
+            btcMinDelta: input.btcMinDelta != null ? Math.max(0, Number(input.btcMinDelta)) : legacyPrev.btcMinDelta,
+            ethMinDelta: input.ethMinDelta != null ? Math.max(0, Number(input.ethMinDelta)) : legacyPrev.ethMinDelta,
+            solMinDelta: input.solMinDelta != null ? Math.max(0, Number(input.solMinDelta)) : legacyPrev.solMinDelta,
+            xrpMinDelta: input.xrpMinDelta != null ? Math.max(0, Number(input.xrpMinDelta)) : legacyPrev.xrpMinDelta,
+        };
+        const prevByTf = this.cryptoAllDeltaThresholds.byTimeframe || ({} as any);
+        const nextByTf: any = {
+            '5m': { ...(prevByTf['5m'] || legacyPrev) },
+            '15m': { ...(prevByTf['15m'] || legacyPrev) },
+            '1h': { ...(prevByTf['1h'] || legacyPrev) },
+            '4h': { ...(prevByTf['4h'] || legacyPrev) },
+            '1d': { ...(prevByTf['1d'] || legacyPrev) },
+        };
+        const bt = input.byTimeframe && typeof input.byTimeframe === 'object' ? input.byTimeframe : null;
+        if (bt) {
+            for (const tf of ['5m', '15m', '1h', '4h', '1d'] as const) {
+                const row = (bt as any)[tf];
+                if (!row || typeof row !== 'object') continue;
+                const r2 = nextByTf[tf] || { ...legacyNext };
+                const btc = row.btcMinDelta != null ? Number(row.btcMinDelta) : r2.btcMinDelta;
+                const eth = row.ethMinDelta != null ? Number(row.ethMinDelta) : r2.ethMinDelta;
+                const sol = row.solMinDelta != null ? Number(row.solMinDelta) : r2.solMinDelta;
+                const xrp = row.xrpMinDelta != null ? Number(row.xrpMinDelta) : r2.xrpMinDelta;
+                nextByTf[tf] = {
+                    btcMinDelta: Number.isFinite(btc) ? Math.max(0, btc) : r2.btcMinDelta,
+                    ethMinDelta: Number.isFinite(eth) ? Math.max(0, eth) : r2.ethMinDelta,
+                    solMinDelta: Number.isFinite(sol) ? Math.max(0, sol) : r2.solMinDelta,
+                    xrpMinDelta: Number.isFinite(xrp) ? Math.max(0, xrp) : r2.xrpMinDelta,
+                };
+            }
+        } else if (input.btcMinDelta != null || input.ethMinDelta != null || input.solMinDelta != null || input.xrpMinDelta != null) {
+            for (const tf of ['5m', '15m', '1h', '4h', '1d'] as const) nextByTf[tf] = { ...legacyNext };
+        }
         this.cryptoAllDeltaThresholds = {
             ...this.cryptoAllDeltaThresholds,
-            btcMinDelta: Math.max(0, btc),
-            ethMinDelta: Math.max(0, eth),
-            solMinDelta: Math.max(0, sol),
-            xrpMinDelta: Math.max(0, xrp),
+            legacy: legacyNext,
+            byTimeframe: nextByTf,
             updatedAt: new Date().toISOString(),
             persistLastError: null,
         };
@@ -3459,16 +4088,37 @@ export class GroupArbitrageScanner {
             if (!fs.existsSync(this.cryptoAllDeltaThresholdsPath)) return;
             const raw = fs.readFileSync(this.cryptoAllDeltaThresholdsPath, 'utf8');
             const parsed = JSON.parse(String(raw || '{}'));
-            const btcMinDelta = parsed?.btcMinDelta != null ? Number(parsed.btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta;
-            const ethMinDelta = parsed?.ethMinDelta != null ? Number(parsed.ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta;
-            const solMinDelta = parsed?.solMinDelta != null ? Number(parsed.solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta;
-            const xrpMinDelta = parsed?.xrpMinDelta != null ? Number(parsed.xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta;
+            const legacyRaw = (parsed?.legacy && typeof parsed.legacy === 'object') ? parsed.legacy : parsed;
+            const legacyPrev = this.cryptoAllDeltaThresholds.legacy || { btcMinDelta: 0, ethMinDelta: 0, solMinDelta: 0, xrpMinDelta: 0 };
+            const btcMinDelta = legacyRaw?.btcMinDelta != null ? Number(legacyRaw.btcMinDelta) : legacyPrev.btcMinDelta;
+            const ethMinDelta = legacyRaw?.ethMinDelta != null ? Number(legacyRaw.ethMinDelta) : legacyPrev.ethMinDelta;
+            const solMinDelta = legacyRaw?.solMinDelta != null ? Number(legacyRaw.solMinDelta) : legacyPrev.solMinDelta;
+            const xrpMinDelta = legacyRaw?.xrpMinDelta != null ? Number(legacyRaw.xrpMinDelta) : legacyPrev.xrpMinDelta;
+            const legacy = {
+                btcMinDelta: Number.isFinite(btcMinDelta) ? Math.max(0, btcMinDelta) : legacyPrev.btcMinDelta,
+                ethMinDelta: Number.isFinite(ethMinDelta) ? Math.max(0, ethMinDelta) : legacyPrev.ethMinDelta,
+                solMinDelta: Number.isFinite(solMinDelta) ? Math.max(0, solMinDelta) : legacyPrev.solMinDelta,
+                xrpMinDelta: Number.isFinite(xrpMinDelta) ? Math.max(0, xrpMinDelta) : legacyPrev.xrpMinDelta,
+            };
+            const byTfParsed = parsed?.byTimeframe && typeof parsed.byTimeframe === 'object' ? parsed.byTimeframe : null;
+            const nextByTf: any = {};
+            for (const tf of ['5m', '15m', '1h', '4h', '1d'] as const) {
+                const row = byTfParsed ? (byTfParsed as any)[tf] : null;
+                const btc = row?.btcMinDelta != null ? Number(row.btcMinDelta) : legacy.btcMinDelta;
+                const eth = row?.ethMinDelta != null ? Number(row.ethMinDelta) : legacy.ethMinDelta;
+                const sol = row?.solMinDelta != null ? Number(row.solMinDelta) : legacy.solMinDelta;
+                const xrp = row?.xrpMinDelta != null ? Number(row.xrpMinDelta) : legacy.xrpMinDelta;
+                nextByTf[tf] = {
+                    btcMinDelta: Number.isFinite(btc) ? Math.max(0, btc) : legacy.btcMinDelta,
+                    ethMinDelta: Number.isFinite(eth) ? Math.max(0, eth) : legacy.ethMinDelta,
+                    solMinDelta: Number.isFinite(sol) ? Math.max(0, sol) : legacy.solMinDelta,
+                    xrpMinDelta: Number.isFinite(xrp) ? Math.max(0, xrp) : legacy.xrpMinDelta,
+                };
+            }
             this.cryptoAllDeltaThresholds = {
                 ...this.cryptoAllDeltaThresholds,
-                btcMinDelta: Number.isFinite(btcMinDelta) ? Math.max(0, btcMinDelta) : this.cryptoAllDeltaThresholds.btcMinDelta,
-                ethMinDelta: Number.isFinite(ethMinDelta) ? Math.max(0, ethMinDelta) : this.cryptoAllDeltaThresholds.ethMinDelta,
-                solMinDelta: Number.isFinite(solMinDelta) ? Math.max(0, solMinDelta) : this.cryptoAllDeltaThresholds.solMinDelta,
-                xrpMinDelta: Number.isFinite(xrpMinDelta) ? Math.max(0, xrpMinDelta) : this.cryptoAllDeltaThresholds.xrpMinDelta,
+                legacy,
+                byTimeframe: nextByTf,
                 loadedAt: new Date().toISOString(),
                 persistLastError: null,
             };
@@ -3488,12 +4138,7 @@ export class GroupArbitrageScanner {
         try {
             fs.writeFileSync(
                 this.cryptoAllDeltaThresholdsPath,
-                JSON.stringify({
-                    btcMinDelta: this.cryptoAllDeltaThresholds.btcMinDelta,
-                    ethMinDelta: this.cryptoAllDeltaThresholds.ethMinDelta,
-                    solMinDelta: this.cryptoAllDeltaThresholds.solMinDelta,
-                    xrpMinDelta: this.cryptoAllDeltaThresholds.xrpMinDelta,
-                }),
+                JSON.stringify({ legacy: this.cryptoAllDeltaThresholds.legacy, byTimeframe: this.cryptoAllDeltaThresholds.byTimeframe }),
                 { encoding: 'utf8', mode: 0o600 }
             );
             try { fs.chmodSync(this.cryptoAllDeltaThresholdsPath, 0o600); } catch {}
@@ -3945,7 +4590,7 @@ export class GroupArbitrageScanner {
                         claimableCountAfter,
                         results: submittedResults,
                     });
-                    if (this.orderHistory.length > 50) this.orderHistory.pop();
+                    if (this.orderHistory.length > 100) this.orderHistory.pop();
                     this.schedulePersistOrderHistory();
                 }
             } finally {
@@ -4032,23 +4677,33 @@ export class GroupArbitrageScanner {
             'accept': 'application/json, text/plain, */*',
             'user-agent': 'Mozilla/5.0 (compatible; polymarket-tools/1.0)',
         };
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), 3_000);
-        const res = await this.withTimeout(
-            fetch(url, { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
-            3_500,
-            `Gamma fetch ${url}`
-        );
-        if (!res.ok) {
-            const retryAfter = res.headers?.get ? res.headers.get('retry-after') : null;
-            const err: any = new Error(`Gamma API failed (${res.status})`);
-            if (res.status === 429) {
-                const sec = retryAfter != null && retryAfter !== '' ? Number(retryAfter) : NaN;
-                err.retryAfterMs = Number.isFinite(sec) ? Math.max(1, sec) * 1000 : 60_000;
+        const attempts = 2;
+        for (let i = 0; i < attempts; i++) {
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 3_000);
+            const res = await this.withTimeout(
+                fetch(url, { headers, signal: controller.signal }).finally(() => clearTimeout(t)),
+                3_500,
+                `Gamma fetch ${url}`
+            );
+            if (!res.ok) {
+                const retryAfter = res.headers?.get ? res.headers.get('retry-after') : null;
+                if (res.status === 429 && i + 1 < attempts) {
+                    const sec = retryAfter != null && retryAfter !== '' ? Number(retryAfter) : NaN;
+                    const retryAfterMs = Number.isFinite(sec) ? Math.max(1, sec) * 1000 : 60_000;
+                    await new Promise((r) => setTimeout(r, Math.min(60_000, retryAfterMs)));
+                    continue;
+                }
+                const err: any = new Error(`Gamma API failed (${res.status})`);
+                if (res.status === 429) {
+                    const sec = retryAfter != null && retryAfter !== '' ? Number(retryAfter) : NaN;
+                    err.retryAfterMs = Number.isFinite(sec) ? Math.max(1, sec) * 1000 : 60_000;
+                }
+                throw err;
             }
-            throw err;
+            return await this.withTimeout(res.json(), 5_000, `Gamma json ${url}`);
         }
-        return await this.withTimeout(res.json(), 5_000, `Gamma json ${url}`);
+        throw new Error('Gamma API failed (retry exhausted)');
     }
 
     private tryParseJsonArray(raw: any): any[] {
@@ -4070,15 +4725,44 @@ export class GroupArbitrageScanner {
     private async resolveCryptoTagId(): Promise<string | null> {
         if (this.crypto15mCryptoTagId) return this.crypto15mCryptoTagId;
         try {
-            const tags = await this.fetchGammaJson('https://gamma-api.polymarket.com/tags?limit=200');
-            const list = Array.isArray(tags) ? tags : [];
-            const t = list.find((x: any) => String(x?.slug || '').toLowerCase() === 'crypto' || String(x?.label || '').toLowerCase() === 'crypto');
-            const id = t?.id != null ? String(t.id) : null;
-            if (id) this.crypto15mCryptoTagId = id;
-            return id;
+            const pageSize = 200;
+            const maxPages = 20;
+            for (let page = 0; page < maxPages; page++) {
+                const offset = page * pageSize;
+                const tags = await this.fetchGammaJson(`https://gamma-api.polymarket.com/tags?limit=${pageSize}&offset=${offset}`);
+                const list = Array.isArray(tags) ? tags : [];
+                const t = list.find((x: any) => String(x?.slug || '').toLowerCase() === 'crypto' || String(x?.label || '').toLowerCase() === 'crypto');
+                const id = t?.id != null ? String(t.id) : null;
+                if (id) {
+                    this.crypto15mCryptoTagId = id;
+                    return id;
+                }
+                if (list.length < pageSize) break;
+            }
+            return null;
         } catch {
             return null;
         }
+    }
+
+    private matchesCryptoAllTimeframe(tf: '5m' | '15m' | '1h' | '4h' | '1d', slug: string, title: string): boolean {
+        const s = String(slug || '').toLowerCase();
+        const t = String(title || '').toLowerCase();
+        if (tf === '5m') return /\b5\s*(m|min|mins|minute|minutes)\b/.test(t) || /(^|-)5m(-|$)/.test(s) || /(^|-)5-min(ute)?s?(-|$)/.test(s) || /(^|-)5mins(-|$)/.test(s) || /(^|-)5min(ute)?s?(-|$)/.test(s);
+        if (tf === '15m') return /\b15\s*(m|min|mins|minute|minutes)\b/.test(t) || s.includes('15m') || s.includes('15-min') || s.includes('15-minute') || s.includes('15minutes') || s.includes('-15m-');
+        if (tf === '1h') return /\b(1\s*(h|hr|hour|hours)|60\s*(m|min|mins|minute|minutes)|hourly)\b/.test(t) || s.includes('1h') || s.includes('1-hr') || s.includes('1-hour') || s.includes('hourly') || s.includes('60m') || s.includes('60min');
+        if (tf === '4h') return /\b(4\s*(h|hr|hour|hours)|240\s*(m|min|mins|minute|minutes))\b/.test(t) || s.includes('4h') || s.includes('4-hr') || s.includes('4-hour') || s.includes('4hours') || s.includes('4-hours') || s.includes('240m') || s.includes('240min');
+        return /\b(1\s*(d|day|days)|24\s*(h|hr|hour|hours)|daily)\b/.test(t) || s.includes('1d') || s.includes('1-day') || s.includes('1day') || s.includes('daily') || s.includes('24h');
+    }
+
+    private async fetchGammaCryptoEvents(tagId: string, limit: number, offset: number): Promise<any[]> {
+        const id = String(tagId || '').trim();
+        if (!id) return [];
+        const l = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+        const o = Math.max(0, Math.floor(Number(offset) || 0));
+        const url = `https://gamma-api.polymarket.com/events?tag_id=${encodeURIComponent(id)}&active=true&closed=false&order=id&ascending=false&limit=${l}&offset=${o}`;
+        const data = await this.fetchGammaJson(url);
+        return Array.isArray(data) ? data : [];
     }
 
     private async fetchCrypto15mSlugsFromSite(limit: number): Promise<string[]> {
@@ -4189,17 +4873,26 @@ export class GroupArbitrageScanner {
             lastAttemptAtMs: this.cryptoAllBooksSnapshot.lastAttemptAtMs,
             lastAttemptError: this.cryptoAllBooksSnapshot.lastAttemptError,
         };
-        return { success: true, sources, config: this.cryptoAllAutoConfig, markets, books, risk };
+        const marketSnapshot = {
+            atMs: this.cryptoAllMarketSnapshot.atMs,
+            marketCount: marketsAll.length,
+            lastError: this.cryptoAllMarketSnapshot.lastError,
+            lastAttemptAtMs: this.cryptoAllMarketSnapshot.lastAttemptAtMs,
+            lastAttemptError: this.cryptoAllMarketSnapshot.lastAttemptError,
+            diag: (this.cryptoAllMarketSnapshot as any)?.diag ?? null,
+        };
+        return { success: true, sources, config: this.cryptoAllAutoConfig, marketSnapshot, markets, books, risk };
     }
 
-    private inferCryptoTimeframeFromSlug(slug: string, title: string): '15m' | '1h' | '4h' | '1d' | null {
+    private inferCryptoTimeframeFromSlug(slug: string, title: string): '5m' | '15m' | '1h' | '4h' | '1d' | null {
         const s = String(slug || '').toLowerCase();
         const t = String(title || '').toLowerCase();
         const hay = `${s} ${t}`;
-        if (hay.includes('15m') || hay.includes('15-min') || hay.includes('15min')) return '15m';
-        if (hay.includes('1h') || hay.includes('1-hr') || hay.includes('1hr') || hay.includes('hourly')) return '1h';
-        if (hay.includes('4h') || hay.includes('4-hr') || hay.includes('4hr') || hay.includes('4-hour') || hay.includes('4hour')) return '4h';
-        if (hay.includes('1d') || hay.includes('1-day') || hay.includes('1day') || hay.includes('daily')) return '1d';
+        if (/(^|-)5m(-|$)/.test(hay) || /(^|-)5-min(ute)?s?(-|$)/.test(hay) || /(^|-)5mins(-|$)/.test(hay) || /(^|-)5min(ute)?s?(-|$)/.test(hay)) return '5m';
+        if (hay.includes('15m') || hay.includes('15-min') || hay.includes('15min') || hay.includes('15-minute') || hay.includes('15minutes')) return '15m';
+        if (hay.includes('1h') || hay.includes('1-hr') || hay.includes('1hr') || hay.includes('hourly') || hay.includes('1-hour') || hay.includes('1hour') || hay.includes('60m') || hay.includes('60min')) return '1h';
+        if (hay.includes('4h') || hay.includes('4-hr') || hay.includes('4hr') || hay.includes('4-hour') || hay.includes('4hour') || hay.includes('4hours') || hay.includes('4-hours') || hay.includes('240m') || hay.includes('240min')) return '4h';
+        if (hay.includes('1d') || hay.includes('1-day') || hay.includes('1day') || hay.includes('daily') || hay.includes('24h') || hay.includes('24hr') || hay.includes('24-hour') || hay.includes('24hours')) return '1d';
         const m = String(title || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
         if (m) {
             const toMin = (hh: number, mm: number, ap: string) => {
@@ -4217,6 +4910,7 @@ export class GroupArbitrageScanner {
             const eMin = toMin(Number(m[4]), Number(m[5]), String(m[6]));
             let diff = eMin - sMin;
             if (diff < 0) diff += 24 * 60;
+            if (diff >= 3 && diff <= 7) return '5m';
             if (diff >= 10 && diff <= 20) return '15m';
             if (diff >= 50 && diff <= 70) return '1h';
             if (diff >= 220 && diff <= 260) return '4h';
@@ -4346,30 +5040,33 @@ export class GroupArbitrageScanner {
         }
     }
 
-    private getCryptoAllTimeframeSec(tf: '15m' | '1h' | '4h' | '1d'): number {
+    private getCryptoAllTimeframeSec(tf: '5m' | '15m' | '1h' | '4h' | '1d'): number {
+        if (tf === '5m') return 5 * 60;
         if (tf === '1h') return 60 * 60;
         if (tf === '4h') return 4 * 60 * 60;
         if (tf === '1d') return 24 * 60 * 60;
         return 15 * 60;
     }
 
-    private getCryptoAllListPaths(tf: '15m' | '1h' | '4h' | '1d'): string[] {
+    private getCryptoAllListPaths(tf: '5m' | '15m' | '1h' | '4h' | '1d'): string[] {
+        if (tf === '5m') return ['/crypto/5M', '/crypto/5m'];
         if (tf === '15m') return ['/crypto/15M'];
-        if (tf === '1h') return ['/crypto/hourly'];
-        if (tf === '4h') return ['/crypto/4H', '/crypto/4-hour', '/crypto/4hour', '/crypto/4-hours'];
-        return ['/crypto/daily', '/crypto/1D', '/crypto/1d'];
+        if (tf === '1h') return ['/crypto/hourly', '/crypto/1H', '/crypto/1-hour', '/crypto/1hour', '/crypto/hour'];
+        if (tf === '4h') return ['/crypto/4H', '/crypto/4-hour', '/crypto/4hour', '/crypto/4-hours', '/crypto/4hours'];
+        return ['/crypto/daily', '/crypto/1D', '/crypto/1d', '/crypto/1-day', '/crypto/1day', '/crypto/24h'];
     }
 
-    private predictCryptoAllSlugs(tf: '15m' | '1h' | '4h' | '1d', nowSec: number, symbols: string[]): string[] {
+    private predictCryptoAllSlugs(tf: '5m' | '15m' | '1h' | '4h' | '1d', nowSec: number, symbols: string[]): string[] {
         const tfSec = this.getCryptoAllTimeframeSec(tf);
         const baseStart = Math.floor(nowSec / tfSec) * tfSec;
         const starts = [baseStart - tfSec, baseStart, baseStart + tfSec, baseStart + 2 * tfSec];
         const symList = symbols.length ? symbols : ['BTC', 'ETH', 'SOL', 'XRP'];
         const tfTokens =
-            tf === '15m' ? ['15m', '15M', '15min', '15mins']
-            : tf === '1h' ? ['1h', '1H', '1hr', 'hourly']
-            : tf === '4h' ? ['4h', '4H', '4hr', '4hour', '4-hour']
-            : ['1d', '1D', 'daily', '1day', '1-day'];
+            tf === '5m' ? ['5m', '5M', '5min', '5mins', '5-min', '5-minute', '5minutes']
+            : tf === '15m' ? ['15m', '15M', '15min', '15mins', '15-min', '15-minute', '15minutes']
+            : tf === '1h' ? ['1h', '1H', '1hr', 'hourly', '1-hour', '1hour', '60m', '60min']
+            : tf === '4h' ? ['4h', '4H', '4hr', '4hour', '4-hour', '4hours', '4-hours', '240m', '240min']
+            : ['1d', '1D', 'daily', '1day', '1-day', '24h', '24hr', '24-hour', '24hours', '24-hours'];
         const slugs: string[] = [];
         for (const sym of symList) {
             const s = String(sym || '').toLowerCase();
@@ -4439,12 +5136,13 @@ export class GroupArbitrageScanner {
         }
     }
 
-    private async isBinanceTrendOkWithSpot(options: { symbol: string; minutes: number; direction?: 'Up' | 'Down'; nowMs?: number; spotPriceOverride?: number }): Promise<{ ok: boolean; closes: number[]; lastClose: number | null; spot: number | null; error: string | null }> {
+    private async isBinanceTrendOkWithSpot(options: { symbol: string; minutes: number; direction?: 'Up' | 'Down'; nowMs?: number; spotPriceOverride?: number; allowEqual?: boolean }): Promise<{ ok: boolean; closes: number[]; lastClose: number | null; spot: number | null; error: string | null }> {
         const sym = String(options.symbol || '').toUpperCase();
         const binSymbol = this.getBinanceSymbol(sym);
         const m = Math.max(1, Math.min(10, Math.floor(Number(options.minutes) || 0)));
         if (!binSymbol) return { ok: false, closes: [], lastClose: null, spot: null, error: 'Unsupported symbol' };
         const dir: 'Up' | 'Down' = options.direction === 'Down' ? 'Down' : 'Up';
+        const allowEqual = options.allowEqual === true;
         const now = options.nowMs != null ? Math.floor(Number(options.nowMs) || 0) : Date.now();
         const lastClosedOpenMs = this.getLastClosedMinuteOpenMs(now);
         if (!(lastClosedOpenMs > 0)) return { ok: false, closes: [], lastClose: null, spot: null, error: 'Invalid time' };
@@ -4458,9 +5156,9 @@ export class GroupArbitrageScanner {
             const prev = closes[i - 1];
             const cur = closes[i];
             if (dir === 'Up') {
-                if (!(Number(cur) > Number(prev))) { candleOk = false; break; }
+                if (!(allowEqual ? (Number(cur) >= Number(prev)) : (Number(cur) > Number(prev)))) { candleOk = false; break; }
             } else {
-                if (!(Number(cur) < Number(prev))) { candleOk = false; break; }
+                if (!(allowEqual ? (Number(cur) <= Number(prev)) : (Number(cur) < Number(prev)))) { candleOk = false; break; }
             }
         }
         const lastClose = Number(closes[closes.length - 1]);
@@ -4469,7 +5167,7 @@ export class GroupArbitrageScanner {
         const spot = Number(spotRaw);
         if (!(Number.isFinite(spot) && spot > 0)) return { ok: false, closes, lastClose: Number.isFinite(lastClose) ? lastClose : null, spot: null, error: 'spot_unavailable' };
 
-        const spotOk = dir === 'Up' ? spot > lastClose : spot < lastClose;
+        const spotOk = dir === 'Up' ? (allowEqual ? spot >= lastClose : spot > lastClose) : (allowEqual ? spot <= lastClose : spot < lastClose);
         return { ok: candleOk && spotOk, closes, lastClose, spot, error: null };
     }
 
@@ -4600,6 +5298,31 @@ export class GroupArbitrageScanner {
         }
     }
 
+    private async fetchBinanceKlinesByInterval(options: { symbol: string; interval: '5m' | '15m' | '1h' | '4h' | '1d'; limit: number }): Promise<any[]> {
+        const symbol = String(options.symbol || '').toUpperCase();
+        const binSymbol = this.getBinanceSymbol(symbol);
+        if (!binSymbol) return [];
+        const interval = options.interval;
+        const limit = Math.max(1, Math.min(1000, Math.floor(Number(options.limit) || 0)));
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 6_000);
+        try {
+            const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(binSymbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`;
+            const res = await this.withTimeout(
+                fetch(url, { signal: controller.signal }).finally(() => clearTimeout(t)),
+                6_500,
+                `Binance klines ${binSymbol} ${interval}`
+            );
+            if (!res.ok) return [];
+            const json: any = await this.withTimeout(res.json(), 3_000, `Binance klines json ${binSymbol} ${interval}`);
+            return Array.isArray(json) ? json : [];
+        } catch {
+            return [];
+        } finally {
+            clearTimeout(t);
+        }
+    }
+
     private async fetchClobBooks(tokenIds: string[]): Promise<any[]> {
         const ids = Array.from(new Set((tokenIds || []).map((t) => String(t || '').trim()).filter((t) => t)));
         if (!ids.length) return [];
@@ -4607,6 +5330,19 @@ export class GroupArbitrageScanner {
         const cache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
         const cached = cache?.get(sortedKey);
         if (cached && Date.now() - cached.atMs < 1200) return cached.data;
+        const globalMinIntervalMs = 2000;
+        const globalState = ((this as any).clobBooksGlobalState ??= { nextAllowedAtMs: 0, blockedUntilMs: 0, blockedBackoffMs: 0, lastStatus: null as any, lastError: null as any });
+        const nowMs = Date.now();
+        if (globalState.blockedUntilMs && nowMs < globalState.blockedUntilMs) {
+            if (cached) return cached.data;
+            globalState.lastError = `blocked_until_${globalState.blockedUntilMs}`;
+            throw new Error('CLOB /books blocked (backoff)');
+        }
+        if (globalState.nextAllowedAtMs && nowMs < globalState.nextAllowedAtMs) {
+            if (cached) return cached.data;
+            globalState.lastError = `throttled_until_${globalState.nextAllowedAtMs}`;
+            throw new Error('CLOB /books throttled');
+        }
         try {
             const attempt = async (chunkIds: string[], timeoutMs: number) => {
                 const controller = new AbortController();
@@ -4627,10 +5363,23 @@ export class GroupArbitrageScanner {
                         timeoutMs + 500,
                         'CLOB /books'
                     );
+                    globalState.lastStatus = res.status;
                     if (!res.ok) {
                         let detail: any = null;
-                        try { detail = await res.json(); } catch {}
-                        throw new Error(`CLOB /books failed (${res.status}): ${detail?.error || detail?.message || 'unknown'}`);
+                        let text: string | null = null;
+                        try { detail = await res.json(); } catch {
+                            try { text = await res.text(); } catch {}
+                        }
+                        const msg = detail?.error || detail?.message || (text ? String(text).slice(0, 180) : 'unknown');
+                        if (res.status === 403) {
+                            const next = globalState.blockedBackoffMs ? Math.min(180 * 60_000, globalState.blockedBackoffMs * 2) : 30 * 60_000;
+                            globalState.blockedBackoffMs = next;
+                            globalState.blockedUntilMs = Date.now() + next;
+                            globalState.lastError = `blocked_403 backoffMs=${next}`;
+                        } else {
+                            globalState.lastError = `http_${res.status}`;
+                        }
+                        throw new Error(`CLOB /books failed (${res.status}): ${msg}`);
                     }
                     const ct = String(res.headers.get('content-type') || '');
                     if (!ct.toLowerCase().includes('application/json')) {
@@ -4671,10 +5420,85 @@ export class GroupArbitrageScanner {
                 }
             }
             if (!(this as any).clobBooksCache) (this as any).clobBooksCache = new Map();
-            (this as any).clobBooksCache.set(sortedKey, { atMs: Date.now(), data: out });
+            const cacheMap = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }>;
+            const atMs = Date.now();
+            cacheMap.set(sortedKey, { atMs, data: out });
+            for (const b of out) {
+                const tid = String((b as any)?.token_id ?? (b as any)?.tokenId ?? (b as any)?.tokenID ?? (b as any)?.asset_id ?? '').trim();
+                if (!tid) continue;
+                cacheMap.set(tid, { atMs, data: [b] });
+            }
+            globalState.nextAllowedAtMs = Date.now() + globalMinIntervalMs;
+            globalState.lastError = null;
+            globalState.blockedUntilMs = 0;
+            globalState.blockedBackoffMs = 0;
             return out;
         } finally {
         }
+    }
+
+    private async fetchClobBookSingle(tokenId: string, options?: { minIntervalMs?: number; timeoutMs?: number }): Promise<any> {
+        const tid = String(tokenId || '').trim();
+        if (!tid) throw new Error('Missing tokenId');
+        const minIntervalMs = Math.max(50, Math.floor(Number(options?.minIntervalMs) || 400));
+        const cache = ((this as any).clobBookSingleCache ??= new Map()) as Map<string, { atMs: number; data: any }>;
+        const inFlight = ((this as any).clobBookSingleInFlight ??= new Map()) as Map<string, Promise<any>>;
+        const cached = cache.get(tid);
+        const now = Date.now();
+        if (cached && now - cached.atMs < minIntervalMs) return cached.data;
+        const cur = inFlight.get(tid);
+        if (cur) return cur;
+        const p = (async () => {
+            try {
+                const books = await this.fetchClobBooks([tid]).catch(() => []);
+                const data = Array.isArray(books) && books.length ? books[0] : null;
+                cache.set(tid, { atMs: Date.now(), data });
+                return data;
+            } finally {
+                inFlight.delete(tid);
+            }
+        })();
+        inFlight.set(tid, p);
+        return await p;
+    }
+
+    private pushCrypto15mBook60sSample(sample: { tokenId: string; sec: number; bestAsk: number | null; bestBid: number | null; topAskSize: number | null; topAskUsd: number | null; depthUsd980: number | null; depthUsd999: number | null; asksCount: number; bidsCount: number }) {
+        const tokenId = String(sample.tokenId || '').trim();
+        if (!tokenId) return;
+        const sec = Math.max(0, Math.floor(Number(sample.sec) || 0));
+        if (!sec) return;
+        const map = ((this as any).crypto15mBook60sByTokenId ??= new Map()) as Map<string, any[]>;
+        const prev = map.get(tokenId) || [];
+        const last = prev.length ? prev[prev.length - 1] : null;
+        const item = {
+            sec,
+            bestAsk: sample.bestAsk != null && Number.isFinite(Number(sample.bestAsk)) ? Number(sample.bestAsk) : null,
+            bestBid: sample.bestBid != null && Number.isFinite(Number(sample.bestBid)) ? Number(sample.bestBid) : null,
+            topAskSize: sample.topAskSize != null && Number.isFinite(Number(sample.topAskSize)) ? Number(sample.topAskSize) : null,
+            topAskUsd: sample.topAskUsd != null && Number.isFinite(Number(sample.topAskUsd)) ? Number(sample.topAskUsd) : null,
+            depthUsd980: sample.depthUsd980 != null && Number.isFinite(Number(sample.depthUsd980)) ? Number(sample.depthUsd980) : null,
+            depthUsd999: sample.depthUsd999 != null && Number.isFinite(Number(sample.depthUsd999)) ? Number(sample.depthUsd999) : null,
+            asksCount: Math.max(0, Math.floor(Number(sample.asksCount) || 0)),
+            bidsCount: Math.max(0, Math.floor(Number(sample.bidsCount) || 0)),
+        };
+        if (last && Number(last.sec) === sec) {
+            prev[prev.length - 1] = item;
+        } else {
+            prev.push(item);
+        }
+        while (prev.length > 70) prev.shift();
+        map.set(tokenId, prev);
+    }
+
+    private getCrypto15mBook60sSnapshot(tokenId: string, endMs?: number): { endSec: number; points: any[] } {
+        const tid = String(tokenId || '').trim();
+        const endSec = Math.max(0, Math.floor(Number.isFinite(Number(endMs)) ? Number(endMs) / 1000 : Date.now() / 1000));
+        if (!tid) return { endSec, points: [] };
+        const map = ((this as any).crypto15mBook60sByTokenId ??= new Map()) as Map<string, any[]>;
+        const list = map.get(tid) || [];
+        const startSec = Math.max(0, endSec - 59);
+        const points = list.filter((p: any) => Number(p?.sec) >= startSec && Number(p?.sec) <= endSec);
+        return { endSec, points };
     }
 
 
@@ -4682,23 +5506,14 @@ export class GroupArbitrageScanner {
         if (this.crypto15mMarketInFlight) return this.crypto15mMarketInFlight;
         if (this.crypto15mMarketNextAllowedAtMs && Date.now() < this.crypto15mMarketNextAllowedAtMs) return;
         this.crypto15mMarketInFlight = (async () => {
+            let diag: any = null;
             try {
                 const now = Date.now();
                 const nowSec = Math.floor(now / 1000);
                 const is15m = (m: any) => {
                     const title = String(m?.question || m?.title || '').toLowerCase();
                     const slug = String(m?.slug || '').toLowerCase();
-                    const has15m = /\b15\s*(m|min|mins|minute|minutes)\b/.test(title) || slug.includes('15m') || slug.includes('15-min') || slug.includes('-15m-');
-                    const hasUpDown = title.includes('up or down') || title.includes('up/down') || title.includes('updown') || slug.includes('updown') || slug.includes('up-or-down');
-                    return has15m && hasUpDown;
-                };
-                const getSymbolFromSlug = (slug: string): string | null => {
-                    const s = String(slug || '').toLowerCase();
-                    if (s.startsWith('btc-')) return 'BTC';
-                    if (s.startsWith('eth-')) return 'ETH';
-                    if (s.startsWith('sol-')) return 'SOL';
-                    if (s.startsWith('xrp-')) return 'XRP';
-                    return null;
+                    return this.matchesCryptoAllTimeframe('15m', slug, title);
                 };
                 const parseStartSecFromSlug = (slug: string): number | null => {
                     const parts = String(slug || '').split('-');
@@ -4724,15 +5539,107 @@ export class GroupArbitrageScanner {
                     return out;
                 };
 
-                const predicted = this.predictCryptoAllSlugs('15m', nowSec, ['BTC', 'ETH', 'SOL', 'XRP']).slice(0, maxSlugs);
-                let markets: any[] = await resolveMarkets(Array.from(new Set(predicted)));
-                if (!markets.length) {
-                    const siteSlugs = await this.fetchCryptoSlugsFromSitePath('/crypto/15M', maxSlugs).catch(() => []);
-                    const uniqSite = Array.from(new Set((siteSlugs || []).map((s: any) => String(s || '').trim()).filter(Boolean))).slice(0, maxSlugs);
-                    if (uniqSite.length) {
-                        markets = await resolveMarkets(uniqSite);
+                const predicted = this.predictCryptoAllSlugs('15m', nowSec, ['BTC', 'ETH', 'SOL', 'XRP']);
+                const tfSec = this.getCryptoAllTimeframeSec('15m');
+                const baseStart = Math.floor(nowSec / tfSec) * tfSec;
+                diag = {
+                    atMs: Date.now(),
+                    nowSec,
+                    baseStart,
+                    predictedCount: predicted.length,
+                    siteSlugsCount: 0,
+                    wantedSlugs: [] as string[],
+                    marketsFetched: 0,
+                    baseMarkets: 0,
+                };
+
+                const pickOnePerSymbol = (slugsRaw: any[]): string[] => {
+                    const bucket = new Map<string, Array<{ slug: string; endMs: number | null }>>();
+                    for (const raw of slugsRaw || []) {
+                        const slug = String(raw || '').trim().toLowerCase();
+                        if (!slug) continue;
+                        if (!this.matchesCryptoAllTimeframe('15m', slug, slug)) continue;
+                        const sym = this.inferCryptoSymbolFromText(slug, '');
+                        if (!sym) continue;
+                        const startSec = parseStartSecFromSlug(slug);
+                        const endMs = startSec != null ? (startSec + 15 * 60) * 1000 : null;
+                        if (!bucket.has(sym)) bucket.set(sym, []);
+                        bucket.get(sym)!.push({ slug, endMs });
+                    }
+                    const out: string[] = [];
+                    const maxAheadMs = 2 * 60 * 60_000;
+                    for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                        const arr = (bucket.get(sym) || []).filter((x) => x.endMs != null && x.endMs > now && (x.endMs - now) <= maxAheadMs);
+                        arr.sort((a, b) => {
+                            const ae = a.endMs == null ? Number.POSITIVE_INFINITY : a.endMs;
+                            const be = b.endMs == null ? Number.POSITIVE_INFINITY : b.endMs;
+                            return ae - be;
+                        });
+                        if (arr[0]?.slug) out.push(arr[0].slug);
+                    }
+                    return out;
+                };
+
+                const siteSlugs = await this.fetchCryptoSlugsFromSitePath('/crypto/15M', 200).catch(() => []);
+                diag.siteSlugsCount = Array.isArray(siteSlugs) ? siteSlugs.length : 0;
+                const wantedFromSite = pickOnePerSymbol(siteSlugs as any[]);
+
+                const wantedFromPred: string[] = [];
+                if (wantedFromSite.length < 4) {
+                    const bySym = new Map<string, string[]>();
+                    for (const raw of predicted) {
+                        const slug = String(raw || '').trim().toLowerCase();
+                        if (!slug) continue;
+                        if (!this.matchesCryptoAllTimeframe('15m', slug, slug)) continue;
+                        const sym = this.inferCryptoSymbolFromText(slug, '');
+                        if (!sym) continue;
+                        if (!bySym.has(sym)) bySym.set(sym, []);
+                        bySym.get(sym)!.push(slug);
+                    }
+                    for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                        if (wantedFromSite.some((s) => s.startsWith(sym.toLowerCase() + '-'))) continue;
+                        const arr = bySym.get(sym) || [];
+                        let best: { slug: string; endMs: number } | null = null;
+                        for (const slug of arr) {
+                            const startSec = parseStartSecFromSlug(slug);
+                            if (startSec == null) continue;
+                            const endMs = (startSec + 15 * 60) * 1000;
+                            if (!(endMs > now)) continue;
+                            if (!best || endMs < best.endMs) best = { slug, endMs };
+                        }
+                        const picked = best?.slug || arr[0];
+                        if (picked) wantedFromPred.push(picked);
                     }
                 }
+                diag.wantedFromSite = wantedFromSite.slice();
+                diag.wantedFromPred = wantedFromPred.slice();
+                const slugsToResolve = Array.from(new Set([...wantedFromSite, ...wantedFromPred])).slice(0, 8);
+                diag.wantedSlugs = slugsToResolve.slice();
+
+                const resolveWithRetry = async (slugs: string[]): Promise<any[]> => {
+                    const uniq = Array.from(new Set(slugs.map((s) => String(s || '').trim()).filter(Boolean)));
+                    if (!uniq.length) return [];
+                    const outBySlug = new Map<string, any>();
+                    let remain = uniq.slice();
+                    for (let round = 0; round < 2 && remain.length; round++) {
+                        const settled = await Promise.allSettled(remain.map(async (slug) => {
+                            const url = `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`;
+                            const data = await this.withTimeout(this.fetchGammaJson(url), 5_000, `Gamma slug ${slug}`);
+                            const list = Array.isArray(data) ? data : [];
+                            return { slug, m: list[0] || null };
+                        }));
+                        for (const r of settled) {
+                            if (r.status !== 'fulfilled') continue;
+                            if (r.value?.m) outBySlug.set(String(r.value.slug).toLowerCase(), r.value.m);
+                        }
+                        remain = remain.filter((s) => !outBySlug.has(String(s).toLowerCase()));
+                        if (remain.length) await new Promise((r) => setTimeout(r, 250));
+                    }
+                    return Array.from(outBySlug.values());
+                };
+
+                const markets: any[] = await resolveWithRetry(slugsToResolve);
+                diag.marketsFetched = markets.length;
                 const baseMarkets: any[] = [];
                 for (const m of markets) {
                     if (!m || !is15m(m)) continue;
@@ -4757,22 +5664,141 @@ export class GroupArbitrageScanner {
                     const upIdx = outsLower.findIndex((x) => x.includes('up'));
                     const downIdx = outsLower.findIndex((x) => x.includes('down'));
                     if (upIdx < 0 || downIdx < 0) continue;
+                    const upOutcome = outcomes[upIdx];
+                    const downOutcome = outcomes[downIdx];
+                    const upTokenId = tokenIds[upIdx];
+                    const downTokenId = tokenIds[downIdx];
+                    if (!upOutcome || !downOutcome || !upTokenId || !downTokenId) continue;
                     baseMarkets.push({
-                        symbol: getSymbolFromSlug(String(m?.slug || '')),
+                        symbol: this.inferCryptoSymbolFromText(String(m?.slug || ''), String(m?.question || m?.title || '')),
                         conditionId,
                         slug: m?.slug,
                         title: m?.question || m?.title,
                         endMs,
                         endDate: new Date(endMs).toISOString(),
                         endMsSource,
-                        outcomes: outcomes.slice(0, 2),
-                        tokenIds: tokenIds.slice(0, 2),
-                        upIdx,
-                        downIdx,
+                        outcomes: [upOutcome, downOutcome],
+                        tokenIds: [upTokenId, downTokenId],
+                        upIdx: 0,
+                        downIdx: 1,
                     });
                 }
-                if (!baseMarkets.length) throw new Error('No 15m markets returned from Gamma');
-                this.crypto15mMarketSnapshot = { atMs: Date.now(), markets: baseMarkets.slice(0, 30), lastError: null };
+                if (!baseMarkets.length) {
+                    const tagId = await this.resolveCryptoTagId();
+                    if (tagId) {
+                        const pageSize = 50;
+                        const maxPages = 6;
+                        const wantedSyms = new Set<string>(['BTC', 'ETH', 'SOL', 'XRP']);
+                        for (let page = 0; page < maxPages && wantedSyms.size; page++) {
+                            const events = await this.fetchGammaCryptoEvents(tagId, pageSize, page * pageSize).catch(() => []);
+                            if (!Array.isArray(events) || !events.length) break;
+                            for (const ev of events) {
+                                const evSlug = String((ev as any)?.slug || '').trim();
+                                const evTitle = String((ev as any)?.title || (ev as any)?.question || '').trim();
+                                const evEndIso = (ev as any)?.endDate ?? (ev as any)?.endDateIso ?? (ev as any)?.end_date ?? (ev as any)?.end_date_iso ?? null;
+                                const marketsArr = Array.isArray((ev as any)?.markets) ? (ev as any).markets : [];
+                                for (const mm of marketsArr) {
+                                    const slug = String((mm as any)?.slug || (mm as any)?.marketSlug || evSlug || '').trim();
+                                    const q = String((mm as any)?.question ?? (mm as any)?.title ?? evTitle ?? '').trim();
+                                    if (!slug && !q) continue;
+                                    if (!this.matchesCryptoAllTimeframe('15m', slug, q)) continue;
+                                    const sym = this.inferCryptoSymbolFromText(slug, q);
+                                    if (!sym || !wantedSyms.has(sym)) continue;
+                                    const conditionId = String((mm as any)?.conditionId ?? (mm as any)?.condition_id ?? '').trim();
+                                    if (!conditionId || !conditionId.startsWith('0x')) continue;
+                                    const endIso = (mm as any)?.endDate ?? (mm as any)?.end_date ?? (mm as any)?.endDateIso ?? (mm as any)?.end_date_iso ?? evEndIso ?? null;
+                                    const endMsFromDate = endIso ? Date.parse(String(endIso)) : NaN;
+                                    const slugStartSec = parseStartSecFromSlug(slug);
+                                    let endMs = endMsFromDate;
+                                    let endMsSource: 'endDate' | 'slug' = 'endDate';
+                                    if (!Number.isFinite(endMs) && slugStartSec != null) {
+                                        endMs = (slugStartSec + 15 * 60) * 1000;
+                                        endMsSource = 'slug';
+                                    }
+                                    if (!Number.isFinite(endMs) || endMs <= now) continue;
+                                    const outcomes = this.tryParseJsonArray((mm as any)?.outcomes);
+                                    const tokenIds = this.tryParseJsonArray((mm as any)?.clobTokenIds ?? (mm as any)?.clob_token_ids ?? null);
+                                    if (outcomes.length < 2 || tokenIds.length < 2) continue;
+                                    const outsLower = outcomes.map((x) => String(x).toLowerCase());
+                                    const upIdx = outsLower.findIndex((x) => x.includes('up'));
+                                    const downIdx = outsLower.findIndex((x) => x.includes('down'));
+                                    if (upIdx < 0 || downIdx < 0) continue;
+                                    const upOutcome = outcomes[upIdx];
+                                    const downOutcome = outcomes[downIdx];
+                                    const upTokenId = tokenIds[upIdx];
+                                    const downTokenId = tokenIds[downIdx];
+                                    if (!upOutcome || !downOutcome || !upTokenId || !downTokenId) continue;
+                                    baseMarkets.push({
+                                        symbol: sym,
+                                        conditionId,
+                                        slug,
+                                        title: q,
+                                        endMs,
+                                        endDate: new Date(endMs).toISOString(),
+                                        endMsSource,
+                                        outcomes: [upOutcome, downOutcome],
+                                        tokenIds: [upTokenId, downTokenId],
+                                        upIdx: 0,
+                                        downIdx: 1,
+                                    });
+                                    wantedSyms.delete(sym);
+                                    if (!wantedSyms.size) break;
+                                }
+                                if (!wantedSyms.size) break;
+                            }
+                        }
+                    }
+                }
+                const horizonMs = 60 * 60_000;
+                const baseMarketsNear = baseMarkets.filter((m) => {
+                    const endMs = Number(m?.endMs || 0);
+                    if (!(endMs > now)) return false;
+                    return (endMs - now) <= horizonMs;
+                });
+                diag.baseMarkets = baseMarketsNear.length;
+                if (!baseMarketsNear.length) throw new Error('No 15m markets returned from Gamma');
+                const bySym = new Map<string, any[]>();
+                for (const m of baseMarketsNear) {
+                    const sym = String(m?.symbol || '').toUpperCase();
+                    if (!sym) continue;
+                    if (!bySym.has(sym)) bySym.set(sym, []);
+                    bySym.get(sym)!.push(m);
+                }
+                for (const [sym, arr] of bySym.entries()) {
+                    arr.sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0));
+                    bySym.set(sym, arr);
+                }
+                const finalMarkets: any[] = [];
+                const seen = new Set<string>();
+                for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                    const m0 = (bySym.get(sym) || [])[0];
+                    if (!m0) continue;
+                    const k = `${String(m0?.conditionId || '')}:${String(m0?.slug || '')}`;
+                    if (k.startsWith(':') || seen.has(k)) continue;
+                    seen.add(k);
+                    finalMarkets.push(m0);
+                }
+
+                if (finalMarkets.length < 4) {
+                    const prevMarketsAll = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
+                    const nowMs = Date.now();
+                    for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                        if (finalMarkets.some((m) => String(m?.symbol || '').toUpperCase() === sym)) continue;
+                        const prev = prevMarketsAll
+                            .filter((m: any) => String(m?.symbol || '').toUpperCase() === sym && Array.isArray(m?.tokenIds) && m.tokenIds.length >= 2)
+                            .filter((m: any) => {
+                                const endMs = Number(m?.endMs || 0);
+                                return endMs > nowMs && (endMs - nowMs) <= horizonMs;
+                            })
+                            .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))[0];
+                        if (prev) finalMarkets.push(prev);
+                    }
+                }
+
+                if (!finalMarkets.length) throw new Error('No 15m markets returned from Gamma');
+                diag.symbolCounts = Object.fromEntries(Array.from(bySym.entries()).map(([k, v]) => [k, v.length]));
+                this.crypto15mMarketSnapshot = { atMs: Date.now(), markets: finalMarkets.slice(0, 4), lastError: null };
+                (this.crypto15mMarketSnapshot as any).diag = diag;
                 this.crypto15mMarketBackoffMs = 0;
                 this.crypto15mMarketNextAllowedAtMs = 0;
             } catch (e: any) {
@@ -4781,6 +5807,7 @@ export class GroupArbitrageScanner {
                 this.crypto15mMarketBackoffMs = next;
                 this.crypto15mMarketNextAllowedAtMs = Date.now() + next;
                 this.crypto15mMarketSnapshot = { ...this.crypto15mMarketSnapshot, atMs: Date.now(), lastError: msg };
+                (this.crypto15mMarketSnapshot as any).diag = { ...(diag || {}), atMs: Date.now(), error: msg };
             } finally {
                 this.crypto15mMarketInFlight = null;
             }
@@ -4797,16 +5824,39 @@ export class GroupArbitrageScanner {
         this.crypto15mBooksInFlight = (async () => {
             this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastAttemptAtMs: Date.now(), lastAttemptError: null };
             try {
-                const markets = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
+                const marketsAll = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
+                const markets = marketsAll
+                    .filter((m: any) => Array.isArray(m?.tokenIds) && m.tokenIds.length >= 2)
+                    .slice()
+                    .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))
+                    .slice(0, 12);
                 const tokenIds = Array.from(new Set(markets.flatMap((m: any) => Array.isArray(m?.tokenIds) ? m.tokenIds : []).map((t: any) => String(t || '').trim()).filter((t: any) => !!t)));
                 if (!tokenIds.length) {
-                    this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastError: 'No tokenIds for books refresh', lastAttemptError: 'No tokenIds for books refresh' };
+                    const reason = marketsAll.length ? 'No tokenIds for books refresh (markets missing tokenIds)' : 'No tokenIds for books refresh (no markets)';
+                    this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastError: reason, lastAttemptError: reason };
                     return;
                 }
-                const books = await this.fetchClobBooks(tokenIds);
-                const byTokenId: Record<string, any> = {};
+                const prevByTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
+                const byTokenId: Record<string, any> = { ...prevByTokenId };
+                for (const t of tokenIds) {
+                    if (!byTokenId[t]) byTokenId[t] = { tokenId: t, timestamp: null, fetchedAtMs: null, asksCount: 0, bidsCount: 0, bestAsk: null, bestBid: null, error: 'stale' };
+                }
+                let books: any[] = [];
+                let usedSdkFallback = false;
+                try {
+                    books = await this.fetchClobBooks(tokenIds);
+                } catch {
+                    const settled = await Promise.allSettled(tokenIds.map(async (tid) => {
+                        const ob = await this.sdk.clobApi.getOrderbook(tid);
+                        return { asset_id: tid, asks: Array.isArray((ob as any)?.asks) ? (ob as any).asks : [], bids: Array.isArray((ob as any)?.bids) ? (ob as any).bids : [], timestamp: (ob as any)?.timestamp ?? null };
+                    }));
+                    books = settled.filter((r) => r.status === 'fulfilled').map((r: any) => r.value);
+                    if (!books.length) throw new Error('No orderbooks from sdk fallback');
+                    usedSdkFallback = true;
+                }
+                const booksCache = !usedSdkFallback ? ((this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined) : undefined;
                 for (const b of books) {
-                    const tokenId = String(b?.asset_id || b?.assetId || '').trim();
+                    const tokenId = String(b?.token_id ?? b?.tokenId ?? b?.tokenID ?? b?.asset_id ?? b?.assetId ?? '').trim();
                     if (!tokenId) continue;
                     const asks = Array.isArray(b?.asks) ? b.asks : [];
                     const bids = Array.isArray(b?.bids) ? b.bids : [];
@@ -4822,19 +5872,41 @@ export class GroupArbitrageScanner {
                         if (!Number.isFinite(p) || p <= 0) continue;
                         if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
                     }
+                    const fetchedAtMs = booksCache?.get(tokenId)?.atMs ?? Date.now();
+                    const topAskPrice = Number(asks?.[0]?.price);
+                    const topAskSize = Number(asks?.[0]?.size);
+                    const topAskUsd = Number.isFinite(topAskPrice) && Number.isFinite(topAskSize) ? (topAskPrice * topAskSize) : null;
+                    let depthUsd980 = 0;
+                    let depthUsd999 = 0;
+                    for (const a of asks.slice(0, 200)) {
+                        const p = Number((a as any)?.price);
+                        const s = Number((a as any)?.size);
+                        if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(s) || s <= 0) continue;
+                        if (p <= 0.98) depthUsd980 += p * s;
+                        if (p <= 0.999) depthUsd999 += p * s;
+                        else break;
+                    }
                     byTokenId[tokenId] = {
                         tokenId,
                         timestamp: b?.timestamp ?? null,
+                        fetchedAtMs,
                         asksCount: asks.length,
                         bidsCount: bids.length,
                         bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
                         bestBid: Number.isFinite(bestBid) ? bestBid : null,
                     };
-                }
-                for (const t of tokenIds) {
-                    if (!byTokenId[t]) {
-                        byTokenId[t] = { tokenId: t, timestamp: null, asksCount: 0, bidsCount: 0, bestAsk: null, bestBid: null, error: 'missing' };
-                    }
+                    this.pushCrypto15mBook60sSample({
+                        tokenId,
+                        sec: Math.floor(fetchedAtMs / 1000),
+                        bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                        bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                        topAskSize: Number.isFinite(topAskSize) ? topAskSize : null,
+                        topAskUsd: topAskUsd != null && Number.isFinite(Number(topAskUsd)) ? Number(topAskUsd) : null,
+                        depthUsd980: Number.isFinite(depthUsd980) ? depthUsd980 : null,
+                        depthUsd999: Number.isFinite(depthUsd999) ? depthUsd999 : null,
+                        asksCount: asks.length,
+                        bidsCount: bids.length,
+                    });
                 }
                 this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, atMs: Date.now(), byTokenId, lastError: null, lastAttemptError: null };
                 this.crypto15mBooksBackoffMs = 0;
@@ -4852,6 +5924,105 @@ export class GroupArbitrageScanner {
         return this.crypto15mBooksInFlight;
     }
 
+    private async refreshCrypto15mBooksSnapshotTiered(options?: { targetFreshMs?: number }): Promise<void> {
+        const desired = Number(options?.targetFreshMs);
+        const staleMsThreshold = Number.isFinite(Number(this.crypto15mAutoConfig.staleMsThreshold)) ? Number(this.crypto15mAutoConfig.staleMsThreshold) : 1500;
+        const targetFreshMs = Math.max(100, Math.floor(Number.isFinite(desired) ? desired : 500));
+        const target = Math.min(targetFreshMs, Math.max(200, Math.floor(staleMsThreshold)));
+        const markets = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
+        const tokenIds = Array.from(new Set(markets.flatMap((m: any) => Array.isArray(m?.tokenIds) ? m.tokenIds : []).map((t: any) => String(t || '').trim()).filter((t) => !!t)));
+        if (!tokenIds.length) return;
+
+        const prevByTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
+        const byTokenId: Record<string, any> = { ...prevByTokenId };
+        for (const t of tokenIds) {
+            if (!byTokenId[t]) byTokenId[t] = { tokenId: t, timestamp: null, fetchedAtMs: null, asksCount: 0, bidsCount: 0, bestAsk: null, bestBid: null, error: 'stale' };
+        }
+
+        const now = Date.now();
+        const needs = tokenIds.filter((tid) => {
+            const prev = byTokenId[tid];
+            const at = prev?.fetchedAtMs != null ? Number(prev.fetchedAtMs) : NaN;
+            if (!Number.isFinite(at) || at <= 0) return true;
+            return (now - at) > target;
+        });
+        if (!needs.length) return;
+
+        this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, lastAttemptAtMs: Date.now(), lastAttemptError: null };
+        const chunkSize = 80;
+        const booksCache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
+        let anyOk = false;
+        let firstErrMsg: string | null = null;
+        for (let i = 0; i < needs.length; i += chunkSize) {
+            const chunk = needs.slice(i, i + chunkSize);
+            try {
+                const books = await this.fetchClobBooks(chunk);
+                if (Array.isArray(books) && books.length) anyOk = true;
+                for (const b of books) {
+                    const tokenId = String(b?.token_id ?? b?.tokenId ?? b?.tokenID ?? b?.asset_id ?? b?.assetId ?? '').trim();
+                    if (!tokenId) continue;
+                    const asks = Array.isArray(b?.asks) ? b.asks : [];
+                    const bids = Array.isArray(b?.bids) ? b.bids : [];
+                    let bestAsk = NaN;
+                    for (const a of asks) {
+                        const p = Number((a as any)?.price);
+                        if (!Number.isFinite(p) || p <= 0) continue;
+                        if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+                    }
+                    let bestBid = NaN;
+                    for (const bb of bids) {
+                        const p = Number((bb as any)?.price);
+                        if (!Number.isFinite(p) || p <= 0) continue;
+                        if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+                    }
+                    const fetchedAtMs = booksCache?.get(tokenId)?.atMs ?? Date.now();
+                    const topAskPrice = Number(asks?.[0]?.price);
+                    const topAskSize = Number(asks?.[0]?.size);
+                    const topAskUsd = Number.isFinite(topAskPrice) && Number.isFinite(topAskSize) ? (topAskPrice * topAskSize) : null;
+                    let depthUsd980 = 0;
+                    let depthUsd999 = 0;
+                    for (const a of asks.slice(0, 200)) {
+                        const p = Number((a as any)?.price);
+                        const s = Number((a as any)?.size);
+                        if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(s) || s <= 0) continue;
+                        if (p <= 0.98) depthUsd980 += p * s;
+                        if (p <= 0.999) depthUsd999 += p * s;
+                        else break;
+                    }
+                    byTokenId[tokenId] = {
+                        tokenId,
+                        timestamp: b?.timestamp ?? null,
+                        fetchedAtMs,
+                        asksCount: asks.length,
+                        bidsCount: bids.length,
+                        bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                        bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                    };
+                    this.pushCrypto15mBook60sSample({
+                        tokenId,
+                        sec: Math.floor(fetchedAtMs / 1000),
+                        bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                        bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                        topAskSize: Number.isFinite(topAskSize) ? topAskSize : null,
+                        topAskUsd: topAskUsd != null && Number.isFinite(Number(topAskUsd)) ? Number(topAskUsd) : null,
+                        depthUsd980: Number.isFinite(depthUsd980) ? depthUsd980 : null,
+                        depthUsd999: Number.isFinite(depthUsd999) ? depthUsd999 : null,
+                        asksCount: asks.length,
+                        bidsCount: bids.length,
+                    });
+                }
+            } catch (e: any) {
+                const msg = e?.message || String(e);
+                if (!firstErrMsg) firstErrMsg = msg;
+            }
+        }
+        if (!anyOk && firstErrMsg) {
+            this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, atMs: Date.now(), byTokenId, lastAttemptError: firstErrMsg, lastError: this.crypto15mBooksSnapshot.lastError || null };
+            return;
+        }
+        this.crypto15mBooksSnapshot = { ...this.crypto15mBooksSnapshot, atMs: Date.now(), byTokenId, lastError: null, lastAttemptError: firstErrMsg };
+    }
+
     private buildCrypto15mCandidatesFromSnapshots(options?: { minProb?: number; expiresWithinSec?: number; limit?: number }) {
         const minProb = Math.max(0, Math.min(1, Number(options?.minProb ?? this.crypto15mAutoConfig.minProb)));
         const expiresWithinSec = Math.max(5, Math.floor(Number(options?.expiresWithinSec ?? this.crypto15mAutoConfig.expiresWithinSec)));
@@ -4861,7 +6032,7 @@ export class GroupArbitrageScanner {
         const markets = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
         const byTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
         const snapshotAt = this.crypto15mBooksSnapshot.atMs ? new Date(this.crypto15mBooksSnapshot.atMs).toISOString() : null;
-        const staleMs = this.crypto15mBooksSnapshot.atMs ? Math.max(0, now - this.crypto15mBooksSnapshot.atMs) : null;
+        const snapshotStaleMs = this.crypto15mBooksSnapshot.atMs ? Math.max(0, now - this.crypto15mBooksSnapshot.atMs) : null;
         const booksAttemptAt = this.crypto15mBooksSnapshot.lastAttemptAtMs ? new Date(this.crypto15mBooksSnapshot.lastAttemptAtMs).toISOString() : null;
         const candidates: any[] = [];
         for (const m of markets) {
@@ -4875,6 +6046,8 @@ export class GroupArbitrageScanner {
             const downIdx = Number.isFinite(Number(m?.downIdx)) ? Number(m.downIdx) : 1;
             if (outcomes.length < 2 || tokenIds.length < 2) continue;
             const books = tokenIds.slice(0, 2).map((t: any) => byTokenId[String(t || '').trim()] || null);
+            const booksFetchedAtMs = books.map((b: any) => (b?.fetchedAtMs != null && Number.isFinite(Number(b.fetchedAtMs)) ? Number(b.fetchedAtMs) : null));
+            const booksStaleMs = booksFetchedAtMs.map((at: any) => (at != null ? Math.max(0, now - Number(at)) : null));
             const prices = books.map((b: any) => {
                 const ask = b?.bestAsk;
                 return ask != null && Number.isFinite(Number(ask)) ? Number(ask) : NaN;
@@ -4887,14 +6060,17 @@ export class GroupArbitrageScanner {
             let chosenIndex = upIdx;
             if (downHasAsk && (!upHasAsk || (Number.isFinite(downPrice) && Number.isFinite(upPrice) && downPrice > upPrice))) chosenIndex = downIdx;
             if (!downHasAsk && upHasAsk) chosenIndex = upIdx;
-            const chosenPrice = Number(prices[chosenIndex]);
+            if (!upHasAsk && !downHasAsk) chosenIndex = -1;
+            const chosenPrice = chosenIndex >= 0 ? Number(prices[chosenIndex]) : NaN;
+            const chosenFetchedAtMs = chosenIndex >= 0 ? booksFetchedAtMs[chosenIndex] : null;
+            const chosenStaleMs = chosenIndex >= 0 ? booksStaleMs[chosenIndex] : null;
             const eligibleByExpiry = secondsToExpire <= expiresWithinSec;
             const meetsMinProb = Number.isFinite(chosenPrice) ? chosenPrice >= minProb : false;
-            const chosenHasAsk = hasAsk[chosenIndex] === true;
+            const chosenHasAsk = chosenIndex >= 0 ? hasAsk[chosenIndex] === true : false;
         let reason: string | null = null;
         if (this.crypto15mBooksSnapshot.lastError) reason = 'books_error';
         else if (this.crypto15mMarketSnapshot.lastError) reason = 'market_error';
-        else if (staleMs != null && staleMs > staleMsThreshold) reason = 'stale';
+        else if (chosenStaleMs != null && chosenStaleMs > staleMsThreshold) reason = 'stale';
         else if (!chosenHasAsk) reason = 'no-asks';
         else if (!eligibleByExpiry) reason = 'expiry';
         else if (!meetsMinProb) reason = 'price';
@@ -4916,11 +6092,15 @@ export class GroupArbitrageScanner {
                 asksCount: books.map((b: any) => Number(b?.asksCount ?? 0)),
                 bidsCount: books.map((b: any) => Number(b?.bidsCount ?? 0)),
                 chosenIndex,
-                chosenOutcome: String(outcomes[chosenIndex]),
+                chosenOutcome: chosenIndex >= 0 ? String(outcomes[chosenIndex]) : null,
                 chosenPrice: Number.isFinite(chosenPrice) ? chosenPrice : null,
-                chosenTokenId: String(tokenIds[chosenIndex]),
+                chosenTokenId: chosenIndex >= 0 ? String(tokenIds[chosenIndex]) : null,
+                chosenFetchedAtMs,
                 snapshotAt,
-                staleMs,
+                staleMs: chosenStaleMs,
+                booksStaleMs,
+                booksFetchedAtMs,
+                snapshotStaleMs,
                 booksError: this.crypto15mBooksSnapshot.lastError,
                 booksAttemptAt,
                 booksAttemptError: this.crypto15mBooksSnapshot.lastAttemptError,
@@ -4943,7 +6123,7 @@ export class GroupArbitrageScanner {
             countEligible,
             candidates: candidates.slice(0, limit),
             snapshotAt,
-            staleMs,
+            staleMs: snapshotStaleMs,
             booksAttemptAt,
             booksAttemptError: this.crypto15mBooksSnapshot.lastAttemptError,
             marketSnapshotAt: this.crypto15mMarketSnapshot.atMs ? new Date(this.crypto15mMarketSnapshot.atMs).toISOString() : null,
@@ -5011,7 +6191,7 @@ export class GroupArbitrageScanner {
             const status = this.getCryptoAllStatus();
             const now = Date.now();
             for (const [socket, cfg] of this.cryptoAllWsClients.entries()) {
-                const key = JSON.stringify({ symbols: cfg.symbols.slice().sort(), timeframes: cfg.timeframes.slice().sort(), minProb: cfg.minProb, expiresWithinSec: cfg.expiresWithinSec, limit: cfg.limit });
+                const key = JSON.stringify({ symbols: cfg.symbols.slice().sort(), timeframes: cfg.timeframes.slice().sort(), minProb: cfg.minProb, expiresWithinSec: cfg.expiresWithinSec, expiresWithinSecByTimeframe: (cfg as any).expiresWithinSecByTimeframe, limit: cfg.limit });
                 try {
                     const c = cache.get(key);
                     let candidates: any[] = [];
@@ -5023,6 +6203,7 @@ export class GroupArbitrageScanner {
                             timeframes: cfg.timeframes,
                             minProb: cfg.minProb,
                             expiresWithinSec: cfg.expiresWithinSec,
+                            expiresWithinSecByTimeframe: (cfg as any).expiresWithinSecByTimeframe,
                             limit: cfg.limit,
                         });
                         candidates = (nextCandidates.length === 0 && c && c.candidates.length) ? c.candidates : nextCandidates;
@@ -5050,15 +6231,312 @@ export class GroupArbitrageScanner {
         const tick = async () => {
             if (!this.cryptoAllWsClients.size) return;
             const symbols = Array.from(new Set(Array.from(this.cryptoAllWsClients.values()).flatMap((c: any) => c.symbols || [])));
+            const timeframes = Array.from(new Set(Array.from(this.cryptoAllWsClients.values()).flatMap((c: any) => c.timeframes || [])))
+                .map((x: any) => String(x || '').toLowerCase())
+                .filter((t: any) => ['5m', '15m', '1h', '4h', '1d'].includes(t)) as Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
             const limit = Math.max(10, Math.min(100, Math.max(...Array.from(this.cryptoAllWsClients.values()).map((c: any) => Number(c.limit) || 0), 0)));
-            await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes: ['15m'], limit }).catch(() => {});
-            await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes: ['15m'], limit }).catch(() => {});
+            await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes: timeframes.length ? timeframes : ['15m'], limit }).catch(() => {});
+            await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes: timeframes.length ? timeframes : ['15m'], limit }).catch(() => {});
         };
         this.cryptoAllSnapshotTimer = setInterval(() => tick().catch(() => {}), 1000);
         tick().catch(() => {});
     }
 
-    public addCryptoAllWsClient(socket: any, options: { symbols?: string[] | string; timeframes?: Array<'15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; limit?: number; includeCandidates?: boolean | string }) {
+    private startDeltaBoxLoop() {
+        if (this.deltaBoxTimer) return;
+        const tick = async () => {
+            await Promise.allSettled([this.deltaBoxTickBinance(), this.deltaBoxTickPolymarket()]);
+        };
+        this.deltaBoxTimer = setInterval(() => tick().catch(() => {}), 1_000);
+        setTimeout(() => tick().catch(() => {}), 250);
+    }
+
+    private normalizeDeltaBoxSymbols(input?: string[] | string): Array<'BTC' | 'ETH' | 'SOL' | 'XRP'> {
+        const arr =
+            Array.isArray(input) ? input
+            : typeof input === 'string' ? input.split(',').map((x) => x.trim()).filter(Boolean)
+            : ['BTC', 'ETH', 'SOL', 'XRP'];
+        const out = Array.from(new Set(arr.map((s) => String(s || '').toUpperCase()).filter(Boolean))) as any[];
+        return out.filter((s) => s === 'BTC' || s === 'ETH' || s === 'SOL' || s === 'XRP');
+    }
+
+    private normalizeDeltaBoxTimeframes(input?: Array<'5m' | '15m' | '1h' | '4h' | '1d'> | string): Array<'5m' | '15m' | '1h' | '4h' | '1d'> {
+        const arr =
+            Array.isArray(input) ? input
+            : typeof input === 'string' ? input.split(',').map((x) => x.trim()).filter(Boolean) as any
+            : ['5m', '15m', '1h', '4h', '1d'];
+        const out = Array.from(new Set(arr.map((x: any) => String(x || '').toLowerCase()).filter(Boolean))) as any[];
+        return out.filter((t) => t === '5m' || t === '15m' || t === '1h' || t === '4h' || t === '1d');
+    }
+
+    private deltaBoxAvg(values: Array<number | null | undefined>): number | null {
+        const xs = values.filter((v: any) => v != null && Number.isFinite(Number(v))) as number[];
+        if (!xs.length) return null;
+        return xs.reduce((a, b) => a + b, 0) / xs.length;
+    }
+
+    private buildDeltaBoxStatsForKey(symbol: string, timeframe: '5m' | '15m' | '1h' | '4h' | '1d') {
+        const k = `${symbol}:${timeframe}`;
+        const aList = this.deltaBoxBinanceHist.get(k) || [];
+        const bList = this.deltaBoxPmHist.get(k) || [];
+        const take = (arr: any[], n: number) => arr.slice(Math.max(0, arr.length - n));
+        const a10 = take(aList, 10);
+        const a20 = take(aList, 20);
+        const a50 = take(aList, 50);
+        const b10 = take(bList, 10);
+        const b20 = take(bList, 20);
+        const b50 = take(bList, 50);
+        const avgOffsets = (rows: any[]) => ({
+            last1: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastOffsetsSec) ? r.lastOffsetsSec[0] : null))),
+            last2: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastOffsetsSec) ? r.lastOffsetsSec[1] : null))),
+            last3: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastOffsetsSec) ? r.lastOffsetsSec[2] : null))),
+        });
+        const avgDeltaAt = (rows: any[]) => ({
+            last1: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastDeltaAtOffsets) ? r.lastDeltaAtOffsets[0] : null))),
+            last2: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastDeltaAtOffsets) ? r.lastDeltaAtOffsets[1] : null))),
+            last3: this.deltaBoxAvg(rows.map((r: any) => (Array.isArray(r?.lastDeltaAtOffsets) ? r.lastDeltaAtOffsets[2] : null))),
+        });
+        return {
+            symbol,
+            timeframe,
+            counts: { a: aList.length, bc: bList.length },
+            a: {
+                avg10: this.deltaBoxAvg(a10.map((x: any) => x?.deltaAbs ?? null)),
+                avg20: this.deltaBoxAvg(a20.map((x: any) => x?.deltaAbs ?? null)),
+                avg50: this.deltaBoxAvg(a50.map((x: any) => x?.deltaAbs ?? null)),
+            },
+            b: {
+                avg10: avgOffsets(b10),
+                avg20: avgOffsets(b20),
+                avg50: avgOffsets(b50),
+            },
+            c: {
+                avg10: avgDeltaAt(b10),
+                avg20: avgDeltaAt(b20),
+                avg50: avgDeltaAt(b50),
+            },
+        };
+    }
+
+    public getDeltaBoxStats(options?: { symbols?: string[] | string; timeframes?: Array<'5m' | '15m' | '1h' | '4h' | '1d'> | string }) {
+        this.startDeltaBoxLoop();
+        const symbols = this.normalizeDeltaBoxSymbols(options?.symbols);
+        const timeframes = this.normalizeDeltaBoxTimeframes(options?.timeframes);
+        this.deltaBoxWantedSymbols = symbols.length ? symbols : ['BTC', 'ETH', 'SOL', 'XRP'];
+        this.deltaBoxWantedTimeframes = timeframes.length ? timeframes : ['5m', '15m', '1h', '4h', '1d'];
+        const rows: any[] = [];
+        for (const s of symbols) {
+            for (const tf of timeframes) {
+                rows.push(this.buildDeltaBoxStatsForKey(s, tf));
+            }
+        }
+        return { symbols, timeframes, rows };
+    }
+
+    private async deltaBoxTickBinance() {
+        const symbols: Array<'BTC' | 'ETH' | 'SOL' | 'XRP'> = ['BTC', 'ETH', 'SOL', 'XRP'];
+        const tfs: Array<'5m' | '15m' | '1h' | '4h' | '1d'> = ['5m', '15m', '1h', '4h', '1d'];
+        const now = Date.now();
+        for (const sym of symbols) {
+            for (const tf of tfs) {
+                const k = `${sym}:${tf}`;
+                const tfSec = this.getCryptoAllTimeframeSec(tf);
+                const tfMs = tfSec * 1000;
+                const expectedEndMs = Math.floor(now / tfMs) * tfMs;
+                const meta = this.deltaBoxBinanceMeta.get(k) || { lastEndMs: 0, nextAllowedAtMs: 0 };
+                if (now < meta.nextAllowedAtMs) continue;
+                if (meta.lastEndMs > 0 && expectedEndMs <= meta.lastEndMs) continue;
+                meta.nextAllowedAtMs = now + 15_000;
+                this.deltaBoxBinanceMeta.set(k, meta);
+                const raw = await this.fetchBinanceKlinesByInterval({ symbol: sym, interval: tf, limit: 80 });
+                const parsed = raw
+                    .map((r: any) => {
+                        const openTime = r?.[0] != null ? Number(r[0]) : NaN;
+                        const open = r?.[1] != null ? Number(r[1]) : NaN;
+                        const close = r?.[4] != null ? Number(r[4]) : NaN;
+                        const closeTime = r?.[6] != null ? Number(r[6]) : NaN;
+                        if (!Number.isFinite(openTime) || !Number.isFinite(closeTime) || !Number.isFinite(open) || !Number.isFinite(close)) return null;
+                        const endMs = closeTime;
+                        const deltaAbs = Math.abs(close - open);
+                        if (!Number.isFinite(deltaAbs)) return null;
+                        return { endMs, open, close, deltaAbs };
+                    })
+                    .filter(Boolean) as Array<{ endMs: number; open: number; close: number; deltaAbs: number }>;
+                parsed.sort((a, b) => a.endMs - b.endMs);
+                const trimmed = parsed.slice(Math.max(0, parsed.length - 220));
+                if (trimmed.length) {
+                    this.deltaBoxBinanceHist.set(k, trimmed);
+                    meta.lastEndMs = Math.max(meta.lastEndMs || 0, trimmed[trimmed.length - 1].endMs);
+                    meta.nextAllowedAtMs = now + Math.min(Math.max(15_000, Math.floor(tfMs / 3)), 5 * 60_000);
+                    this.deltaBoxBinanceMeta.set(k, meta);
+                }
+            }
+        }
+    }
+
+    private async deltaBoxFetchOrderbooks(tokenIds: string[]): Promise<any[]> {
+        const ids = Array.from(new Set((tokenIds || []).map((t) => String(t || '').trim()).filter(Boolean)));
+        if (!ids.length) return [];
+        try {
+            return await this.fetchClobBooks(ids);
+        } catch {
+            const concurrency = 8;
+            const out: any[] = [];
+            for (let i = 0; i < ids.length; i += concurrency) {
+                const chunk = ids.slice(i, i + concurrency);
+                const settled = await Promise.allSettled(chunk.map(async (tid) => {
+                    const ob = await this.sdk.clobApi.getOrderbook(tid);
+                    return { asset_id: tid, asks: Array.isArray((ob as any)?.asks) ? (ob as any).asks : [], bids: Array.isArray((ob as any)?.bids) ? (ob as any).bids : [], timestamp: (ob as any)?.timestamp ?? null };
+                }));
+                for (const r of settled) {
+                    if (r.status === 'fulfilled') out.push((r as any).value);
+                }
+            }
+            return out;
+        }
+    }
+
+    private finalizeDeltaBoxPmMarket(m: { key: string; symbol: string; timeframe: '5m' | '15m' | '1h' | '4h' | '1d'; endMs: number; events: Array<{ atMs: number; deltaAbs: number | null }> }) {
+        const key = `${m.symbol}:${m.timeframe}`;
+        const events = Array.isArray(m.events) ? m.events : [];
+        const last = events.slice(Math.max(0, events.length - 3));
+        const lastOffsetsSec: Array<number | null> = [null, null, null];
+        const lastDeltaAtOffsets: Array<number | null> = [null, null, null];
+        const tfSec = this.getCryptoAllTimeframeSec(m.timeframe);
+        for (let i = 0; i < last.length; i++) {
+            const ev = last[last.length - 1 - i];
+            const offsetSec = Math.ceil((Number(m.endMs) - Number(ev?.atMs || 0)) / 1000);
+            const validOffset = Number.isFinite(offsetSec) && offsetSec >= 0 && offsetSec <= Math.max(0, tfSec);
+            lastOffsetsSec[i] = validOffset ? Math.max(0, offsetSec) : null;
+            lastDeltaAtOffsets[i] = validOffset && ev?.deltaAbs != null && Number.isFinite(Number(ev.deltaAbs)) ? Number(ev.deltaAbs) : null;
+        }
+        const list = this.deltaBoxPmHist.get(key) || [];
+        list.push({ endMs: m.endMs, lastOffsetsSec, lastDeltaAtOffsets });
+        while (list.length > 220) list.shift();
+        this.deltaBoxPmHist.set(key, list);
+    }
+
+    private async deltaBoxTickPolymarket() {
+        const now = Date.now();
+        if (now < this.deltaBoxPmNextSampleAtMs) return;
+        this.deltaBoxPmNextSampleAtMs = now + 1000;
+
+        if (now >= this.deltaBoxPmNextMarketRefreshAtMs) {
+            this.deltaBoxPmNextMarketRefreshAtMs = now + 12_000;
+            const symbols = this.deltaBoxWantedSymbols.length ? this.deltaBoxWantedSymbols.slice() : (['BTC', 'ETH', 'SOL', 'XRP'] as any);
+            const timeframes = this.deltaBoxWantedTimeframes.length ? this.deltaBoxWantedTimeframes.slice() : (['5m', '15m', '1h', '4h', '1d'] as any);
+            await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit: 40 }).catch(() => {});
+        }
+
+        const marketKeys = new Set<string>();
+        const addMarket = (m: any, tf: '5m' | '15m' | '1h' | '4h' | '1d', symbol: string, endMs: number, upTokenId: string, downTokenId: string, idHint: string) => {
+            if (!symbol || !Number.isFinite(endMs) || !upTokenId || !downTokenId) return;
+            const key = idHint ? `${tf}:${idHint}` : `${tf}:${symbol}:${endMs}`;
+            marketKeys.add(key);
+            if (!this.deltaBoxPmMarkets.has(key)) {
+                const tfSec = this.getCryptoAllTimeframeSec(tf);
+                const startMs = endMs - tfSec * 1000;
+                this.deltaBoxPmMarkets.set(key, { key, symbol, timeframe: tf, endMs, startMs, upTokenId, downTokenId, lastHasRange: false, events: [] });
+            }
+        };
+
+        const m15 = Array.isArray(this.crypto15mMarketSnapshot?.markets) ? this.crypto15mMarketSnapshot.markets : [];
+        for (const m of m15) {
+            const symbol = String(m?.symbol || '').toUpperCase();
+            const endMs = Number(m?.endMs);
+            const tids = Array.isArray(m?.tokenIds) ? m.tokenIds.map((t: any) => String(t || '').trim()).filter(Boolean) : [];
+            const upIdx = Number.isFinite(Number(m?.upIdx)) ? Number(m.upIdx) : 0;
+            const downIdx = Number.isFinite(Number(m?.downIdx)) ? Number(m.downIdx) : 1;
+            const upTokenId = tids[upIdx] ? String(tids[upIdx]) : '';
+            const downTokenId = tids[downIdx] ? String(tids[downIdx]) : '';
+            const cid = String(m?.conditionId || m?.condition_id || m?.slug || '').trim();
+            addMarket(m, '15m', symbol, endMs, upTokenId, downTokenId, cid);
+        }
+
+        const mAll = Array.isArray(this.cryptoAllMarketSnapshot?.markets) ? this.cryptoAllMarketSnapshot.markets : [];
+        for (const m of mAll) {
+            const symbol = String(m?.symbol || '').toUpperCase();
+            const tf = String(m?.timeframe || '').toLowerCase() as any;
+            if (!(tf === '5m' || tf === '15m' || tf === '1h' || tf === '4h' || tf === '1d')) continue;
+            const endMs = Number(m?.endMs);
+            const upTokenId = String(m?.upTokenId || '').trim();
+            const downTokenId = String(m?.downTokenId || '').trim();
+            const cid = String(m?.conditionId || m?.condition_id || m?.slug || '').trim();
+            addMarket(m, tf, symbol, endMs, upTokenId, downTokenId, cid);
+        }
+
+        for (const [k, m] of Array.from(this.deltaBoxPmMarkets.entries())) {
+            if (!marketKeys.has(k)) {
+                if (now >= Number(m.endMs)) {
+                    this.finalizeDeltaBoxPmMarket(m);
+                }
+                this.deltaBoxPmMarkets.delete(k);
+            }
+        }
+
+        const active = Array.from(this.deltaBoxPmMarkets.values()).filter((m) => now < Number(m.endMs) && Number(m.endMs) - now <= 36 * 60 * 60_000);
+        for (const m of active) {
+            if (now >= Number(m.endMs)) continue;
+            marketKeys.add(m.key);
+        }
+
+        const tokenIds = Array.from(new Set(active.flatMap((m) => [m.upTokenId, m.downTokenId]).filter(Boolean)));
+        if (!tokenIds.length) return;
+        const books = await this.deltaBoxFetchOrderbooks(tokenIds);
+        const byTid = new Map<string, any>();
+        for (const b of books) {
+            const tid = String((b as any)?.asset_id || (b as any)?.assetId || '').trim();
+            if (!tid) continue;
+            byTid.set(tid, b);
+        }
+
+        const refPxByTid = new Map<string, number | null>();
+        for (const tid of tokenIds) {
+            const b = byTid.get(tid);
+            const asks = Array.isArray((b as any)?.asks) ? (b as any).asks : [];
+            const bids = Array.isArray((b as any)?.bids) ? (b as any).bids : [];
+            let bestAsk = NaN;
+            for (const a of asks) {
+                const p = Number((a as any)?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+            }
+            let bestBid = NaN;
+            for (const bb of bids) {
+                const p = Number((bb as any)?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+            }
+            const ref = Number.isFinite(bestBid) ? bestBid : (Number.isFinite(bestAsk) ? bestAsk : NaN);
+            refPxByTid.set(tid, Number.isFinite(ref) ? ref : null);
+        }
+
+        for (const m of active) {
+            if (now >= Number(m.endMs)) continue;
+            const upRef = refPxByTid.get(m.upTokenId);
+            const downRef = refPxByTid.get(m.downTokenId);
+            const inRange = (p: any) => p != null && Number.isFinite(Number(p)) && Number(p) >= 0.98 && Number(p) <= 0.999;
+            const hasRange = inRange(upRef) || inRange(downRef);
+            if (hasRange && !m.lastHasRange) {
+                const tfSec = this.getCryptoAllTimeframeSec(m.timeframe);
+                const secRem = Math.ceil((Number(m.endMs) - now) / 1000);
+                if (Number.isFinite(secRem) && secRem >= 0 && secRem <= Math.max(0, tfSec)) {
+                    const beat = await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: m.symbol, endMs: m.endMs, timeframeSec: tfSec });
+                    m.events.push({ atMs: now, deltaAbs: beat?.deltaAbs != null && Number.isFinite(Number(beat.deltaAbs)) ? Number(beat.deltaAbs) : null });
+                    while (m.events.length > 80) m.events.shift();
+                }
+            }
+            m.lastHasRange = hasRange;
+        }
+
+        for (const m of active) {
+            if (now < Number(m.endMs)) continue;
+            this.finalizeDeltaBoxPmMarket(m);
+            this.deltaBoxPmMarkets.delete(m.key);
+        }
+    }
+
+    public addCryptoAllWsClient(socket: any, options: { symbols?: string[] | string; timeframes?: Array<'5m' | '15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; expiresWithinSecByTimeframe?: any; limit?: number; includeCandidates?: boolean | string }) {
         const symbolsInput = options?.symbols;
         const symbolsArr =
             Array.isArray(symbolsInput) ? symbolsInput
@@ -5066,11 +6544,28 @@ export class GroupArbitrageScanner {
             : this.cryptoAllAutoConfig.symbols;
         const symbols = Array.from(new Set(symbolsArr.map((s) => String(s || '').toUpperCase()).filter(Boolean)));
 
+        const tfsInput = options?.timeframes;
+        const tfArr =
+            Array.isArray(tfsInput) ? tfsInput
+            : typeof tfsInput === 'string' ? tfsInput.split(',').map((x) => x.trim()).filter(Boolean) as any
+            : this.cryptoAllAutoConfig.timeframes;
+        const timeframes = Array.from(new Set(tfArr.map((x: any) => String(x || '').toLowerCase()).filter(Boolean)))
+            .filter((t) => ['5m', '15m', '1h', '4h', '1d'].includes(String(t))) as Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
+
         const minProb = Math.max(0, Math.min(1, Number(options?.minProb ?? this.cryptoAllAutoConfig.minProb)));
         const expiresWithinSec = Math.max(10, Math.floor(Number(options?.expiresWithinSec ?? this.cryptoAllAutoConfig.expiresWithinSec)));
+        const expiresWithinSecByTimeframeRaw =
+            options?.expiresWithinSecByTimeframe && typeof options.expiresWithinSecByTimeframe === 'object'
+                ? options.expiresWithinSecByTimeframe
+                : (this.cryptoAllAutoConfig.expiresWithinSecByTimeframe || null);
+        const expiresWithinSecByTimeframe = (['5m', '15m', '1h', '4h', '1d'] as const).reduce((acc: any, tf) => {
+            const v = expiresWithinSecByTimeframeRaw && (expiresWithinSecByTimeframeRaw as any)[tf] != null ? Number((expiresWithinSecByTimeframeRaw as any)[tf]) : expiresWithinSec;
+            acc[tf] = Math.max(10, Math.floor(Number.isFinite(v) ? v : expiresWithinSec));
+            return acc;
+        }, {}) as Record<'5m' | '15m' | '1h' | '4h' | '1d', number>;
         const limit = Math.max(1, Math.min(100, Math.floor(Number(options?.limit ?? 40))));
         const includeCandidates = options?.includeCandidates == null ? true : (String(options?.includeCandidates || '').toLowerCase() === '1' || String(options?.includeCandidates || '').toLowerCase() === 'true');
-        this.cryptoAllWsClients.set(socket, { symbols, timeframes: ['15m'], minProb, expiresWithinSec, limit, includeCandidates });
+        this.cryptoAllWsClients.set(socket, { symbols, timeframes: timeframes.length ? timeframes : ['15m'], minProb, expiresWithinSec, expiresWithinSecByTimeframe, limit, includeCandidates });
         this.startCryptoAllSnapshotLoop();
         this.startCryptoAllWsLoop();
     }
@@ -5089,19 +6584,22 @@ export class GroupArbitrageScanner {
 
     async getCrypto15mCandidates(options?: { minProb?: number; expiresWithinSec?: number; limit?: number }) {
         const now = Date.now();
-        if (!this.crypto15mMarketSnapshot.atMs || now - this.crypto15mMarketSnapshot.atMs > 5_000) {
-            await this.refreshCrypto15mMarketSnapshot();
-        }
-        if (!this.crypto15mBooksSnapshot.atMs || now - this.crypto15mBooksSnapshot.atMs > 500) {
-            await this.refreshCrypto15mBooksSnapshot();
-            const afterStaleMs = this.crypto15mBooksSnapshot.atMs ? (Date.now() - Number(this.crypto15mBooksSnapshot.atMs)) : Infinity;
-            if (Number.isFinite(afterStaleMs) && afterStaleMs > 10_000 && !this.crypto15mBooksSnapshot.lastError) {
-                this.crypto15mBooksInFlight = null;
-                this.crypto15mBooksBackoffMs = 0;
-                this.crypto15mBooksNextAllowedAtMs = 0;
-                await this.refreshCrypto15mBooksSnapshot();
-            }
-        }
+        const marketAt = this.crypto15mMarketSnapshot.atMs ? Number(this.crypto15mMarketSnapshot.atMs) : 0;
+        const booksAt = this.crypto15mBooksSnapshot.atMs ? Number(this.crypto15mBooksSnapshot.atMs) : 0;
+        const needMarket = marketAt <= 0;
+        const needBooks = booksAt <= 0;
+        const marketStale = !needMarket && (now - marketAt) > 5_000;
+        const booksStale = !needBooks && (now - booksAt) > 500;
+
+        if (needMarket) await this.refreshCrypto15mMarketSnapshot();
+        else if (marketStale) this.refreshCrypto15mMarketSnapshot().catch(() => {});
+
+        const markets = Array.isArray(this.crypto15mMarketSnapshot.markets) ? this.crypto15mMarketSnapshot.markets : [];
+        const soon = markets.some((m: any) => Number(m?.endMs ?? 0) - now < 2 * 60_000);
+        const targetStale = soon ? 250 : 500;
+        if (needBooks) await this.refreshCrypto15mBooksSnapshot();
+        else if (booksStale) this.refreshCrypto15mBooksSnapshot().catch(() => {});
+
         if (Array.isArray(this.crypto15mMarketSnapshot.markets) && this.crypto15mMarketSnapshot.markets.length > 0) {
             const byTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
             const hasAnyBook = Object.keys(byTokenId).some((k) => {
@@ -5112,10 +6610,134 @@ export class GroupArbitrageScanner {
                 this.crypto15mBooksInFlight = null;
                 this.crypto15mBooksBackoffMs = 0;
                 this.crypto15mBooksNextAllowedAtMs = 0;
-                await this.refreshCrypto15mBooksSnapshot();
+                this.refreshCrypto15mBooksSnapshot().catch(() => {});
             }
         }
         return this.buildCrypto15mCandidatesFromSnapshots(options);
+    }
+
+    getCrypto15mTradeAnalysis(options?: { limit?: number; tradeId?: number }) {
+        const limit = Math.max(1, Math.min(200, Math.floor(Number(options?.limit) || 100)));
+        const tradeId = options?.tradeId != null ? Number(options.tradeId) : null;
+        const trades = (this.orderHistory || [])
+            .filter((e: any) => e && String(e?.action || '') === 'crypto15m_order')
+            .slice(0, limit);
+
+        const offsets = Array.from({ length: 60 }, (_, i) => i - 59);
+        const timeline = offsets.map((offsetSec) => ({
+            offsetSec,
+            count980: 0,
+            usd980: 0,
+            count999: 0,
+            usd999: 0,
+        }));
+        const idxByOffset = new Map<number, any>(timeline.map((x) => [x.offsetSec, x]));
+
+        for (const t of trades) {
+            const endSec = t?.book60sEndSec != null ? Math.floor(Number(t.book60sEndSec) || 0) : Math.floor((Number(t?.id) || Date.now()) / 1000);
+            const pts = Array.isArray(t?.book60s) ? t.book60s : [];
+            for (const p of pts) {
+                const sec = Number(p?.sec);
+                if (!Number.isFinite(sec)) continue;
+                const offsetSec = Math.floor(sec) - endSec;
+                const row = idxByOffset.get(offsetSec);
+                if (!row) continue;
+                const bestAsk = p?.bestAsk != null ? Number(p.bestAsk) : NaN;
+                const mil = Number.isFinite(bestAsk) ? Math.round(bestAsk * 1000) : NaN;
+                const depthUsd980 = p?.depthUsd980 != null ? Number(p.depthUsd980) : NaN;
+                const depthUsd999 = p?.depthUsd999 != null ? Number(p.depthUsd999) : NaN;
+                if (mil === 980) {
+                    row.count980 += 1;
+                    if (Number.isFinite(depthUsd980)) row.usd980 += depthUsd980;
+                }
+                if (mil === 999) {
+                    row.count999 += 1;
+                    if (Number.isFinite(depthUsd999)) row.usd999 += depthUsd999;
+                }
+            }
+        }
+
+        const best980 = timeline.reduce((a, b) => (b.count980 > a.count980 ? b : a), timeline[0]);
+        const best999 = timeline.reduce((a, b) => (b.count999 > a.count999 ? b : a), timeline[0]);
+
+        const toFilledUsd = (e: any) => {
+            const sweepFilled = e?.sweepLog?.summary?.totalFilledUsd;
+            if (sweepFilled != null && Number.isFinite(Number(sweepFilled))) return Number(sweepFilled);
+            const r0 = Array.isArray(e?.results) ? e.results[0] : null;
+            const filledSize = r0?.filledSize != null ? Number(r0.filledSize) : NaN;
+            const pxHint = r0?.orderPrice ?? r0?.price ?? e?.bestAsk ?? e?.price ?? e?.limitPrice ?? null;
+            const px = pxHint != null ? Number(pxHint) : NaN;
+            if (Number.isFinite(filledSize) && Number.isFinite(px)) return filledSize * px;
+            return null;
+        };
+
+        const tradeRows = trades.map((e: any) => {
+            const filledUsd = toFilledUsd(e);
+            const attemptedUsd = e?.amountUsd != null ? Number(e.amountUsd) : null;
+            const fillPct = filledUsd != null && attemptedUsd != null && attemptedUsd > 0 ? Math.max(0, Math.min(1, filledUsd / attemptedUsd)) : null;
+            const r0 = Array.isArray(e?.results) ? e.results[0] : null;
+            const orderRoundtripMs = r0?.orderRoundtripMs != null ? Number(r0.orderRoundtripMs) : null;
+            return {
+                id: e?.id ?? null,
+                timestamp: e?.timestamp ?? null,
+                symbol: e?.symbol ?? null,
+                marketId: e?.marketId ?? null,
+                slug: e?.slug ?? null,
+                outcome: e?.outcome ?? null,
+                bestAsk: e?.bestAsk ?? null,
+                limitPrice: e?.limitPrice ?? null,
+                depthUsdAtCap: e?.depthUsdAtCap ?? null,
+                amountUsd: attemptedUsd,
+                filledUsd,
+                fillPct,
+                preOpenOrdersCount: e?.preOpenOrdersCount ?? null,
+                preOpenOrdersRemainingUsd: e?.preOpenOrdersRemainingUsd ?? null,
+                orderRoundtripMs,
+                book60sEndSec: e?.book60sEndSec ?? null,
+                book60sPoints: Array.isArray(e?.book60s) ? e.book60s.length : 0,
+            };
+        });
+
+        const buys = tradeRows.length;
+        const sells = (this.orderHistory || []).filter((e: any) => {
+            const a = String(e?.action || '');
+            return a.includes('stoploss') || a.includes('sell');
+        }).slice(0, limit).length;
+
+        const detail = tradeId != null
+            ? (trades.find((e: any) => Number(e?.id) === tradeId) || null)
+            : null;
+
+        return {
+            success: true,
+            limit,
+            trades: tradeRows,
+            tradeDetail: detail ? {
+                id: detail?.id ?? null,
+                timestamp: detail?.timestamp ?? null,
+                symbol: detail?.symbol ?? null,
+                marketId: detail?.marketId ?? null,
+                slug: detail?.slug ?? null,
+                outcome: detail?.outcome ?? null,
+                bestAsk: detail?.bestAsk ?? null,
+                limitPrice: detail?.limitPrice ?? null,
+                depthUsdAtCap: detail?.depthUsdAtCap ?? null,
+                amountUsd: detail?.amountUsd ?? null,
+                preOpenOrdersCount: detail?.preOpenOrdersCount ?? null,
+                preOpenOrdersRemainingUsd: detail?.preOpenOrdersRemainingUsd ?? null,
+                book60sEndSec: detail?.book60sEndSec ?? null,
+                book60s: Array.isArray(detail?.book60s) ? detail.book60s : [],
+            } : null,
+            timeline: timeline.map((r) => ({ ...r, usd980: Number(r.usd980.toFixed(6)), usd999: Number(r.usd999.toFixed(6)) })),
+            peaks: {
+                best980: { offsetSec: best980.offsetSec, count: best980.count980, usd: Number(best980.usd980.toFixed(6)) },
+                best999: { offsetSec: best999.offsetSec, count: best999.count999, usd: Number(best999.usd999.toFixed(6)) },
+            },
+            buySell: {
+                buyCount: buys,
+                sellCount: sells,
+            }
+        };
     }
 
     getCrypto15mStatus() {
@@ -5155,6 +6777,7 @@ export class GroupArbitrageScanner {
             hasValidKey: this.hasValidKey === true,
             trading: this.getTradingInitStatus(),
             enabled: this.crypto15mAutoEnabled,
+            dryRun: this.crypto15mAutoDryRun === true,
             config: this.crypto15mAutoConfig,
             lastScanAt: this.crypto15mLastScanAt,
             lastError: this.crypto15mLastError,
@@ -5165,6 +6788,560 @@ export class GroupArbitrageScanner {
             actives,
             tracked,
         };
+    }
+
+    getCrypto15mHedgeStatus() {
+        const actives: any = {};
+        for (const [symbol, a] of this.crypto15mHedgeActivesBySymbol.entries()) {
+            actives[symbol] = a;
+        }
+        const tracked = Array.from(this.crypto15mHedgeTrackedByCondition.values())
+            .sort((a: any, b: any) => String(b?.startedAt || '').localeCompare(String(a?.startedAt || '')))
+            .slice(0, 50);
+        return {
+            hasValidKey: this.hasValidKey === true,
+            trading: this.getTradingInitStatus(),
+            enabled: this.crypto15mHedgeAutoEnabled,
+            config: this.crypto15mHedgeAutoConfig,
+            lastScanAt: this.crypto15mHedgeLastScanAt,
+            lastError: this.crypto15mHedgeLastError,
+            lastDecision: this.crypto15mHedgeLastDecision,
+            lastOrderAttempt: this.crypto15mHedgeLastOrderAttempt,
+            actives,
+            tracked,
+            configPersist: {
+                path: this.crypto15mHedgeConfigPath,
+                loadedAt: this.crypto15mHedgeConfigLoadedAt,
+                persistedAt: this.crypto15mHedgeConfigPersistedAt,
+                lastError: this.crypto15mHedgeConfigPersistLastError,
+            },
+        };
+    }
+
+    private computeCrypto15mHedgeEffectiveProfitCents(remainingSec: number | null, cfg?: any) {
+        const c = cfg || this.crypto15mHedgeAutoConfig;
+        const base = c?.targetProfitCents != null ? Number(c.targetProfitCents) : 10;
+        const enabled = c?.profitDecayEnabled === true;
+        if (!enabled) return Number.isFinite(base) ? base : 10;
+        const startC = c?.profitStartCents != null ? Number(c.profitStartCents) : base;
+        const endC = c?.profitEndCents != null ? Number(c.profitEndCents) : Math.max(0, base - 1);
+        const startSec = c?.profitDecayStartSec != null ? Math.floor(Number(c.profitDecayStartSec)) : 300;
+        const endSec = c?.profitDecayEndSec != null ? Math.floor(Number(c.profitDecayEndSec)) : 60;
+        const mode = String(c?.profitDecayMode || 'linear').toLowerCase() === 'per_minute' ? 'per_minute' : 'linear';
+        const perMinC = c?.profitDecayPerMinCents != null ? Number(c.profitDecayPerMinCents) : 1;
+        const step = c?.profitStepCents != null ? Number(c.profitStepCents) : 0.1;
+        const s = remainingSec != null && Number.isFinite(Number(remainingSec)) ? Math.max(0, Math.floor(Number(remainingSec))) : null;
+        if (s == null) return Number.isFinite(startC) ? startC : base;
+        const hi = Math.max(startSec, endSec);
+        const lo = Math.min(startSec, endSec);
+        const top = Number.isFinite(startC) ? startC : base;
+        const bot = Number.isFinite(endC) ? endC : Math.max(0, base - 1);
+        if (s >= hi) return top;
+        if (s <= lo) return bot;
+        let raw = top;
+        if (mode === 'per_minute') {
+            const rate = Number.isFinite(perMinC) && perMinC > 0 ? perMinC : 1;
+            const minutes = Math.max(0, Math.floor((hi - s) / 60));
+            raw = top - minutes * rate;
+        } else {
+            const t = (hi - s) / Math.max(1, (hi - lo));
+            raw = top + (bot - top) * t;
+        }
+        const st = Number.isFinite(step) && step > 0 ? step : 0.1;
+        const rounded = Math.round(raw / st) * st;
+        const clamped = Math.max(Math.min(top, bot), Math.min(Math.max(top, bot), rounded));
+        return clamped;
+    }
+
+    async getCrypto15mHedgeSignals() {
+        const now = Date.now();
+        const cfg = this.crypto15mHedgeAutoConfig;
+        const entryMinSec = Math.max(0, Math.floor(Number(cfg.entryRemainingMinSec) || 0));
+        const entryMaxSec = Math.max(entryMinSec, Math.floor(Number(cfg.entryRemainingMaxSec) || 900));
+        const cheapMin = Number(cfg.entryCheapMinCents) / 100;
+        const cheapMax = Number(cfg.entryCheapMaxCents) / 100;
+        const candidatesResp: any = await this.getCrypto15mCandidates({ minProb: cfg.minProb, expiresWithinSec: 900, limit: 80 });
+        const candidates = Array.isArray(candidatesResp?.candidates) ? candidatesResp.candidates : [];
+        const entrySignals: any[] = [];
+        const opportunities: any[] = [];
+
+        const pickEntryIndex = (prices: any[]) => {
+            const p0 = Number(prices?.[0]);
+            const p1 = Number(prices?.[1]);
+            const ok0 = Number.isFinite(p0) && p0 >= cheapMin && p0 <= cheapMax;
+            const ok1 = Number.isFinite(p1) && p1 >= cheapMin && p1 <= cheapMax;
+            if (ok0 && !ok1) return 0;
+            if (ok1 && !ok0) return 1;
+            if (ok0 && ok1) return Number.isFinite(p0) && Number.isFinite(p1) ? (p0 <= p1 ? 0 : 1) : 0;
+            return Number.isFinite(p0) && Number.isFinite(p1) ? (p0 <= p1 ? 0 : 1) : 0;
+        };
+
+        const byTokenId = this.crypto15mBooksSnapshot.byTokenId || {};
+        const symbolsAllow = new Set(['BTC', 'ETH', 'SOL', 'XRP']);
+        const oppSeed: any[] = [];
+        for (const c of candidates) {
+            const symbol = String(c?.symbol || '').toUpperCase();
+            if (!symbol) continue;
+            const secondsToExpire = c?.secondsToExpire != null ? Math.floor(Number(c.secondsToExpire)) : null;
+            const tokenIds = Array.isArray(c?.tokenIds) ? c.tokenIds : [];
+            const outcomes = Array.isArray(c?.outcomes) ? c.outcomes : [];
+            const prices = Array.isArray(c?.prices) ? c.prices : [];
+            if (tokenIds.length < 2 || outcomes.length < 2 || prices.length < 2) continue;
+            const idxEntry = pickEntryIndex(prices);
+            const entryTokenId = String(tokenIds[idxEntry] || '').trim();
+            const entryOutcome = String(outcomes[idxEntry] || '');
+            const bestAsk = Number(prices[idxEntry]);
+            const b = entryTokenId ? byTokenId[entryTokenId] : null;
+            const bestBid = b?.bestBid != null && Number.isFinite(Number(b.bestBid)) ? Number(b.bestBid) : null;
+            const spreadCents = bestBid != null && Number.isFinite(bestAsk) ? Math.max(0, (bestAsk - bestBid) * 100) : null;
+            const withinEntryWindow = secondsToExpire != null && Number.isFinite(secondsToExpire) && secondsToExpire >= entryMinSec && secondsToExpire <= entryMaxSec;
+            const cheapOk = Number.isFinite(bestAsk) && bestAsk >= cheapMin && bestAsk <= cheapMax;
+            const baseReason = c?.reason != null ? String(c.reason) : null;
+            const entryEligible = baseReason == null && withinEntryWindow && cheapOk;
+            const reason =
+                baseReason != null ? baseReason
+                : !withinEntryWindow ? 'entry_window_closed'
+                : !cheapOk ? 'not_cheap'
+                : null;
+            entrySignals.push({
+                symbol,
+                conditionId: c?.conditionId ?? null,
+                slug: c?.slug ?? null,
+                title: c?.title ?? null,
+                endDate: c?.endDate ?? null,
+                secondsToExpire,
+                entryTokenId,
+                entryOutcome,
+                bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                bestBid,
+                spreadCents,
+                cheapMin,
+                cheapMax,
+                entryEligible,
+                reason,
+            });
+
+            if (symbolsAllow.has(symbol)) {
+                const idxHedge = idxEntry === 0 ? 1 : 0;
+                const hedgeTokenId = String(tokenIds[idxHedge] || '').trim();
+                const hedgeOutcome = String(outcomes[idxHedge] || '');
+                const conditionId = c?.conditionId ?? null;
+                if (entryTokenId && hedgeTokenId && conditionId) {
+                    oppSeed.push({
+                        symbol,
+                        conditionId,
+                        slug: c?.slug ?? null,
+                        title: c?.title ?? null,
+                        endDate: c?.endDate ?? null,
+                        secondsToExpire,
+                        entryIndex: idxEntry,
+                        hedgeIndex: idxHedge,
+                        entryTokenId,
+                        hedgeTokenId,
+                        entryOutcome,
+                        hedgeOutcome,
+                        baseReason,
+                        withinEntryWindow,
+                        cheapOk,
+                    });
+                }
+            }
+        }
+        entrySignals.sort((a, b) => {
+            if (!!a.entryEligible !== !!b.entryEligible) return a.entryEligible ? -1 : 1;
+            const as = a?.secondsToExpire != null ? Number(a.secondsToExpire) : Infinity;
+            const bs = b?.secondsToExpire != null ? Number(b.secondsToExpire) : Infinity;
+            return as - bs;
+        });
+
+        const computeBestFromBook = (book: any) => {
+            const asks = Array.isArray(book?.asks) ? book.asks : [];
+            const bids = Array.isArray(book?.bids) ? book.bids : [];
+            let bestAsk = NaN;
+            let bestBid = NaN;
+            for (const a of asks) {
+                const p = Number(a?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+            }
+            for (const b of bids) {
+                const p = Number(b?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+            }
+            const spreadCents = Number.isFinite(bestAsk) && Number.isFinite(bestBid) ? Math.max(0, (bestAsk - bestBid) * 100) : null;
+            return { asks, bids, bestAsk: Number.isFinite(bestAsk) ? bestAsk : null, bestBid: Number.isFinite(bestBid) ? bestBid : null, spreadCents };
+        };
+        const computeTradableShares = (asks: any[], limitPrice: number, maxLevels: number) => {
+            const normalized = (Array.isArray(asks) ? asks : [])
+                .map((a: any) => {
+                    const price = Number(a?.price);
+                    const size = Number(a?.size ?? a?.amount ?? a?.quantity);
+                    if (!Number.isFinite(price) || price <= 0) return null;
+                    if (!Number.isFinite(size) || size <= 0) return null;
+                    if (Number.isFinite(limitPrice) && price > limitPrice) return null;
+                    return { price, size };
+                })
+                .filter(Boolean) as Array<{ price: number; size: number }>;
+            normalized.sort((a, b) => a.price - b.price);
+            let shares = 0;
+            let levels = 0;
+            for (const lvl of normalized) {
+                if (levels >= maxLevels) break;
+                shares += lvl.size;
+                levels += 1;
+            }
+            return shares;
+        };
+
+        const padSec = 300;
+        const oppCandidates = oppSeed.filter((x) => {
+            const s = x?.secondsToExpire != null ? Number(x.secondsToExpire) : null;
+            if (s == null || !Number.isFinite(s)) return false;
+            return s >= Math.max(0, entryMinSec - padSec) && s <= (entryMaxSec + padSec);
+        });
+        const oppTokenIds = Array.from(new Set(oppCandidates.flatMap((x: any) => [String(x.entryTokenId || '').trim(), String(x.hedgeTokenId || '').trim()]).filter(Boolean)));
+        const oppBooksByToken: Record<string, any> = {};
+        if (oppTokenIds.length) {
+            const books = await this.fetchClobBooks(oppTokenIds.slice(0, 60));
+            for (const b of books || []) {
+                const tokenId = String(b?.token_id ?? b?.tokenId ?? b?.tokenID ?? b?.asset_id ?? b?.assetId ?? '').trim();
+                if (!tokenId) continue;
+                oppBooksByToken[tokenId] = b;
+            }
+        }
+        const oppBuffer = Number(cfg.bufferCents) / 100;
+        const oppMaxSpreadCents = Number(cfg.maxSpreadCents);
+        const oppMinDepthPct = Number(cfg.minDepthPct);
+        const oppIgnoreSpread = cfg.hedgeIgnoreSpread === true;
+        const estAmountUsd = Math.max(0.01, Number(cfg.amountUsd) || 1);
+        for (const x of oppCandidates) {
+            const secondsToExpire = x?.secondsToExpire != null ? Number(x.secondsToExpire) : null;
+            const effProfitCents = this.computeCrypto15mHedgeEffectiveProfitCents(secondsToExpire, cfg);
+            const effProfit = Number(effProfitCents) / 100;
+            const entryBook = oppBooksByToken[String(x.entryTokenId || '')] || null;
+            const hedgeBook = oppBooksByToken[String(x.hedgeTokenId || '')] || null;
+            const entryBest = computeBestFromBook(entryBook);
+            const hedgeBest = computeBestFromBook(hedgeBook);
+            const entryBestAsk = entryBest.bestAsk;
+            const cheapOk = entryBestAsk != null && entryBestAsk >= cheapMin && entryBestAsk <= cheapMax;
+            const withinEntryWindow = secondsToExpire != null && Number.isFinite(secondsToExpire) && secondsToExpire >= entryMinSec && secondsToExpire <= entryMaxSec;
+            const entryEligible = x.baseReason == null && withinEntryWindow && cheapOk;
+            const entryReason =
+                x.baseReason != null ? x.baseReason
+                : !withinEntryWindow ? 'entry_window_closed'
+                : !cheapOk ? 'not_cheap'
+                : null;
+            const p2Max = entryBestAsk != null ? (1 - effProfit - oppBuffer - entryBestAsk) : null;
+            const hedgeBestAsk = hedgeBest.bestAsk;
+            const hedgeBestBid = hedgeBest.bestBid;
+            const hedgeSpreadCents = hedgeBest.spreadCents;
+            const edgeOk = p2Max != null && Number.isFinite(p2Max) && p2Max > 0 && hedgeBestAsk != null && hedgeBestAsk <= p2Max;
+            const spreadOk = oppIgnoreSpread ? true : (hedgeSpreadCents == null || !Number.isFinite(oppMaxSpreadCents) ? true : hedgeSpreadCents <= oppMaxSpreadCents);
+            const estEntryShares = entryBestAsk != null && entryBestAsk > 0 ? (estAmountUsd / entryBestAsk) : null;
+            const tradableShares = edgeOk && p2Max != null ? computeTradableShares(hedgeBest.asks, Math.min(0.999, p2Max), 50) : null;
+            const depthThreshold = estEntryShares != null && estEntryShares > 0 ? estEntryShares * (Math.max(0, oppMinDepthPct) / 100) : 0;
+            const depthOk = estEntryShares == null ? false : (oppMinDepthPct <= 0 ? (tradableShares != null && Number(tradableShares) > 0) : (tradableShares != null && Number(tradableShares) + 1e-9 >= Math.min(estEntryShares, depthThreshold)));
+            const secondEligibleNow = entryEligible && edgeOk && spreadOk && depthOk;
+            const secondReason =
+                !entryEligible ? 'need_entry'
+                : !spreadOk ? 'hedge_spread_too_wide'
+                : !edgeOk ? 'hedge_edge_too_small'
+                : !depthOk ? 'hedge_depth_too_thin'
+                : null;
+            const sharesToBuyNow = estEntryShares != null && tradableShares != null ? Math.min(estEntryShares, tradableShares) : null;
+            const estHedgeUsdNow = sharesToBuyNow != null && hedgeBestAsk != null ? Math.max(0, sharesToBuyNow * hedgeBestAsk) : null;
+            opportunities.push({
+                symbol: x.symbol,
+                conditionId: x.conditionId,
+                slug: x.slug,
+                title: x.title,
+                endDate: x.endDate,
+                secondsToExpire,
+                entryOutcome: x.entryOutcome,
+                hedgeOutcome: x.hedgeOutcome,
+                entryBestAsk,
+                entryBestBid: entryBest.bestBid,
+                entrySpreadCents: entryBest.spreadCents,
+                entryEligible,
+                entryReason,
+                effectiveProfitCents: effProfitCents,
+                p2Max: p2Max != null && Number.isFinite(p2Max) ? p2Max : null,
+                hedgeBestAsk,
+                hedgeBestBid,
+                hedgeSpreadCents,
+                tradableShares,
+                estEntryShares,
+                estHedgeUsdNow,
+                secondEligibleNow,
+                secondReason,
+            });
+        }
+        opportunities.sort((a, b) => {
+            if (!!a.entryEligible !== !!b.entryEligible) return a.entryEligible ? -1 : 1;
+            if (!!a.secondEligibleNow !== !!b.secondEligibleNow) return a.secondEligibleNow ? -1 : 1;
+            const as = a?.secondsToExpire != null ? Number(a.secondsToExpire) : Infinity;
+            const bs = b?.secondsToExpire != null ? Number(b.secondsToExpire) : Infinity;
+            return as - bs;
+        });
+
+        const actives = Array.from(this.crypto15mHedgeActivesBySymbol.entries()).map(([symbol, a]) => ({ symbol, ...(a || {}) }));
+        const hedgeTokenIds = Array.from(new Set(actives.map((a: any) => String(a?.hedgeTokenId || '').trim()).filter(Boolean)));
+        const booksByToken: Record<string, any> = {};
+        if (hedgeTokenIds.length) {
+            const books = await this.fetchClobBooks(hedgeTokenIds);
+            for (const b of books || []) {
+                const tokenId = String(b?.token_id ?? b?.tokenId ?? b?.tokenID ?? b?.asset_id ?? b?.assetId ?? '').trim();
+                if (!tokenId) continue;
+                booksByToken[tokenId] = b;
+            }
+        }
+
+        const hedgeSignals: any[] = [];
+        const buffer = Number(cfg.bufferCents) / 100;
+        const maxSpreadCents = Number(cfg.maxSpreadCents);
+        const minDepthPct = Number(cfg.minDepthPct);
+        const ignoreSpread = cfg.hedgeIgnoreSpread === true;
+        const minSecToHedge = Math.floor(Number(cfg.minSecToHedge) || 0);
+        for (const a of actives) {
+            const symbol = String(a?.symbol || '').toUpperCase();
+            const phase = String(a?.phase || '');
+            const entryPrice = a?.entryPrice != null ? Number(a.entryPrice) : NaN;
+            const entryShares = a?.entryFilledShares != null ? Number(a.entryFilledShares) : NaN;
+            const hedgeFilledShares = a?.hedgeFilledShares != null ? Number(a.hedgeFilledShares) : 0;
+            const remainingShares = (Number.isFinite(entryShares) ? entryShares : 0) - (Number.isFinite(hedgeFilledShares) ? hedgeFilledShares : 0);
+            const expiresAtMs = a?.expiresAtMs != null ? Number(a.expiresAtMs) : NaN;
+            const secondsToExpire = Number.isFinite(expiresAtMs) ? Math.floor((expiresAtMs - now) / 1000) : null;
+            const effProfitCents = this.computeCrypto15mHedgeEffectiveProfitCents(secondsToExpire, cfg);
+            const effProfit = Number(effProfitCents) / 100;
+            const p2Max = Number.isFinite(entryPrice) ? (1 - effProfit - buffer - entryPrice) : NaN;
+            const hedgeTokenId = String(a?.hedgeTokenId || '').trim();
+            const book = hedgeTokenId ? booksByToken[hedgeTokenId] : null;
+            const asks = Array.isArray(book?.asks) ? book.asks : [];
+            const bids = Array.isArray(book?.bids) ? book.bids : [];
+            let bestAsk = NaN;
+            let bestBid = NaN;
+            for (const x of asks) {
+                const p = Number(x?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+            }
+            for (const x of bids) {
+                const p = Number(x?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+            }
+            const spreadCents = Number.isFinite(bestAsk) && Number.isFinite(bestBid) ? Math.max(0, (bestAsk - bestBid) * 100) : null;
+            const windowOk = secondsToExpire == null || !Number.isFinite(secondsToExpire) ? true : secondsToExpire > minSecToHedge;
+            const edgeOk = Number.isFinite(p2Max) && p2Max > 0 && Number.isFinite(bestAsk) && bestAsk <= p2Max;
+            const spreadOk = ignoreSpread ? true : (spreadCents == null || !Number.isFinite(maxSpreadCents) ? true : spreadCents <= maxSpreadCents);
+            let tradableShares = null as any;
+            if (edgeOk && asks.length) {
+                const limitPrice = Math.min(0.999, p2Max);
+                const eligibleAsks = asks
+                    .map((x: any) => ({ price: Number(x?.price), size: Number(x?.size ?? x?.amount ?? x?.quantity) }))
+                    .filter((x: any) => Number.isFinite(x.price) && x.price > 0 && Number.isFinite(x.size) && x.size > 0 && x.price <= limitPrice)
+                    .sort((x: any, y: any) => x.price - y.price);
+                let s = 0;
+                for (const x of eligibleAsks.slice(0, 50)) s += x.size;
+                tradableShares = s;
+            }
+            const depthThreshold = remainingShares > 0 ? remainingShares * (Math.max(0, minDepthPct) / 100) : 0;
+            const depthOk = remainingShares <= 0 ? true : (minDepthPct <= 0 ? (tradableShares != null && Number(tradableShares) > 0) : (tradableShares != null && Number(tradableShares) + 1e-9 >= Math.min(remainingShares, depthThreshold)));
+            const hedgeEligible = phase !== 'failed' && remainingShares > 0.01 && windowOk && edgeOk && spreadOk && depthOk;
+            const reason =
+                phase === 'failed' ? 'failed'
+                : !(remainingShares > 0.01) ? 'hedge_done'
+                : !windowOk ? 'hedge_window_closed'
+                : !spreadOk ? 'hedge_spread_too_wide'
+                : !edgeOk ? 'hedge_edge_too_small'
+                : !depthOk ? 'hedge_depth_too_thin'
+                : null;
+            hedgeSignals.push({
+                symbol,
+                conditionId: a?.conditionId ?? null,
+                phase,
+                secondsToExpire,
+                entryPrice: Number.isFinite(entryPrice) ? entryPrice : null,
+                effectiveProfitCents: effProfitCents,
+                entryShares: Number.isFinite(entryShares) ? entryShares : null,
+                hedgeFilledShares: Number.isFinite(hedgeFilledShares) ? hedgeFilledShares : null,
+                remainingShares,
+                hedgeTokenId,
+                bestAsk: Number.isFinite(bestAsk) ? bestAsk : null,
+                bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                spreadCents,
+                p2Max: Number.isFinite(p2Max) ? p2Max : null,
+                tradableShares,
+                depthOk,
+                hedgeEligible,
+                reason,
+            });
+        }
+        hedgeSignals.sort((a, b) => {
+            if (!!a.hedgeEligible !== !!b.hedgeEligible) return a.hedgeEligible ? -1 : 1;
+            const as = a?.secondsToExpire != null ? Number(a.secondsToExpire) : Infinity;
+            const bs = b?.secondsToExpire != null ? Number(b.secondsToExpire) : Infinity;
+            return as - bs;
+        });
+
+        return {
+            success: true,
+            at: new Date().toISOString(),
+            config: cfg,
+            entrySignals,
+            opportunities,
+            hedgeSignals,
+            status: this.getCrypto15mHedgeStatus(),
+        };
+    }
+
+    private recordCrypto15mHedgeEvent(payload: any) {
+        this.orderHistory.unshift({
+            id: Date.now(),
+            timestamp: new Date().toISOString(),
+            mode: 'crypto15m-hedge',
+            action: payload?.action || 'crypto15m_hedge_event',
+            ...payload,
+        });
+        if (this.orderHistory.length > 300) this.orderHistory.pop();
+        this.schedulePersistOrderHistory();
+    }
+
+    getCrypto15mHedgeHistory(options?: { maxEntries?: number }) {
+        const maxEntries = options?.maxEntries != null ? Math.max(1, Math.min(200, Math.floor(Number(options.maxEntries)))) : 50;
+        const list = this.orderHistory
+            .filter((e: any) => e && typeof e === 'object' && String(e?.mode || '') === 'crypto15m-hedge')
+            .slice(0, maxEntries);
+        return { success: true, history: list };
+    }
+
+    updateCrypto15mHedgeConfig(config?: Partial<{
+        pollMs: number;
+        minProb: number;
+        amountUsd: number;
+        entryRemainingMinSec: number;
+        entryRemainingMaxSec: number;
+        entryCheapMinCents: number;
+        entryCheapMaxCents: number;
+        targetProfitCents: number;
+        profitDecayEnabled: boolean;
+        profitDecayMode: 'linear' | 'per_minute' | string;
+        profitDecayPerMinCents: number;
+        profitStartCents: number;
+        profitEndCents: number;
+        profitDecayStartSec: number;
+        profitDecayEndSec: number;
+        profitStepCents: number;
+        mode: 'conservative' | 'balanced' | 'aggressive' | string;
+        bufferCents: number;
+        maxSpreadCents: number;
+        minDepthPct: number;
+        minSecToHedge: number;
+        hedgeIgnoreSpread: boolean;
+        panicHedgeEnabled: boolean;
+        panicHedgeStartSec: number;
+        panicMaxLossCents: number;
+    }>) {
+        const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mHedgeAutoConfig.pollMs;
+        const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mHedgeAutoConfig.minProb;
+        const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mHedgeAutoConfig.amountUsd;
+        const entryRemainingMinSecRaw = config?.entryRemainingMinSec != null ? Number(config.entryRemainingMinSec) : this.crypto15mHedgeAutoConfig.entryRemainingMinSec;
+        const entryRemainingMaxSecRaw = config?.entryRemainingMaxSec != null ? Number(config.entryRemainingMaxSec) : this.crypto15mHedgeAutoConfig.entryRemainingMaxSec;
+        const entryCheapMinCents = config?.entryCheapMinCents != null ? Number(config.entryCheapMinCents) : this.crypto15mHedgeAutoConfig.entryCheapMinCents;
+        const entryCheapMaxCents = config?.entryCheapMaxCents != null ? Number(config.entryCheapMaxCents) : this.crypto15mHedgeAutoConfig.entryCheapMaxCents;
+        const targetProfitCents = config?.targetProfitCents != null ? Number(config.targetProfitCents) : this.crypto15mHedgeAutoConfig.targetProfitCents;
+        const profitDecayEnabled = config?.profitDecayEnabled != null ? !!config.profitDecayEnabled : this.crypto15mHedgeAutoConfig.profitDecayEnabled;
+        const profitDecayModeRaw = config?.profitDecayMode != null ? String(config.profitDecayMode) : String(this.crypto15mHedgeAutoConfig.profitDecayMode);
+        const profitDecayPerMinCentsRaw = config?.profitDecayPerMinCents != null ? Number(config.profitDecayPerMinCents) : this.crypto15mHedgeAutoConfig.profitDecayPerMinCents;
+        const profitStartCentsRaw = config?.profitStartCents != null ? Number(config.profitStartCents) : this.crypto15mHedgeAutoConfig.profitStartCents;
+        const profitEndCentsRaw = config?.profitEndCents != null ? Number(config.profitEndCents) : this.crypto15mHedgeAutoConfig.profitEndCents;
+        const profitDecayStartSecRaw = config?.profitDecayStartSec != null ? Number(config.profitDecayStartSec) : this.crypto15mHedgeAutoConfig.profitDecayStartSec;
+        const profitDecayEndSecRaw = config?.profitDecayEndSec != null ? Number(config.profitDecayEndSec) : this.crypto15mHedgeAutoConfig.profitDecayEndSec;
+        const profitStepCentsRaw = config?.profitStepCents != null ? Number(config.profitStepCents) : this.crypto15mHedgeAutoConfig.profitStepCents;
+        const minSecToHedge = config?.minSecToHedge != null ? Number(config.minSecToHedge) : this.crypto15mHedgeAutoConfig.minSecToHedge;
+        const hedgeIgnoreSpread = config?.hedgeIgnoreSpread != null ? !!config.hedgeIgnoreSpread : this.crypto15mHedgeAutoConfig.hedgeIgnoreSpread;
+        const panicHedgeEnabled = config?.panicHedgeEnabled != null ? !!config.panicHedgeEnabled : this.crypto15mHedgeAutoConfig.panicHedgeEnabled;
+        const panicHedgeStartSecRaw = config?.panicHedgeStartSec != null ? Number(config.panicHedgeStartSec) : this.crypto15mHedgeAutoConfig.panicHedgeStartSec;
+        const panicMaxLossCentsRaw = config?.panicMaxLossCents != null ? Number(config.panicMaxLossCents) : this.crypto15mHedgeAutoConfig.panicMaxLossCents;
+        const modeInfo = this.applyCrypto15mHedgeMode(config?.mode ?? this.crypto15mHedgeAutoConfig.mode, {
+            bufferCents: config?.bufferCents,
+            maxSpreadCents: config?.maxSpreadCents,
+            minDepthPct: config?.minDepthPct,
+        });
+        const entryRemainingMinSec = Math.max(60, Math.min(900, Math.floor(Number.isFinite(entryRemainingMinSecRaw) ? entryRemainingMinSecRaw : 480)));
+        const entryRemainingMaxSec = Math.max(entryRemainingMinSec, Math.min(900, Math.floor(Number.isFinite(entryRemainingMaxSecRaw) ? entryRemainingMaxSecRaw : 900)));
+        const profitStartCents = Math.max(0, Math.min(30, Number.isFinite(profitStartCentsRaw) ? profitStartCentsRaw : Number(targetProfitCents)));
+        const profitEndCents = Math.max(0, Math.min(30, Number.isFinite(profitEndCentsRaw) ? profitEndCentsRaw : Math.max(0, profitStartCents - 1)));
+        const profitDecayStartSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(profitDecayStartSecRaw) ? profitDecayStartSecRaw : 300)));
+        const profitDecayEndSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(profitDecayEndSecRaw) ? profitDecayEndSecRaw : 60)));
+        const profitStepCents = Math.max(0.05, Math.min(5, Number.isFinite(profitStepCentsRaw) ? profitStepCentsRaw : 0.1));
+        const profitDecayMode: 'linear' | 'per_minute' = String(profitDecayModeRaw || '').toLowerCase() === 'per_minute' ? 'per_minute' : 'linear';
+        const profitDecayPerMinCents = Math.max(0.05, Math.min(30, Number.isFinite(profitDecayPerMinCentsRaw) ? profitDecayPerMinCentsRaw : 1));
+        const panicHedgeStartSec = Math.max(0, Math.min(900, Math.floor(Number.isFinite(panicHedgeStartSecRaw) ? panicHedgeStartSecRaw : 120)));
+        const panicMaxLossCents = Math.max(0, Math.min(200, Number.isFinite(panicMaxLossCentsRaw) ? panicMaxLossCentsRaw : 20));
+        this.crypto15mHedgeAutoConfig = {
+            pollMs: Math.max(500, Math.floor(Number.isFinite(pollMs) ? pollMs : 2_000)),
+            expiresWithinSec: 900,
+            minProb: Math.max(0, Math.min(1, Number.isFinite(minProb) ? minProb : 0)),
+            amountUsd: Math.max(1, Number.isFinite(amountUsd) ? amountUsd : 1),
+            entryRemainingMinSec,
+            entryRemainingMaxSec,
+            entryCheapMinCents: Math.max(1, Math.min(49, Number.isFinite(entryCheapMinCents) ? entryCheapMinCents : 8)),
+            entryCheapMaxCents: Math.max(1, Math.min(49, Number.isFinite(entryCheapMaxCents) ? entryCheapMaxCents : 15)),
+            targetProfitCents: Math.max(1, Math.min(30, Number.isFinite(targetProfitCents) ? targetProfitCents : 10)),
+            profitDecayEnabled,
+            profitDecayMode,
+            profitDecayPerMinCents,
+            profitStartCents,
+            profitEndCents,
+            profitDecayStartSec,
+            profitDecayEndSec,
+            profitStepCents,
+            mode: modeInfo.mode,
+            bufferCents: Math.max(0, Math.min(10, Number.isFinite(modeInfo.bufferCents) ? modeInfo.bufferCents : 1.5)),
+            maxSpreadCents: Math.max(0, Math.min(50, Math.floor(Number.isFinite(modeInfo.maxSpreadCents) ? modeInfo.maxSpreadCents : 3))),
+            minDepthPct: Math.max(0, Math.min(100, Math.floor(Number.isFinite(modeInfo.minDepthPct) ? modeInfo.minDepthPct : 70))),
+            minSecToHedge: Math.max(0, Math.min(900, Math.floor(Number.isFinite(minSecToHedge) ? minSecToHedge : 90))),
+            hedgeIgnoreSpread,
+            panicHedgeEnabled,
+            panicHedgeStartSec,
+            panicMaxLossCents,
+        };
+        this.persistCrypto15mHedgeConfigToFile();
+        this.recordCrypto15mHedgeEvent({ action: 'crypto15m_hedge_config_update', strategy: 'crypto15m-hedge', config: { ...this.crypto15mHedgeAutoConfig } });
+        return this.getCrypto15mHedgeStatus();
+    }
+
+    startCrypto15mHedgeAuto(config?: Partial<{ enabled?: boolean }> & Parameters<GroupArbitrageScanner['updateCrypto15mHedgeConfig']>[0]) {
+        const enabled = config?.enabled != null ? !!config.enabled : true;
+        this.updateCrypto15mHedgeConfig(config);
+        this.crypto15mHedgeAutoEnabled = enabled;
+        this.crypto15mHedgeLastError = null;
+
+        if (this.crypto15mHedgeAutoTimer) {
+            clearInterval(this.crypto15mHedgeAutoTimer);
+            this.crypto15mHedgeAutoTimer = null;
+        }
+        if (this.crypto15mHedgeAutoEnabled) {
+            const tick = () => {
+                this.crypto15mHedgeTryAutoOnce().catch(() => {});
+            };
+            tick();
+            this.crypto15mHedgeAutoTimer = setInterval(tick, this.crypto15mHedgeAutoConfig.pollMs);
+        }
+        this.recordCrypto15mHedgeEvent({ action: enabled ? 'crypto15m_hedge_auto_start' : 'crypto15m_hedge_auto_stop', strategy: 'crypto15m-hedge', config: { enabled, ...this.crypto15mHedgeAutoConfig } });
+        return this.getCrypto15mHedgeStatus();
+    }
+
+    stopCrypto15mHedgeAuto() {
+        this.crypto15mHedgeAutoEnabled = false;
+        if (this.crypto15mHedgeAutoTimer) {
+            clearInterval(this.crypto15mHedgeAutoTimer);
+            this.crypto15mHedgeAutoTimer = null;
+        }
+        this.recordCrypto15mHedgeEvent({ action: 'crypto15m_hedge_auto_stop', strategy: 'crypto15m-hedge', config: { enabled: false, ...this.crypto15mHedgeAutoConfig } });
+        return this.getCrypto15mHedgeStatus();
     }
 
     async getCryptoAll2Candidates(options?: { minProb?: number; expiresWithinSec?: number; limit?: number; symbols?: string[] | string }) {
@@ -5524,6 +7701,7 @@ export class GroupArbitrageScanner {
     updateCryptoAllConfig(config?: {
         pollMs?: number;
         expiresWithinSec?: number;
+        expiresWithinSecByTimeframe?: any;
         minProb?: number;
         amountUsd?: number;
         symbols?: string[];
@@ -5549,6 +7727,7 @@ export class GroupArbitrageScanner {
     }) {
         const pollMsRaw = config?.pollMs != null ? Number(config.pollMs) : this.cryptoAllAutoConfig.pollMs;
         const expiresWithinSecRaw = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec;
+        const expiresWithinSecByTimeframeInput = (config as any)?.expiresWithinSecByTimeframe && typeof (config as any).expiresWithinSecByTimeframe === 'object' ? (config as any).expiresWithinSecByTimeframe : null;
         const minProbRaw = config?.minProb != null ? Number(config.minProb) : this.cryptoAllAutoConfig.minProb;
         const amountUsdRaw = config?.amountUsd != null ? Number(config.amountUsd) : this.cryptoAllAutoConfig.amountUsd;
         const symbols = Array.isArray(config?.symbols) && config?.symbols.length ? Array.from(new Set(config.symbols.map((s) => String(s || '').toUpperCase()).filter(Boolean))) : this.cryptoAllAutoConfig.symbols;
@@ -5571,10 +7750,17 @@ export class GroupArbitrageScanner {
         const adaptiveDeltaEnabled = config?.adaptiveDeltaEnabled != null ? !!config.adaptiveDeltaEnabled : this.cryptoAllAutoConfig.adaptiveDeltaEnabled;
         const adaptiveDeltaBigMoveMultiplierRaw = config?.adaptiveDeltaBigMoveMultiplier != null ? Number(config.adaptiveDeltaBigMoveMultiplier) : this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier;
         const adaptiveDeltaRevertNoBuyCountRaw = config?.adaptiveDeltaRevertNoBuyCount != null ? Number(config.adaptiveDeltaRevertNoBuyCount) : this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount;
+        const prevExpByTf = this.cryptoAllAutoConfig.expiresWithinSecByTimeframe || { '5m': this.cryptoAllAutoConfig.expiresWithinSec, '15m': this.cryptoAllAutoConfig.expiresWithinSec, '1h': this.cryptoAllAutoConfig.expiresWithinSec, '4h': this.cryptoAllAutoConfig.expiresWithinSec, '1d': this.cryptoAllAutoConfig.expiresWithinSec };
+        const expiresWithinSecByTimeframe = (['5m', '15m', '1h', '4h', '1d'] as const).reduce((acc: any, tf) => {
+            const raw = expiresWithinSecByTimeframeInput && (expiresWithinSecByTimeframeInput as any)[tf] != null ? Number((expiresWithinSecByTimeframeInput as any)[tf]) : Number(prevExpByTf[tf] ?? expiresWithinSecRaw);
+            acc[tf] = Math.max(5, Math.floor(Number.isFinite(raw) ? raw : expiresWithinSecRaw));
+            return acc;
+        }, {}) as Record<'5m' | '15m' | '1h' | '4h' | '1d', number>;
 
         this.cryptoAllAutoConfig = {
             pollMs: Math.max(500, Math.floor(Number.isFinite(pollMsRaw) ? pollMsRaw : 2_000)),
             expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : 180)),
+            expiresWithinSecByTimeframe,
             minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : 0.9)),
             amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : 1),
             symbols,
@@ -5665,7 +7851,7 @@ export class GroupArbitrageScanner {
                     nextLeg === '3m' ? this.cryptoAll2AutoConfig.splitBuyTrendMinutes3m
                     : nextLeg === '2m' ? this.cryptoAll2AutoConfig.splitBuyTrendMinutes2m
                     : this.cryptoAll2AutoConfig.splitBuyTrendMinutes1m;
-                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
+                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up', allowEqual: nextLeg === '2m' || nextLeg === '1m' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
                 if (!up.ok) continue;
             }
             const r: any = await this.placeCryptoAll2Order({
@@ -5806,7 +7992,7 @@ export class GroupArbitrageScanner {
         let amountUsd = Math.max(source === 'addon' ? 0.01 : 1, Number.isFinite(requestedAmountUsd) ? requestedAmountUsd : this.cryptoAll2AutoConfig.amountUsd);
         const force = params.force === true;
         const requestedMinPrice = params.minPrice != null ? Number(params.minPrice) : NaN;
-        const effectiveMinPrice = Math.max(0.9, this.cryptoAll2AutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
+        const effectiveMinPrice = Math.max(0, this.cryptoAll2AutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
         const splitBuyEnabled = params.splitBuyEnabled != null ? (params.splitBuyEnabled === true) : this.cryptoAll2AutoConfig.splitBuyEnabled;
         const splitBuyPct3mRaw = params.splitBuyPct3m != null ? Number(params.splitBuyPct3m) : this.cryptoAll2AutoConfig.splitBuyPct3m;
         const splitBuyPct2mRaw = params.splitBuyPct2m != null ? Number(params.splitBuyPct2m) : this.cryptoAll2AutoConfig.splitBuyPct2m;
@@ -6067,9 +8253,14 @@ export class GroupArbitrageScanner {
             }
         }
 
+        const booksFetchedAtMs = Date.now();
         const books = await this.fetchClobBooks([tokenId]);
         const book = books && books.length ? books[0] : null;
+        const booksCache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
+        const booksCacheAtMs = booksCache?.get(String(tokenId))?.atMs ?? null;
+        const booksStaleMs = booksCacheAtMs != null ? Math.max(0, booksFetchedAtMs - Number(booksCacheAtMs)) : null;
         const asks = Array.isArray(book?.asks) ? book.asks : [];
+        const bids = Array.isArray(book?.bids) ? book.bids : [];
         let bestAsk = NaN;
         for (const a of asks) {
             const p = Number(a?.price);
@@ -6124,6 +8315,15 @@ export class GroupArbitrageScanner {
                 orderType: 'FAK',
             });
             globalOk = !!order?.success;
+            if (!globalOk) {
+                const oid = order?.orderId != null ? String(order.orderId) : (order?.orderID != null ? String(order.orderID) : (order?.id != null ? String(order.id) : null));
+                const probe = await this.probeRecentBuyState({ conditionId, tokenId, orderId: oid, maxWaitMs: 900 }).catch(() => null as any);
+                const has = probe && ((probe.filledUsd != null && Number(probe.filledUsd) > 0) || probe.hasOpen === true || probe.orderFetched === true);
+                if (has) {
+                    globalOk = true;
+                    order = { ...(order || {}), success: true, orderId: (order?.orderId ?? (probe?.orderId ?? null)), errorMsg: null };
+                }
+            }
         } catch (e: any) {
             if (orderLockKey) {
                 this.cryptoAll2OrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'failed' });
@@ -6156,7 +8356,7 @@ export class GroupArbitrageScanner {
             results: [{ ...order, orderStatus, tokenId, outcome, conditionId }],
         };
         this.orderHistory.unshift(entry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
         this.schedulePersistOrderHistory();
 
         if (order?.success === true && splitPlan && splitPlan.dueLeg) {
@@ -6247,6 +8447,8 @@ export class GroupArbitrageScanner {
             if (Number.isFinite(endMs) && nowMs > endMs) {
                 const expired = { ...a, phase: 'expired', expiredAt: new Date(nowMs).toISOString() };
                 this.crypto15mTrackedByCondition.set(String(expired.conditionId), expired);
+                const cid = String(expired.conditionId || '').trim();
+                if (cid) this.crypto15mSweepStateByConditionId.delete(cid);
                 this.crypto15mActivesBySymbol.delete(symbol);
                 this.crypto15mCooldownUntilBySymbol.set(symbol, nowMs + 2_000);
             }
@@ -6255,6 +8457,10 @@ export class GroupArbitrageScanner {
         for (const [cid, a] of this.crypto15mTrackedByCondition.entries()) {
             const started = Date.parse(String(a?.startedAt || a?.started_at || ''));
             if (Number.isFinite(started) && started < cutoff) this.crypto15mTrackedByCondition.delete(cid);
+        }
+        for (const [cid, s] of this.crypto15mSweepStateByConditionId.entries()) {
+            const expiresAtMs = s?.expiresAtMs != null ? Number(s.expiresAtMs) : NaN;
+            if (Number.isFinite(expiresAtMs) && nowMs > expiresAtMs + 10 * 60_000) this.crypto15mSweepStateByConditionId.delete(cid);
         }
     }
 
@@ -6294,7 +8500,7 @@ export class GroupArbitrageScanner {
         if (Date.now() < this.crypto15mNextScanAllowedAtMs) return;
         if (this.crypto15mAutoInFlight) return;
         this.crypto15mAutoInFlight = true;
-        if (!this.hasValidKey) {
+        if (!this.crypto15mAutoDryRun && !this.hasValidKey) {
             this.crypto15mLastError = 'Missing private key';
             this.crypto15mAutoInFlight = false;
             return;
@@ -6329,17 +8535,37 @@ export class GroupArbitrageScanner {
                 this.crypto15mLastError = `books_stale: ${Math.floor(staleMs)}ms`;
                 return;
             }
+            this.crypto15mLastError = null;
             const candidates = Array.isArray((r as any)?.candidates) ? (r as any).candidates : [];
             const symbols = ['BTC', 'ETH', 'SOL', 'XRP'];
+            const decisions: any[] = [];
             for (const symbol of symbols) {
-                if (this.crypto15mActivesBySymbol.has(symbol)) continue;
+                if (this.crypto15mActivesBySymbol.has(symbol)) { decisions.push({ symbol, action: 'skip', reason: 'already_active' }); continue; }
                 const cd = this.crypto15mCooldownUntilBySymbol.get(symbol);
-                if (cd != null && nowMs < cd) continue;
+                if (cd != null && nowMs < cd) { decisions.push({ symbol, action: 'skip', reason: 'cooldown', untilMs: cd }); continue; }
                 const pick = candidates.find((c: any) => String(c?.symbol || '').toUpperCase() === symbol && c?.eligibleByExpiry && c?.meetsMinProb && c?.reason == null) || null;
-                if (!pick) continue;
+                if (!pick) {
+                    const best = candidates
+                        .filter((c: any) => String(c?.symbol || '').toUpperCase() === symbol)
+                        .slice()
+                        .sort((a: any, b: any) => (Number(b?.chosenPrice) || -Infinity) - (Number(a?.chosenPrice) || -Infinity))[0] || null;
+                    const sample = best ? {
+                        conditionId: best?.conditionId ?? null,
+                        reason: best?.reason ?? null,
+                        eligibleByExpiry: best?.eligibleByExpiry ?? null,
+                        meetsMinProb: best?.meetsMinProb ?? null,
+                        chosenOutcome: best?.chosenOutcome ?? null,
+                        chosenPrice: best?.chosenPrice ?? null,
+                        secondsToExpire: best?.secondsToExpire ?? null,
+                        booksError: best?.booksError ?? null,
+                        marketsError: best?.marketsError ?? null,
+                    } : null;
+                    decisions.push({ symbol, action: 'skip', reason: 'no_candidate', sample });
+                    continue;
+                }
                 const cid = String(pick.conditionId || '');
-                if (cid && this.crypto15mTrackedByCondition.has(cid)) continue;
-                const placed: any = await this.placeCrypto15mOrder({
+                if (cid && this.crypto15mTrackedByCondition.has(cid)) { decisions.push({ symbol, action: 'skip', reason: 'already_tracked', conditionId: cid }); continue; }
+                const orderParams: any = {
                     conditionId: cid,
                     outcomeIndex: Number(pick.chosenIndex),
                     amountUsd: this.crypto15mAutoConfig.amountUsd,
@@ -6349,8 +8575,13 @@ export class GroupArbitrageScanner {
                     endDate: pick.endDate,
                     secondsToExpire: pick.secondsToExpire,
                     chosenPrice: pick.chosenPrice,
-                });
-                if (this.crypto15mAutoConfig.adaptiveDeltaEnabled === true) {
+                };
+                const placed: any = this.crypto15mAutoDryRun
+                    ? { success: true, dryRun: true, wouldPlaceOrder: true, params: orderParams }
+                    : await this.placeCrypto15mOrder(orderParams);
+                if (this.crypto15mAutoDryRun) this.crypto15mLastOrderAttempt = { at: new Date().toISOString(), type: 'dry_run', params: orderParams };
+                decisions.push({ symbol, action: this.crypto15mAutoDryRun ? 'would_place' : placed?.success ? 'placed' : 'failed', conditionId: cid, outcomeIndex: Number(pick.chosenIndex), chosenPrice: pick.chosenPrice, secondsToExpire: pick.secondsToExpire, dryRun: this.crypto15mAutoDryRun === true, error: placed?.error ?? null, reason: placed?.reason ?? null });
+                if (!this.crypto15mAutoDryRun && this.crypto15mAutoConfig.adaptiveDeltaEnabled === true) {
                     const st = this.crypto15mAdaptiveDeltaBySymbol.get(symbol);
                     const overrideDelta = st?.overrideDelta != null ? Number(st.overrideDelta) : NaN;
                     if (st && Number.isFinite(overrideDelta) && overrideDelta > 0) {
@@ -6377,6 +8608,15 @@ export class GroupArbitrageScanner {
                     this.crypto15mLastError = msg;
                 }
             }
+            if (this.crypto15mAutoDryRun) {
+                this.crypto15mLastDecision = {
+                    at: new Date().toISOString(),
+                    dryRun: true,
+                    config: { minProb: this.crypto15mAutoConfig.minProb, expiresWithinSec: this.crypto15mAutoConfig.expiresWithinSec, amountUsd: this.crypto15mAutoConfig.amountUsd },
+                    candidatesCount: candidates.length,
+                    decisions,
+                };
+            }
         } catch (e: any) {
             if (e?.retryAfterMs != null || String(e?.message || '').includes('(429)')) {
                 const retryAfterMs = e?.retryAfterMs != null ? Number(e.retryAfterMs) : 60_000;
@@ -6388,13 +8628,377 @@ export class GroupArbitrageScanner {
         }
     }
 
-    startCrypto15mAuto(config?: { enabled?: boolean; amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; buySizingMode?: 'fixed' | 'orderbook_max' | 'all_capital' | string; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
+    private crypto15mHedgeUpdateTracking(nowMs: number) {
+        const now = Number(nowMs || Date.now());
+        for (const [symbol, a] of this.crypto15mHedgeActivesBySymbol.entries()) {
+            const expiresAtMs = a?.expiresAtMs != null ? Number(a.expiresAtMs) : NaN;
+            if (Number.isFinite(expiresAtMs) && now >= expiresAtMs) {
+                const cid = String(a?.conditionId || '').trim();
+                const next = { ...a, phase: a?.phase === 'hedged' ? 'expired_hedged' : a?.phase === 'waiting_hedge' || a?.phase === 'hedging' ? 'expired_unhedged' : 'expired', endedAt: new Date(now).toISOString() };
+                if (cid) this.crypto15mHedgeTrackedByCondition.set(cid, next);
+                this.crypto15mHedgeActivesBySymbol.delete(symbol);
+            }
+        }
+        if (this.crypto15mHedgeTrackedByCondition.size > 250) {
+            const list = Array.from(this.crypto15mHedgeTrackedByCondition.entries())
+                .sort((a: any, b: any) => String(b?.[1]?.startedAt || '').localeCompare(String(a?.[1]?.startedAt || '')));
+            const keep = list.slice(0, 200);
+            this.crypto15mHedgeTrackedByCondition = new Map(keep);
+        }
+    }
+
+    private async crypto15mHedgeTryAutoOnce() {
+        if (!this.crypto15mHedgeAutoEnabled) return;
+        if (this.crypto15mHedgeAutoInFlight) return;
+        this.crypto15mHedgeAutoInFlight = true;
+        const nowMs = Date.now();
+        this.crypto15mHedgeLastScanAt = new Date(nowMs).toISOString();
+        if (!this.hasValidKey) {
+            this.crypto15mHedgeLastError = 'Missing private key';
+            this.crypto15mHedgeAutoInFlight = false;
+            return;
+        }
+        const cleanupLocks = () => {
+            const now = Date.now();
+            for (const [k, v] of this.crypto15mHedgeOrderLocks.entries()) {
+                if (!v) { this.crypto15mHedgeOrderLocks.delete(k); continue; }
+                if (now > Number(v.expiresAtMs || 0) + 10 * 60_000) this.crypto15mHedgeOrderLocks.delete(k);
+                else if (now - Number(v.atMs || 0) > 60 * 60_000) this.crypto15mHedgeOrderLocks.delete(k);
+            }
+        };
+        const computeBest = (book: any) => {
+            const asks = Array.isArray(book?.asks) ? book.asks : [];
+            const bids = Array.isArray(book?.bids) ? book.bids : [];
+            let bestAsk = NaN;
+            let bestBid = NaN;
+            for (const a of asks) {
+                const p = Number(a?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
+            }
+            for (const b of bids) {
+                const p = Number(b?.price);
+                if (!Number.isFinite(p) || p <= 0) continue;
+                if (!Number.isFinite(bestBid) || p > bestBid) bestBid = p;
+            }
+            const spreadCents = Number.isFinite(bestAsk) && Number.isFinite(bestBid) ? Math.max(0, (bestAsk - bestBid) * 100) : null;
+            return { asks, bestAsk: Number.isFinite(bestAsk) ? bestAsk : null, bestBid: Number.isFinite(bestBid) ? bestBid : null, spreadCents };
+        };
+        const computeTradableShares = (asks: any[], limitPrice: number, maxLevels: number) => {
+            const normalized = (Array.isArray(asks) ? asks : [])
+                .map((a: any) => {
+                    const price = Number(a?.price);
+                    const size = Number(a?.size ?? a?.amount ?? a?.quantity);
+                    if (!Number.isFinite(price) || price <= 0) return null;
+                    if (!Number.isFinite(size) || size <= 0) return null;
+                    if (Number.isFinite(limitPrice) && price > limitPrice) return null;
+                    return { price, size };
+                })
+                .filter(Boolean) as Array<{ price: number; size: number }>;
+            normalized.sort((a, b) => a.price - b.price);
+            let shares = 0;
+            let levels = 0;
+            for (const lvl of normalized) {
+                if (levels >= maxLevels) break;
+                shares += lvl.size;
+                levels += 1;
+            }
+            return shares;
+        };
+        const waitForOrderFill = async (orderId: string) => {
+            const id = String(orderId || '').trim();
+            if (!id) return null;
+            for (let i = 0; i < 3; i++) {
+                const o = await this.tradingClient.getOrder(id).catch(() => null);
+                if (o && (o.filledSize != null || o.status)) return o;
+                await new Promise(r => setTimeout(r, 250));
+            }
+            return null;
+        };
+        const attemptHedge = async (active: any) => {
+            const now = Date.now();
+            const expiresAtMs = active?.expiresAtMs != null ? Number(active.expiresAtMs) : NaN;
+            const remainingSec = Number.isFinite(expiresAtMs) ? Math.floor((expiresAtMs - now) / 1000) : null;
+            const entryPrice = active?.entryPrice != null ? Number(active.entryPrice) : NaN;
+            const entryShares = active?.entryFilledShares != null ? Number(active.entryFilledShares) : NaN;
+            const hedgeFilledShares = active?.hedgeFilledShares != null ? Number(active.hedgeFilledShares) : 0;
+            const remainingShares = (Number.isFinite(entryShares) ? entryShares : 0) - (Number.isFinite(hedgeFilledShares) ? hedgeFilledShares : 0);
+            const panicNow = this.crypto15mHedgeAutoConfig.panicHedgeEnabled === true
+                && remainingSec != null
+                && Number.isFinite(Number(remainingSec))
+                && Number(remainingSec) <= Number(this.crypto15mHedgeAutoConfig.panicHedgeStartSec);
+            if (remainingSec != null && remainingSec <= this.crypto15mHedgeAutoConfig.minSecToHedge && !panicNow) {
+                return { did: false, reason: 'hedge_window_closed', remainingSec };
+            }
+            if (!(remainingShares > 0.01)) return { did: false, reason: 'hedge_done', remainingSec };
+            if (!Number.isFinite(entryPrice) || entryPrice <= 0) return { did: false, reason: 'missing_entry_price', remainingSec };
+            const profitCents = this.computeCrypto15mHedgeEffectiveProfitCents(remainingSec, this.crypto15mHedgeAutoConfig);
+            const profit = Number(profitCents) / 100;
+            const bufferCents = Number(this.crypto15mHedgeAutoConfig.bufferCents);
+            const buffer = bufferCents / 100;
+            const panicLoss = Math.max(0, Number(this.crypto15mHedgeAutoConfig.panicMaxLossCents || 0)) / 100;
+            const p2MaxRaw = panicNow ? (1 + panicLoss - buffer - entryPrice) : (1 - profit - buffer - entryPrice);
+            const p2Max = Math.min(0.999, p2MaxRaw);
+            if (!(p2Max > 0)) return { did: false, reason: 'hedge_edge_too_small', remainingSec, profitCents, bufferCents, entryPrice, p2Max };
+            const hedgeTokenId = String(active?.hedgeTokenId || '').trim();
+            if (!hedgeTokenId) return { did: false, reason: 'missing_hedge_token', remainingSec, profitCents, bufferCents, entryPrice, p2Max };
+            const books = await this.fetchClobBooks([hedgeTokenId]);
+            const book = books && books.length ? books[0] : null;
+            const best = computeBest(book);
+            const bestAsk = best.bestAsk != null ? Number(best.bestAsk) : NaN;
+            const bestBid = best.bestBid != null ? Number(best.bestBid) : NaN;
+            const spreadCents = best.spreadCents != null ? Number(best.spreadCents) : null;
+            if (!Number.isFinite(bestAsk) || bestAsk <= 0) return { did: false, reason: 'no_asks', remainingSec, profitCents, bufferCents, entryPrice, p2Max };
+            const ignoreSpread = panicNow ? true : (this.crypto15mHedgeAutoConfig.hedgeIgnoreSpread === true);
+            if (!ignoreSpread && spreadCents != null && spreadCents > Number(this.crypto15mHedgeAutoConfig.maxSpreadCents)) {
+                return { did: false, reason: 'hedge_spread_too_wide', remainingSec, profitCents, bufferCents, entryPrice, p2Max, bestAsk, spreadCents };
+            }
+            if (bestAsk > p2Max) return { did: false, reason: 'hedge_edge_too_small', remainingSec, profitCents, bufferCents, entryPrice, p2Max, bestAsk, spreadCents };
+            const tradableShares = computeTradableShares(best.asks, p2Max, 50);
+            const minDepthPct = panicNow ? 0 : Number(this.crypto15mHedgeAutoConfig.minDepthPct);
+            const threshold = remainingShares * (Math.max(0, minDepthPct) / 100);
+            const okDepth = minDepthPct <= 0 ? (tradableShares > 0) : (tradableShares > 0 && tradableShares + 1e-9 >= Math.min(remainingShares, threshold));
+            if (!okDepth) {
+                return { did: false, reason: 'hedge_depth_too_thin', remainingSec, profitCents, bufferCents, entryPrice, p2Max, bestAsk, spreadCents, tradableShares, minDepthPct, threshold, remainingShares };
+            }
+            const sharesToBuy = Math.min(remainingShares, tradableShares);
+            const amountUsd = Math.max(0.01, sharesToBuy * bestAsk);
+            const limitPrice = Math.min(0.999, p2Max);
+            const res = await this.tradingClient.createMarketOrder({ tokenId: hedgeTokenId, side: 'BUY', amount: amountUsd, price: limitPrice, orderType: 'FAK' });
+            const orderId = res?.orderId != null ? String(res.orderId) : null;
+            const order = orderId ? await waitForOrderFill(orderId) : null;
+            const filledSize = order?.filledSize != null ? Number(order.filledSize) : null;
+            const nextFilled = typeof filledSize === 'number' && Number.isFinite(filledSize) ? filledSize : 0;
+            const updatedFilled = (Number.isFinite(hedgeFilledShares) ? hedgeFilledShares : 0) + nextFilled;
+            const done = Number.isFinite(entryShares) && updatedFilled >= entryShares * 0.98;
+            return { did: true, res, order, remainingSec, profitCents, bufferCents, entryPrice, p2Max, bestAsk, bestBid: Number.isFinite(bestBid) ? bestBid : null, spreadCents, tradableShares, sharesToBuy, amountUsd, filledSize, updatedFilled, done, panicNow };
+        };
+
+        try {
+            cleanupLocks();
+            this.crypto15mHedgeUpdateTracking(nowMs);
+
+            for (const [symbol, active] of this.crypto15mHedgeActivesBySymbol.entries()) {
+                const phase = String(active?.phase || '');
+                if (phase !== 'waiting_hedge' && phase !== 'hedging') continue;
+                const r: any = await attemptHedge(active).catch((e: any) => ({ did: false, reason: 'hedge_error', error: e?.message || String(e) }));
+                const cid = String(active?.conditionId || '').trim();
+                this.crypto15mHedgeLastDecision = { at: new Date().toISOString(), type: 'hedge', symbol, conditionId: cid || null, ...r };
+                if (cid && r?.did !== true && String(r?.reason || '') !== 'hedge_done') {
+                    const key = cid;
+                    const reason = String(r?.reason || 'hedge_unknown');
+                    const prev = this.crypto15mHedgeAttemptLogState.get(key) || null;
+                    const now2 = Date.now();
+                    const shouldLog = !prev || prev.reason !== reason || now2 - Number(prev.atMs || 0) >= 10_000;
+                    if (shouldLog) {
+                        this.crypto15mHedgeAttemptLogState.set(key, { atMs: now2, reason });
+                        this.recordCrypto15mHedgeEvent({
+                            action: 'crypto15m_hedge_attempt',
+                            symbol,
+                            conditionId: cid,
+                            tokenId: String(active?.hedgeTokenId || ''),
+                            outcome: String(active?.hedgeOutcome || ''),
+                            remainingSec: r?.remainingSec ?? null,
+                            entryPrice: r?.entryPrice ?? active?.entryPrice ?? null,
+                            profitCents: r?.profitCents ?? null,
+                            bufferCents: r?.bufferCents ?? null,
+                            p2Max: r?.p2Max ?? null,
+                            bestAsk: r?.bestAsk ?? null,
+                            spreadCents: r?.spreadCents ?? null,
+                            tradableShares: r?.tradableShares ?? null,
+                            minDepthPct: r?.minDepthPct ?? this.crypto15mHedgeAutoConfig.minDepthPct,
+                            reason,
+                            panicNow: r?.panicNow === true,
+                            errorMsg: r?.error ?? null,
+                        });
+                    }
+                }
+                if (r?.did === true) {
+                    const next = { ...active, phase: r.done ? 'hedged' : 'hedging', hedgeFilledShares: r.updatedFilled, hedgeP2Max: r.p2Max, hedgeLastAsk: r.bestAsk, hedgeLastAttemptAt: new Date().toISOString() };
+                    this.crypto15mHedgeActivesBySymbol.set(symbol, next);
+                    const cid2 = String(next?.conditionId || '').trim();
+                    if (cid2) this.crypto15mHedgeTrackedByCondition.set(cid2, next);
+                    this.crypto15mHedgeLastOrderAttempt = { at: new Date().toISOString(), type: 'hedge', symbol, conditionId: cid2, orderId: r?.res?.orderId ?? null, success: r?.res?.success ?? null, errorMsg: r?.res?.errorMsg ?? null, filledSize: r?.filledSize ?? null, p2Max: r?.p2Max ?? null, bestAsk: r?.bestAsk ?? null };
+                    this.recordCrypto15mHedgeEvent({
+                        action: 'crypto15m_hedge_buy',
+                        symbol,
+                        conditionId: cid2,
+                        tokenId: String(next.hedgeTokenId || ''),
+                        outcome: String(next.hedgeOutcome || ''),
+                        bestAsk: r?.bestAsk ?? null,
+                        p2Max: r?.p2Max ?? null,
+                        amountUsd: r?.amountUsd ?? null,
+                        sharesTarget: r?.sharesToBuy ?? null,
+                        filledSize: r?.filledSize ?? null,
+                        orderId: r?.res?.orderId ?? null,
+                        success: r?.res?.success ?? null,
+                        errorMsg: r?.res?.errorMsg ?? null,
+                        phase: next.phase,
+                    });
+                }
+            }
+
+            const r = await this.getCrypto15mCandidates({ minProb: this.crypto15mHedgeAutoConfig.minProb, expiresWithinSec: 900, limit: 40 });
+            const staleMs = (r as any)?.staleMs != null ? Number((r as any).staleMs) : null;
+            const booksError = (r as any)?.booksError != null ? String((r as any).booksError) : null;
+            const marketError = (r as any)?.marketError != null ? String((r as any).marketError) : null;
+            if (booksError) { this.crypto15mHedgeLastError = `books_error: ${booksError}`; return; }
+            if (marketError) { this.crypto15mHedgeLastError = `market_error: ${marketError}`; return; }
+            if (staleMs != null && Number.isFinite(staleMs) && staleMs > 10_000) { this.crypto15mHedgeLastError = `books_stale: ${Math.floor(staleMs)}ms`; return; }
+            const candidates = Array.isArray((r as any)?.candidates) ? (r as any).candidates : [];
+            const cheapMin = Number(this.crypto15mHedgeAutoConfig.entryCheapMinCents) / 100;
+            const cheapMax = Number(this.crypto15mHedgeAutoConfig.entryCheapMaxCents) / 100;
+            const remMin = Number(this.crypto15mHedgeAutoConfig.entryRemainingMinSec);
+            const remMax = Number(this.crypto15mHedgeAutoConfig.entryRemainingMaxSec);
+
+            for (const symbol of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                if (this.crypto15mHedgeActivesBySymbol.has(symbol)) continue;
+                const pick = candidates.find((c: any) => {
+                    if (String(c?.symbol || '').toUpperCase() !== symbol) return false;
+                    if (c?.secondsToExpire == null) return false;
+                    const s = Number(c.secondsToExpire);
+                    if (!Number.isFinite(s)) return false;
+                    if (s < remMin || s > remMax) return false;
+                    if (!Array.isArray(c?.prices) || c.prices.length < 2) return false;
+                    const p0 = Number(c.prices[0]);
+                    const p1 = Number(c.prices[1]);
+                    const ok0 = Number.isFinite(p0) && p0 >= cheapMin && p0 <= cheapMax;
+                    const ok1 = Number.isFinite(p1) && p1 >= cheapMin && p1 <= cheapMax;
+                    if (!ok0 && !ok1) return false;
+                    if (c?.booksError || c?.marketsError) return false;
+                    return true;
+                }) || null;
+                if (!pick) continue;
+                const cid = String(pick.conditionId || '').trim();
+                if (!cid) continue;
+                if (this.crypto15mHedgeTrackedByCondition.has(cid)) continue;
+                const tokenIds = Array.isArray(pick.tokenIds) ? pick.tokenIds : [];
+                const outcomes = Array.isArray(pick.outcomes) ? pick.outcomes : [];
+                if (tokenIds.length < 2 || outcomes.length < 2) continue;
+                const p0 = Number(pick.prices[0]);
+                const p1 = Number(pick.prices[1]);
+                const idxEntry =
+                    Number.isFinite(p0) && p0 >= cheapMin && p0 <= cheapMax && !(Number.isFinite(p1) && p1 >= cheapMin && p1 <= cheapMax) ? 0
+                    : Number.isFinite(p1) && p1 >= cheapMin && p1 <= cheapMax && !(Number.isFinite(p0) && p0 >= cheapMin && p0 <= cheapMax) ? 1
+                    : (Number.isFinite(p0) && Number.isFinite(p1) && p0 <= p1 ? 0 : 1);
+                const idxHedge = idxEntry === 0 ? 1 : 0;
+                const entryTokenId = String(tokenIds[idxEntry] || '').trim();
+                const hedgeTokenId = String(tokenIds[idxHedge] || '').trim();
+                if (!entryTokenId || !hedgeTokenId) continue;
+                const expiresAtMs = Number(pick.endMs) || (Date.now() + Number(pick.secondsToExpire || 0) * 1000);
+                const orderLockKey = `${symbol}:${expiresAtMs}`;
+                const locked = this.crypto15mHedgeOrderLocks.get(orderLockKey);
+                if (locked && locked.status === 'placing') continue;
+                this.crypto15mHedgeOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol, expiresAtMs, conditionId: cid, status: 'placing' });
+                const entryBooks = await this.fetchClobBooks([entryTokenId]);
+                const entryBook = entryBooks && entryBooks.length ? entryBooks[0] : null;
+                const best = computeBest(entryBook);
+                const bestAsk = best.bestAsk != null ? Number(best.bestAsk) : NaN;
+                const bestBid = best.bestBid != null ? Number(best.bestBid) : NaN;
+                const spreadCents = best.spreadCents != null ? Number(best.spreadCents) : null;
+                if (!Number.isFinite(bestAsk) || bestAsk <= 0) {
+                    this.crypto15mHedgeOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol, expiresAtMs, conditionId: cid, status: 'failed' });
+                    continue;
+                }
+                const amountUsd = Number(this.crypto15mHedgeAutoConfig.amountUsd) || 1;
+                const limitPrice = Math.min(0.999, bestAsk + 0.02);
+                const estEntryShares = amountUsd > 0 && bestAsk > 0 ? (amountUsd / bestAsk) : null;
+                const tradableShares = computeTradableShares(best.asks, limitPrice, 50);
+                if (estEntryShares != null && Number.isFinite(estEntryShares) && tradableShares + 1e-9 < estEntryShares) {
+                    this.crypto15mHedgeLastDecision = { at: new Date().toISOString(), type: 'entry', symbol, conditionId: cid, reason: 'entry_depth_too_thin', bestAsk, bestBid: Number.isFinite(bestBid) ? bestBid : null, spreadCents, limitPrice, estEntryShares, tradableShares };
+                    this.crypto15mHedgeOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol, expiresAtMs, conditionId: cid, status: 'failed' });
+                    this.recordCrypto15mHedgeEvent({
+                        action: 'crypto15m_hedge_skip',
+                        symbol,
+                        conditionId: cid,
+                        reason: 'entry_depth_too_thin',
+                        bestAsk,
+                        bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                        spreadCents,
+                        maxSpreadCents: this.crypto15mHedgeAutoConfig.maxSpreadCents,
+                        limitPrice,
+                        estEntryShares,
+                        tradableShares,
+                    });
+                    continue;
+                }
+                const res = await this.tradingClient.createMarketOrder({ tokenId: entryTokenId, side: 'BUY', amount: amountUsd, price: limitPrice, orderType: 'FAK' });
+                const orderId = res?.orderId != null ? String(res.orderId) : null;
+                const order = orderId ? await waitForOrderFill(orderId) : null;
+                const filledSize = order?.filledSize != null ? Number(order.filledSize) : null;
+                const filled = typeof filledSize === 'number' && Number.isFinite(filledSize) && filledSize > 0 ? filledSize : null;
+                const entryFilledShares = filled != null ? filled : (amountUsd / bestAsk);
+                const entryOutcome = String(outcomes[idxEntry] || '');
+                const hedgeOutcome = String(outcomes[idxHedge] || '');
+                const active = {
+                    startedAt: new Date().toISOString(),
+                    phase: res?.success === true ? 'waiting_hedge' : 'failed',
+                    symbol,
+                    conditionId: cid,
+                    slug: pick.slug ?? null,
+                    title: pick.title ?? null,
+                    endDate: pick.endDate ?? null,
+                    expiresAtMs,
+                    secondsToExpire: pick.secondsToExpire ?? null,
+                    entryIndex: idxEntry,
+                    hedgeIndex: idxHedge,
+                    entryTokenId,
+                    hedgeTokenId,
+                    entryOutcome,
+                    hedgeOutcome,
+                    entryPrice: bestAsk,
+                    entryLimitPrice: limitPrice,
+                    entryAmountUsd: amountUsd,
+                    entryOrderId: orderId,
+                    entryOrder: res,
+                    entryFilledShares,
+                    hedgeFilledShares: 0,
+                };
+                this.crypto15mHedgeActivesBySymbol.set(symbol, active);
+                this.crypto15mHedgeTrackedByCondition.set(cid, active);
+                this.crypto15mHedgeOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol, expiresAtMs, conditionId: cid, status: res?.success === true ? 'ordered' : 'failed' });
+                this.crypto15mHedgeLastOrderAttempt = { at: new Date().toISOString(), type: 'entry', symbol, conditionId: cid, orderId, success: res?.success ?? null, errorMsg: res?.errorMsg ?? null, entryPrice: bestAsk, limitPrice, entryFilledShares };
+                this.recordCrypto15mHedgeEvent({
+                    action: 'crypto15m_hedge_entry',
+                    symbol,
+                    conditionId: cid,
+                    slug: pick.slug ?? null,
+                    tokenId: entryTokenId,
+                    outcome: entryOutcome,
+                    bestAsk,
+                    bestBid: Number.isFinite(bestBid) ? bestBid : null,
+                    spreadCents,
+                    limitPrice,
+                    amountUsd,
+                    orderId,
+                    success: res?.success ?? null,
+                    errorMsg: res?.errorMsg ?? null,
+                    filledSize,
+                    entryFilledShares,
+                    secondsToExpire: pick.secondsToExpire ?? null,
+                    phase: active.phase,
+                });
+            }
+        } catch (e: any) {
+            this.crypto15mHedgeLastError = e?.message || String(e);
+        } finally {
+            this.crypto15mHedgeAutoInFlight = false;
+        }
+    }
+
+    startCrypto15mAuto(config?: { enabled?: boolean; dryRun?: boolean; amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; buySizingMode?: 'fixed' | 'orderbook_max' | 'all_capital' | string; sweepEnabled?: boolean; sweepWindowSec?: number; sweepMaxOrdersPerMarket?: number; sweepMaxTotalUsdPerMarket?: number; sweepMinIntervalMs?: number; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
         const enabled = config?.enabled != null ? !!config.enabled : true;
+        const dryRun = config?.dryRun != null ? (config.dryRun === true) : this.crypto15mAutoDryRun;
         const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mAutoConfig.amountUsd;
         const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mAutoConfig.minProb;
         const expiresWithinSec = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec;
         const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mAutoConfig.pollMs;
         const buySizingModeRaw = config?.buySizingMode != null ? String(config.buySizingMode) : this.crypto15mAutoConfig.buySizingMode;
+        const sweepEnabled = config?.sweepEnabled != null ? !!config.sweepEnabled : this.crypto15mAutoConfig.sweepEnabled;
+        const sweepWindowSecRaw = config?.sweepWindowSec != null ? Number(config.sweepWindowSec) : this.crypto15mAutoConfig.sweepWindowSec;
+        const sweepMaxOrdersPerMarketRaw = config?.sweepMaxOrdersPerMarket != null ? Number(config.sweepMaxOrdersPerMarket) : this.crypto15mAutoConfig.sweepMaxOrdersPerMarket;
+        const sweepMaxTotalUsdPerMarketRaw = config?.sweepMaxTotalUsdPerMarket != null ? Number(config.sweepMaxTotalUsdPerMarket) : this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket;
+        const sweepMinIntervalMsRaw = config?.sweepMinIntervalMs != null ? Number(config.sweepMinIntervalMs) : this.crypto15mAutoConfig.sweepMinIntervalMs;
         const trendEnabled = config?.trendEnabled != null ? !!config.trendEnabled : this.crypto15mAutoConfig.trendEnabled;
         const trendMinutesRaw = config?.trendMinutes != null ? Number(config.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
         const staleMsThreshold = config?.staleMsThreshold != null ? Number(config.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold;
@@ -6414,6 +9018,11 @@ export class GroupArbitrageScanner {
             minProb: Math.max(0, Math.min(1, minProb)),
             amountUsd: Math.max(1, Number.isFinite(amountUsd) ? amountUsd : 1),
             buySizingMode: buySizingModeRaw === 'orderbook_max' ? 'orderbook_max' : buySizingModeRaw === 'all_capital' ? 'all_capital' : 'fixed',
+            sweepEnabled,
+            sweepWindowSec: Math.max(0, Math.min(900, Math.floor(Number.isFinite(sweepWindowSecRaw) ? sweepWindowSecRaw : 30))),
+            sweepMaxOrdersPerMarket: Math.max(1, Math.min(200, Math.floor(Number.isFinite(sweepMaxOrdersPerMarketRaw) ? sweepMaxOrdersPerMarketRaw : 10))),
+            sweepMaxTotalUsdPerMarket: Math.max(1, Math.min(50_000, Number.isFinite(sweepMaxTotalUsdPerMarketRaw) ? sweepMaxTotalUsdPerMarketRaw : 600)),
+            sweepMinIntervalMs: Math.max(50, Math.min(30_000, Math.floor(Number.isFinite(sweepMinIntervalMsRaw) ? sweepMinIntervalMsRaw : 400))),
             trendEnabled,
             trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1))),
             staleMsThreshold: Math.max(500, Math.floor(staleMsThreshold)),
@@ -6430,6 +9039,7 @@ export class GroupArbitrageScanner {
         this.persistCrypto15mAutoConfigToFile();
 
         this.crypto15mAutoEnabled = enabled;
+        this.crypto15mAutoDryRun = dryRun;
         this.crypto15mLastError = null;
 
         if (this.crypto15mAutoTimer) {
@@ -6448,7 +9058,7 @@ export class GroupArbitrageScanner {
             }
         }
 
-        this.recordAutoConfigEvent('crypto15m', enabled ? 'start' : 'stop', { enabled, ...this.crypto15mAutoConfig });
+        this.recordAutoConfigEvent('crypto15m', enabled ? 'start' : 'stop', { enabled, dryRun: this.crypto15mAutoDryRun === true, ...this.crypto15mAutoConfig });
         return this.getCrypto15mStatus();
     }
 
@@ -6462,12 +9072,46 @@ export class GroupArbitrageScanner {
         return this.getCrypto15mStatus();
     }
 
-    updateCrypto15mConfig(config?: { amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
+    async runCrypto15mAutoOnce(options?: { dryRun?: boolean; minProb?: number; expiresWithinSec?: number; amountUsd?: number }) {
+        const prevEnabled = this.crypto15mAutoEnabled;
+        const prevDryRun = this.crypto15mAutoDryRun;
+        const prevConfig = { ...this.crypto15mAutoConfig };
+        try {
+            this.crypto15mAutoEnabled = true;
+            if (options?.dryRun != null) this.crypto15mAutoDryRun = options.dryRun === true;
+            if (options?.minProb != null || options?.expiresWithinSec != null || options?.amountUsd != null) {
+                const minProbRaw = options?.minProb != null ? Number(options.minProb) : prevConfig.minProb;
+                const expiresWithinSecRaw = options?.expiresWithinSec != null ? Number(options.expiresWithinSec) : prevConfig.expiresWithinSec;
+                const amountUsdRaw = options?.amountUsd != null ? Number(options.amountUsd) : prevConfig.amountUsd;
+                this.crypto15mAutoConfig = {
+                    ...prevConfig,
+                    minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : prevConfig.minProb)),
+                    expiresWithinSec: Math.max(5, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : prevConfig.expiresWithinSec)),
+                    amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : prevConfig.amountUsd),
+                };
+            }
+            await this.crypto15mTryAutoOnce();
+            return { success: true, status: this.getCrypto15mStatus() };
+        } catch (e: any) {
+            return { success: false, error: e?.message || String(e), status: this.getCrypto15mStatus() };
+        } finally {
+            this.crypto15mAutoEnabled = prevEnabled;
+            this.crypto15mAutoDryRun = prevDryRun;
+            this.crypto15mAutoConfig = prevConfig;
+        }
+    }
+
+    updateCrypto15mConfig(config?: { amountUsd?: number; minProb?: number; expiresWithinSec?: number; pollMs?: number; buySizingMode?: 'fixed' | 'orderbook_max' | 'all_capital' | string; sweepEnabled?: boolean; sweepWindowSec?: number; sweepMaxOrdersPerMarket?: number; sweepMaxTotalUsdPerMarket?: number; sweepMinIntervalMs?: number; trendEnabled?: boolean; trendMinutes?: number; staleMsThreshold?: number; stoplossEnabled?: boolean; stoplossCut1DropCents?: number; stoplossCut1SellPct?: number; stoplossCut2DropCents?: number; stoplossCut2SellPct?: number; stoplossMinSecToExit?: number; adaptiveDeltaEnabled?: boolean; adaptiveDeltaBigMoveMultiplier?: number; adaptiveDeltaRevertNoBuyCount?: number }) {
         const amountUsd = config?.amountUsd != null ? Number(config.amountUsd) : this.crypto15mAutoConfig.amountUsd;
         const minProb = config?.minProb != null ? Number(config.minProb) : this.crypto15mAutoConfig.minProb;
         const expiresWithinSec = config?.expiresWithinSec != null ? Number(config.expiresWithinSec) : this.crypto15mAutoConfig.expiresWithinSec;
         const pollMs = config?.pollMs != null ? Number(config.pollMs) : this.crypto15mAutoConfig.pollMs;
         const buySizingModeRaw = (config as any)?.buySizingMode != null ? String((config as any).buySizingMode) : this.crypto15mAutoConfig.buySizingMode;
+        const sweepEnabled = (config as any)?.sweepEnabled != null ? !!(config as any).sweepEnabled : this.crypto15mAutoConfig.sweepEnabled;
+        const sweepWindowSecRaw = (config as any)?.sweepWindowSec != null ? Number((config as any).sweepWindowSec) : this.crypto15mAutoConfig.sweepWindowSec;
+        const sweepMaxOrdersPerMarketRaw = (config as any)?.sweepMaxOrdersPerMarket != null ? Number((config as any).sweepMaxOrdersPerMarket) : this.crypto15mAutoConfig.sweepMaxOrdersPerMarket;
+        const sweepMaxTotalUsdPerMarketRaw = (config as any)?.sweepMaxTotalUsdPerMarket != null ? Number((config as any).sweepMaxTotalUsdPerMarket) : this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket;
+        const sweepMinIntervalMsRaw = (config as any)?.sweepMinIntervalMs != null ? Number((config as any).sweepMinIntervalMs) : this.crypto15mAutoConfig.sweepMinIntervalMs;
         const trendEnabled = config?.trendEnabled != null ? !!config.trendEnabled : this.crypto15mAutoConfig.trendEnabled;
         const trendMinutesRaw = config?.trendMinutes != null ? Number(config.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
         const staleMsThreshold = config?.staleMsThreshold != null ? Number(config.staleMsThreshold) : this.crypto15mAutoConfig.staleMsThreshold;
@@ -6487,6 +9131,11 @@ export class GroupArbitrageScanner {
             minProb: Math.max(0, Math.min(1, minProb)),
             amountUsd: Math.max(1, Number.isFinite(amountUsd) ? amountUsd : 1),
             buySizingMode: buySizingModeRaw === 'orderbook_max' ? 'orderbook_max' : buySizingModeRaw === 'all_capital' ? 'all_capital' : 'fixed',
+            sweepEnabled,
+            sweepWindowSec: Math.max(0, Math.min(900, Math.floor(Number.isFinite(sweepWindowSecRaw) ? sweepWindowSecRaw : 30))),
+            sweepMaxOrdersPerMarket: Math.max(1, Math.min(200, Math.floor(Number.isFinite(sweepMaxOrdersPerMarketRaw) ? sweepMaxOrdersPerMarketRaw : 10))),
+            sweepMaxTotalUsdPerMarket: Math.max(1, Math.min(50_000, Number.isFinite(sweepMaxTotalUsdPerMarketRaw) ? sweepMaxTotalUsdPerMarketRaw : 600)),
+            sweepMinIntervalMs: Math.max(50, Math.min(30_000, Math.floor(Number.isFinite(sweepMinIntervalMsRaw) ? sweepMinIntervalMsRaw : 400))),
             trendEnabled,
             trendMinutes: Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1))),
             staleMsThreshold: Math.max(500, Math.floor(staleMsThreshold)),
@@ -6508,12 +9157,13 @@ export class GroupArbitrageScanner {
     getCrypto15mWatchdogStatus() {
         const w = this.crypto15mWatchdog;
         const now = Date.now();
-        const remainingMs = w.running && w.endsAtMs ? Math.max(0, w.endsAtMs - now) : 0;
+        const hasEnd = w.endsAtMs != null && Number.isFinite(Number(w.endsAtMs)) && Number(w.endsAtMs) > 0;
+        const remainingMs = w.running && hasEnd ? Math.max(0, Number(w.endsAtMs) - now) : null;
         return {
             running: w.running,
             pollMs: w.pollMs,
             startedAt: w.startedAtMs ? new Date(w.startedAtMs).toISOString() : null,
-            endsAt: w.endsAtMs ? new Date(w.endsAtMs).toISOString() : null,
+            endsAt: hasEnd ? new Date(Number(w.endsAtMs)).toISOString() : null,
             remainingMs: w.running ? remainingMs : null,
             lastTickAt: w.lastTickAtMs ? new Date(w.lastTickAtMs).toISOString() : null,
             lastError: w.lastError,
@@ -6527,14 +9177,13 @@ export class GroupArbitrageScanner {
     }
 
     startCrypto15mWatchdog(options?: { durationHours?: number; pollMs?: number; staleMsThreshold?: number }) {
-        const durationHours = options?.durationHours != null ? Number(options.durationHours) : 12;
         const pollMs = options?.pollMs != null ? Number(options.pollMs) : 30_000;
         const staleMsThreshold = options?.staleMsThreshold != null ? Number(options.staleMsThreshold) : this.crypto15mWatchdog.thresholds.staleMsThreshold;
         const now = Date.now();
         this.crypto15mWatchdog.running = true;
         this.crypto15mWatchdog.pollMs = Math.max(5_000, Math.floor(pollMs));
         this.crypto15mWatchdog.startedAtMs = now;
-        this.crypto15mWatchdog.endsAtMs = now + Math.max(1, durationHours) * 60 * 60_000;
+        this.crypto15mWatchdog.endsAtMs = 0;
         this.crypto15mWatchdog.lastTickAtMs = 0;
         this.crypto15mWatchdog.lastError = null;
         this.crypto15mWatchdog.stopReason = null;
@@ -6597,10 +9246,6 @@ export class GroupArbitrageScanner {
         if (!w.running) return;
         const now = Date.now();
         w.lastTickAtMs = now;
-        if (w.endsAtMs && now >= w.endsAtMs) {
-            this.stopCrypto15mWatchdog({ reason: 'duration_elapsed', stopAuto: true });
-            return;
-        }
 
         let staleMs: number | null = null;
         let booksError: string | null = null;
@@ -6621,14 +9266,14 @@ export class GroupArbitrageScanner {
         else w.counters.consecutiveStale = 0;
 
         if (w.counters.consecutiveDataError >= w.thresholds.consecutiveDataStops) {
-            w.issues.push({ at: new Date().toISOString(), type: 'data_error', message: `booksError=${booksError || '-'} marketError=${marketError || '-'}` });
-            this.stopCrypto15mWatchdog({ reason: 'data_error', stopAuto: true });
-            return;
+            if (w.counters.consecutiveDataError === w.thresholds.consecutiveDataStops) {
+                w.issues.push({ at: new Date().toISOString(), type: 'data_error', message: `booksError=${booksError || '-'} marketError=${marketError || '-'}` });
+            }
         }
         if (w.counters.consecutiveStale >= w.thresholds.consecutiveStaleStops) {
-            w.issues.push({ at: new Date().toISOString(), type: 'books_stale', message: `staleMs=${Math.floor(Number(staleMs))} threshold=${w.thresholds.staleMsThreshold}` });
-            this.stopCrypto15mWatchdog({ reason: 'books_stale', stopAuto: true });
-            return;
+            if (w.counters.consecutiveStale === w.thresholds.consecutiveStaleStops) {
+                w.issues.push({ at: new Date().toISOString(), type: 'books_stale', message: `staleMs=${Math.floor(Number(staleMs))} threshold=${w.thresholds.staleMsThreshold}` });
+            }
         }
 
         await this.refreshHistoryStatuses({ maxEntries: 50, minIntervalMs: 1000 }).catch(() => null);
@@ -6638,10 +9283,8 @@ export class GroupArbitrageScanner {
         const anyRedeemFailed = items.find((it: any) => String(it?.redeemStatus || '') === 'failed' || String(it?.state || '') === 'redeem_failed') || null;
         if (anyRedeemFailed) {
             w.counters.redeemFailed += 1;
-            w.issues.push({ at: new Date().toISOString(), type: 'redeem_failed', message: `${anyRedeemFailed.slug || anyRedeemFailed.conditionId || ''}`, meta: { conditionId: anyRedeemFailed.conditionId, txHash: anyRedeemFailed.txHash || null } });
-            if (w.counters.redeemFailed >= w.thresholds.redeemFailedStops) {
-                this.stopCrypto15mWatchdog({ reason: 'redeem_failed', stopAuto: true });
-                return;
+            if (w.counters.redeemFailed === w.thresholds.redeemFailedStops) {
+                w.issues.push({ at: new Date().toISOString(), type: 'redeem_failed', message: `${anyRedeemFailed.slug || anyRedeemFailed.conditionId || ''}`, meta: { conditionId: anyRedeemFailed.conditionId, txHash: anyRedeemFailed.txHash || null } });
             }
         } else {
             w.counters.redeemFailed = 0;
@@ -6653,10 +9296,8 @@ export class GroupArbitrageScanner {
         }) || null;
         if (anyOrderFailed) {
             w.counters.orderFailed += 1;
-            w.issues.push({ at: new Date().toISOString(), type: 'order_failed', message: `${anyOrderFailed.slug || anyOrderFailed.conditionId || ''}`, meta: { conditionId: anyOrderFailed.conditionId, orderId: anyOrderFailed.orderId || null, orderStatus: anyOrderFailed.orderStatus } });
-            if (w.counters.orderFailed >= w.thresholds.orderFailedStops) {
-                this.stopCrypto15mWatchdog({ reason: 'order_failed', stopAuto: true });
-                return;
+            if (w.counters.orderFailed === w.thresholds.orderFailedStops) {
+                w.issues.push({ at: new Date().toISOString(), type: 'order_failed', message: `${anyOrderFailed.slug || anyOrderFailed.conditionId || ''}`, meta: { conditionId: anyOrderFailed.conditionId, orderId: anyOrderFailed.orderId || null, orderStatus: anyOrderFailed.orderStatus } });
             }
         } else {
             w.counters.orderFailed = 0;
@@ -6678,8 +9319,6 @@ export class GroupArbitrageScanner {
         if (dup) {
             const [key, count] = dup;
             w.issues.push({ at: new Date().toISOString(), type: 'duplicate_order', message: `${key} count=${count} (10m)`, meta: { key, count } });
-            this.stopCrypto15mWatchdog({ reason: 'duplicate_order', stopAuto: true });
-            return;
         }
 
         for (const [cid, inflight] of this.redeemInFlight.entries()) {
@@ -6688,9 +9327,9 @@ export class GroupArbitrageScanner {
             if (!Number.isFinite(subAt)) continue;
             if (now - subAt <= w.thresholds.redeemSubmittedTimeoutMs) continue;
             w.issues.push({ at: new Date().toISOString(), type: 'redeem_timeout', message: `conditionId=${cid}`, meta: { submittedAt: inflight.submittedAt, transactionId: inflight.transactionId || null } });
-            this.stopCrypto15mWatchdog({ reason: 'redeem_timeout', stopAuto: true });
-            return;
         }
+
+        if (w.issues.length > 2000) w.issues = w.issues.slice(-2000);
     }
 
     private crypto15mWriteWatchdogReport(stopReason: string) {
@@ -6757,7 +9396,7 @@ export class GroupArbitrageScanner {
         const source = params.source || 'semi';
         const force = params.force === true;
         const requestedMinPrice = params.minPrice != null ? Number(params.minPrice) : NaN;
-        const effectiveMinPrice = Math.max(0.9, this.crypto15mAutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
+        const effectiveMinPrice = Math.max(0, this.crypto15mAutoConfig.minProb, Number.isFinite(requestedMinPrice) ? requestedMinPrice : -Infinity);
         const trendEnabled = params.trendEnabled != null ? (params.trendEnabled === true) : this.crypto15mAutoConfig.trendEnabled;
         const trendMinutesRaw = params.trendMinutes != null ? Number(params.trendMinutes) : this.crypto15mAutoConfig.trendMinutes;
         const trendMinutes = Math.max(1, Math.min(10, Math.floor(Number.isFinite(trendMinutesRaw) ? trendMinutesRaw : 1)));
@@ -6789,18 +9428,9 @@ export class GroupArbitrageScanner {
         if (params.trendEnabled != null || params.trendMinutes != null) {
             this.crypto15mAutoConfig = { ...this.crypto15mAutoConfig, trendEnabled, trendMinutes };
         }
-        if (this.crypto15mTrackedByCondition.has(conditionId)) {
-            throw new Error(`Already ordered for this market (conditionId=${conditionId})`);
-        }
-        const alreadyInHistory = this.orderHistory.some((e: any) => {
-            if (!e) return false;
-            if (String(e?.action || '') !== 'crypto15m_order') return false;
-            const mid = String(e?.marketId || '').trim().toLowerCase();
-            return mid && mid === conditionId.toLowerCase();
-        });
-        if (alreadyInHistory) {
-            throw new Error(`Already ordered for this market (history) (conditionId=${conditionId})`);
-        }
+        const buySizingMode = this.crypto15mAutoConfig.buySizingMode;
+        const secondsToExpireRaw = params.secondsToExpire != null ? Math.floor(Number(params.secondsToExpire)) : NaN;
+        const secondsToExpireParam = Number.isFinite(secondsToExpireRaw) ? secondsToExpireRaw : null;
 
         const market = await withRetry(() => this.sdk.clobApi.getMarket(conditionId), { maxRetries: 2 });
         const marketAny: any = market as any;
@@ -6830,10 +9460,28 @@ export class GroupArbitrageScanner {
             endDate = new Date(expiresAtMs).toISOString();
         }
 
+        const secondsToExpire = secondsToExpireParam != null ? secondsToExpireParam : Math.max(0, Math.floor((expiresAtMs - Date.now()) / 1000));
+        const sweepWindowSec = Math.max(0, Math.floor(Number(this.crypto15mAutoConfig.sweepWindowSec) || 0));
+        const sweepActive = this.crypto15mAutoConfig.sweepEnabled === true && secondsToExpire <= sweepWindowSec;
+
+        if (this.crypto15mTrackedByCondition.has(conditionId) && !sweepActive) {
+            throw new Error(`Already ordered for this market (conditionId=${conditionId})`);
+        }
+        const alreadyInHistory = this.orderHistory.some((e: any) => {
+            if (!e) return false;
+            if (String(e?.action || '') !== 'crypto15m_order') return false;
+            const mid = String(e?.marketId || '').trim().toLowerCase();
+            return mid && mid === conditionId.toLowerCase();
+        });
+        if (alreadyInHistory && !sweepActive) {
+            throw new Error(`Already ordered for this market (history) (conditionId=${conditionId})`);
+        }
+
         const upperSymbol = String(symbol || '').toUpperCase();
         const orderLockKey = upperSymbol && upperSymbol !== 'UNKNOWN' ? `${upperSymbol}:${expiresAtMs}` : null;
         if (!force && orderLockKey) {
-            if (this.crypto15mActivesBySymbol.has(upperSymbol)) {
+            const active = this.crypto15mActivesBySymbol.get(upperSymbol);
+            if (active && !(sweepActive && String(active?.conditionId || '') === conditionId)) {
                 return { success: false, skipped: true, reason: 'already_active', symbol: upperSymbol, slug: marketSlug || null, expiresAtMs };
             }
             const locked = this.crypto15mOrderLocks.get(orderLockKey);
@@ -6901,9 +9549,14 @@ export class GroupArbitrageScanner {
                 }
             }
         }
+        const booksFetchedAtMs = Date.now();
         const books = await this.fetchClobBooks([tokenId]);
         const book = books && books.length ? books[0] : null;
-        const asks = Array.isArray(book?.asks) ? book.asks : [];
+        const booksCache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
+        const booksCacheAtMs = booksCache?.get(String(tokenId))?.atMs ?? null;
+        const booksStaleMs = booksCacheAtMs != null ? Math.max(0, booksFetchedAtMs - Number(booksCacheAtMs)) : null;
+        const asks = Array.isArray((book as any)?.asks) ? (book as any).asks : [];
+        const bids = Array.isArray((book as any)?.bids) ? (book as any).bids : [];
         let bestAsk = NaN;
         for (const a of asks) {
             const p = Number(a?.price);
@@ -6911,31 +9564,116 @@ export class GroupArbitrageScanner {
             if (!Number.isFinite(bestAsk) || p < bestAsk) bestAsk = p;
         }
         const asksCount = asks.length;
-        if (!(asksCount > 0) || !Number.isFinite(bestAsk) || bestAsk <= 0) {
+        const hasAsks = (asksCount > 0) && Number.isFinite(bestAsk) && bestAsk > 0;
+        if (!hasAsks && !sweepActive) {
             throw new Error(`No asks (orderbook unavailable) for tokenId=${tokenId}`);
         }
-        const price = bestAsk;
-        if (Number.isFinite(effectiveMinPrice) && effectiveMinPrice > 0 && price < effectiveMinPrice) {
+        const price = hasAsks ? bestAsk : NaN;
+        if (hasAsks && Number.isFinite(effectiveMinPrice) && effectiveMinPrice > 0 && price < effectiveMinPrice) {
             throw new Error(`Price below threshold: bestAsk=${price} < minPrice=${effectiveMinPrice}`);
         }
 
-        const limitPrice = Math.min(0.999, Math.max(effectiveMinPrice, price) + 0.02);
+        const basePrice = hasAsks
+            ? price
+            : (Number.isFinite(effectiveMinPrice) && effectiveMinPrice > 0 ? effectiveMinPrice : 0.999);
+        let limitPrice = Math.min(0.999, basePrice + 0.02);
+        if (sweepActive) limitPrice = 0.999;
+        const depthUsdAtCap = (() => {
+            try {
+                const r = computeAskDepthUsd({ asks, limitPrice, maxLevels: 200 });
+                const v = r?.depthUsd != null ? Number(r.depthUsd) : NaN;
+                return Number.isFinite(v) ? v : null;
+            } catch {
+                return null;
+            }
+        })();
         let amountUsdFinal = amountUsd;
-        const buySizingMode = this.crypto15mAutoConfig.buySizingMode || 'fixed';
+        const buySizingModeFinal = sweepActive ? 'orderbook_max' : (this.crypto15mAutoConfig.buySizingMode || 'fixed');
         let sizingDepthUsd: number | null = null;
         let sizingDepthCap: number | null = null;
         let sizingAskLevelsUsed: number | null = null;
-        if (buySizingMode !== 'fixed') {
-            const depth = computeAskDepthUsd({ asks, limitPrice, targetUsd: amountUsd, maxLevels: 200 });
+        const replayBefore = buildOrderbookSnapshot({ book: { asks, bids }, fetchedAtMs: Number(booksCacheAtMs) || booksFetchedAtMs, topN: 25 });
+        const replay: any = {
+            meta: {
+                strategy: 'crypto15m',
+                tokenId,
+                conditionId,
+                symbol: upperSymbol || symbol,
+                outcome,
+                outcomeIndex: idx,
+                expiresAtMs,
+                secondsToExpire,
+                bestAsk: Number.isFinite(price) ? Number(price) : null,
+                limitPrice,
+                buySizingMode: buySizingModeFinal,
+                requestedAmountUsd: amountUsd,
+                booksStaleMs,
+                depthUsdAtCap,
+                preOpenOrdersCount: null,
+                preOpenOrdersRemainingShares: null,
+                preOpenOrdersRemainingUsd: null,
+            },
+            before: replayBefore,
+            after: null,
+        };
+
+        let preOpenOrdersCount: number | null = null;
+        let preOpenOrdersRemainingShares: number | null = null;
+        let preOpenOrdersRemainingUsd: number | null = null;
+        try {
+            const openOrders = await this.tradingClient.getOpenOrders(conditionId).catch(() => []);
+            const list = Array.isArray(openOrders) ? openOrders : [];
+            preOpenOrdersCount = list.length;
+            let remShares = 0;
+            let remUsd = 0;
+            for (const o of list) {
+                const size = o?.size != null ? Number(o.size) : (o?.originalSize != null ? Number(o.originalSize) : NaN);
+                const filled = o?.filledSize != null ? Number(o.filledSize) : (o?.filled != null ? Number(o.filled) : 0);
+                const price0 = o?.price != null ? Number(o.price) : NaN;
+                const remaining = Number.isFinite(size) ? Math.max(0, size - (Number.isFinite(filled) ? filled : 0)) : NaN;
+                if (Number.isFinite(remaining)) remShares += remaining;
+                if (Number.isFinite(remaining) && Number.isFinite(price0)) remUsd += remaining * price0;
+            }
+            preOpenOrdersRemainingShares = Number.isFinite(remShares) ? remShares : null;
+            preOpenOrdersRemainingUsd = Number.isFinite(remUsd) ? remUsd : null;
+        } catch {
+        }
+        replay.meta.preOpenOrdersCount = preOpenOrdersCount;
+        replay.meta.preOpenOrdersRemainingShares = preOpenOrdersRemainingShares;
+        replay.meta.preOpenOrdersRemainingUsd = preOpenOrdersRemainingUsd;
+        let sweepState: { conditionId: string; symbol: string; expiresAtMs: number; ordersCount: number; totalUsd: number; lastOrderAtMs: number } | null = null;
+        if (!force && sweepActive) {
+            const maxOrders = Math.max(1, Math.floor(Number(this.crypto15mAutoConfig.sweepMaxOrdersPerMarket) || 10));
+            const maxTotalUsd = Math.max(1, Number(this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket) || 600);
+            const minIntervalMs = Math.max(0, Math.floor(Number(this.crypto15mAutoConfig.sweepMinIntervalMs) || 0));
+            const cur = this.crypto15mSweepStateByConditionId.get(conditionId) || { conditionId, symbol: upperSymbol || symbol, expiresAtMs, ordersCount: 0, totalUsd: 0, lastOrderAtMs: 0 };
+            if (cur.ordersCount >= maxOrders) {
+                return { success: false, skipped: true, reason: 'sweep_max_orders', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs, ordersCount: cur.ordersCount, maxOrders };
+            }
+            if (cur.totalUsd >= maxTotalUsd) {
+                return { success: false, skipped: true, reason: 'sweep_max_total', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs, totalUsd: cur.totalUsd, maxTotalUsd };
+            }
+            const nowMs = Date.now();
+            if (minIntervalMs > 0 && cur.lastOrderAtMs > 0 && nowMs - cur.lastOrderAtMs < minIntervalMs) {
+                return { success: false, skipped: true, reason: 'sweep_throttle', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs, waitMs: minIntervalMs - (nowMs - cur.lastOrderAtMs) };
+            }
+            const remaining = maxTotalUsd - cur.totalUsd;
+            if (remaining < 1) {
+                return { success: false, skipped: true, reason: 'sweep_max_total', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs, totalUsd: cur.totalUsd, maxTotalUsd };
+            }
+            amountUsdFinal = Math.max(1, Math.min(amountUsdFinal, remaining));
+            sweepState = { ...cur, lastOrderAtMs: nowMs, expiresAtMs, symbol: upperSymbol || symbol };
+            this.crypto15mSweepStateByConditionId.set(conditionId, sweepState);
+        }
+        if (buySizingModeFinal !== 'fixed') {
+            const depth = computeAskDepthUsd({ asks, limitPrice, targetUsd: amountUsdFinal, maxLevels: 200 });
             const depthCap = depth.depthUsd * 0.95;
             sizingDepthUsd = depth.depthUsd;
             sizingDepthCap = depthCap;
             sizingAskLevelsUsed = depth.levelsUsed;
-            if (buySizingMode === 'orderbook_max') {
-                if (Number.isFinite(depthCap) && depthCap >= 1) {
-                    amountUsdFinal = Math.max(1, Math.min(amountUsd, depthCap));
-                }
-            } else if (buySizingMode === 'all_capital') {
+            if (buySizingModeFinal === 'orderbook_max') {
+                amountUsdFinal = Number.isFinite(depthCap) ? Math.max(1, Math.min(amountUsdFinal, depthCap)) : amountUsdFinal;
+            } else if (buySizingModeFinal === 'all_capital') {
                 const pf: any = await this.getPortfolioSummary({ positionsLimit: 1 }).catch(() => null);
                 const cash = pf?.cash != null ? Number(pf.cash) : NaN;
                 if (!Number.isFinite(cash) || cash < 1) {
@@ -6943,43 +9681,168 @@ export class GroupArbitrageScanner {
                 }
                 const hardCap = 5_000;
                 const cap = Math.min(cash, hardCap);
-                amountUsdFinal = Math.max(1, Number.isFinite(depthCap) && depthCap >= 1 ? Math.min(cap, depthCap) : cap);
+                amountUsdFinal = Math.max(1, Number.isFinite(depthCap) ? Math.min(cap, depthCap) : cap);
             }
         }
         const globalKey = `crypto15m:${conditionId}`.toLowerCase();
-        let order: any = null;
-        let globalOk = false;
-        try {
-            if (!force) {
-                if (!this.tryAcquireGlobalOrderLock(globalKey, 'crypto15m')) {
-                    return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
-                }
-                if (this.globalOrderPlaceInFlight) {
-                    this.markGlobalOrderLockDone(globalKey, false);
-                    return { success: false, skipped: true, reason: 'global_inflight', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
-                }
-                this.globalOrderPlaceInFlight = true;
-            }
-            order = await this.tradingClient.createMarketOrder({
-                tokenId,
-                side: 'BUY',
-                amount: amountUsdFinal,
-                price: limitPrice,
-                orderType: 'FAK',
-            });
-            globalOk = !!order?.success;
-        } catch (e: any) {
-            if (orderLockKey) {
-                this.crypto15mOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'failed' });
-            }
-            throw e;
-        } finally {
-            if (!force) {
-                this.globalOrderPlaceInFlight = false;
-                this.markGlobalOrderLockDone(globalKey, globalOk);
+        const sweepMaxOrders = Math.max(1, Math.floor(Number(this.crypto15mAutoConfig.sweepMaxOrdersPerMarket) || 10));
+        const sweepMinIntervalMs = Math.max(0, Math.floor(Number(this.crypto15mAutoConfig.sweepMinIntervalMs) || 0));
+        const sweepOrdersRemaining = sweepState ? Math.max(1, sweepMaxOrders - (Number(sweepState.ordersCount) || 0)) : 1;
+
+        if (sweepActive && !force) {
+            if (!this.tryAcquireGlobalOrderLock(globalKey, 'crypto15m')) {
+                return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol || symbol, slug: marketSlug || null, expiresAtMs };
             }
         }
 
+        const sweepResult = sweepActive
+            ? await runSweepBuyLiveBurst({
+                tokenId,
+                priceCap: limitPrice,
+                budgetUsd: amountUsdFinal,
+                maxOrders: sweepOrdersRemaining,
+                maxConcurrent: Math.min(12, Math.max(1, sweepOrdersRemaining)),
+                windowMs: Math.max(0, Math.floor(Number(this.crypto15mAutoConfig.sweepWindowSec) || 0) * 1000),
+                roundIntervalMs: sweepMinIntervalMs,
+                maxRounds: 60,
+                fetchAsks: async () => {
+                    const books2 = await this.fetchClobBooks([tokenId]);
+                    const book2 = books2 && books2.length ? books2[0] : null;
+                    return Array.isArray(book2?.asks) ? book2.asks : [];
+                },
+                placeOrder: async ({ amountUsd, priceCap }) => {
+                    try {
+                        const res: any = await this.tradingClient.createMarketOrder({ tokenId, side: 'BUY', amount: amountUsd, price: priceCap, orderType: 'FAK' });
+                        const ok = res?.success === true;
+                        const rawErr =
+                            res?.errorMsg ?? res?.errorMessage ?? res?.message ?? res?.error ?? res?.reason ?? res?.details ?? res?.data ?? null;
+                        const errText = rawErr == null ? null : (() => {
+                            try {
+                                const s = typeof rawErr === 'string' ? rawErr : JSON.stringify(rawErr);
+                                return s ? String(s).slice(0, 240) : null;
+                            } catch {
+                                return String(rawErr).slice(0, 240);
+                            }
+                        })();
+                        return { success: ok, orderId: res?.orderId ?? null, errorMsg: ok ? null : (errText || 'order_rejected') };
+                    } catch (e: any) {
+                        return { success: false, orderId: null, errorMsg: e?.message || String(e) };
+                    }
+                },
+                getOrder: async (orderId: string) => {
+                    const id = String(orderId || '').trim();
+                    if (!id) return {};
+                    const o: any = await this.tradingClient.getOrder(id).catch(() => null);
+                    return {
+                        status: o?.status ?? null,
+                        filledSize: o?.filledSize ?? null,
+                        price: o?.price ?? null,
+                    };
+                },
+                maxLevels: 200,
+            })
+            : null;
+
+        if (sweepActive && !force) {
+            this.markGlobalOrderLockDone(globalKey, sweepResult?.ok === true);
+        }
+
+        const order = sweepActive
+            ? {
+                success: sweepResult?.ok === true,
+                orderId: sweepResult?.orders?.[0]?.orderId ?? null,
+                orderStatus: sweepResult?.orders?.[0]?.orderStatus ?? null,
+                filledSize: sweepResult?.summary?.totalFilledShares ?? null,
+                errorMsg: (sweepResult?.summary?.totalFilledUsd != null && Number(sweepResult.summary.totalFilledUsd) > 0)
+                    ? null
+                    : (sweepResult?.orders?.find((o) => o?.success === false)?.errorMsg ?? (sweepResult?.ok === true ? null : (sweepResult?.summary?.stopReason ?? 'order_failed'))),
+                sweep: sweepResult,
+            }
+            : await (async () => {
+                let ord: any = null;
+                let globalOk = false;
+                const attempts: any[] = [];
+                try {
+                    if (!force) {
+                        if (!this.tryAcquireGlobalOrderLock(globalKey, 'crypto15m')) {
+                            return { success: false, errorMsg: 'global_locked' };
+                        }
+                        if (this.globalOrderPlaceInFlight) {
+                            this.markGlobalOrderLockDone(globalKey, false);
+                            return { success: false, errorMsg: 'global_inflight' };
+                        }
+                        this.globalOrderPlaceInFlight = true;
+                    }
+                    const runAttempt = async (attemptNo: number, attemptUsd: number) => {
+                        const startedAtMs = Date.now();
+                        const res = await this.tradingClient.createMarketOrder({
+                            tokenId,
+                            side: 'BUY',
+                            amount: attemptUsd,
+                            price: limitPrice,
+                            orderType: 'FAK',
+                        });
+                        const orderRoundtripMs = Math.max(0, Date.now() - startedAtMs);
+                        const out = { ...res, orderRoundtripMs, attemptedUsd: attemptUsd, attemptNo };
+                        attempts.push(out);
+                        return out;
+                    };
+                    const a1 = await runAttempt(1, amountUsdFinal);
+                    ord = a1;
+                    const orderId1 = a1?.orderId != null ? String(a1.orderId) : (a1?.orderID != null ? String(a1.orderID) : (a1?.id != null ? String(a1.id) : null));
+                    const probe1 = await this.probeRecentBuyState({ conditionId, tokenId, orderId: orderId1, maxWaitMs: 900 }).catch(() => ({ orderId: orderId1, filledSize: null, filledUsd: null, hasOpen: false, openOrderId: null, openRemainingUsd: null } as any));
+                    (a1 as any).verified = true;
+                    (a1 as any).verifiedOrderId = probe1?.orderId ?? null;
+                    (a1 as any).verifiedFilledSize = probe1?.filledSize ?? null;
+                    (a1 as any).verifiedFilledUsd = probe1?.filledUsd ?? null;
+                    (a1 as any).verifiedHasOpen = probe1?.hasOpen === true;
+                    const filledUsd1 = probe1?.filledUsd != null ? Number(probe1.filledUsd) : 0;
+                    const didFill1 = Number.isFinite(filledUsd1) && filledUsd1 > 0;
+                    const remainingUsd1 = Math.max(0, amountUsdFinal - (Number.isFinite(filledUsd1) ? filledUsd1 : 0));
+                    const minDepthUsd = Math.max(2, Math.min(10, amountUsdFinal * 0.2));
+                    const depthOk = depthUsdAtCap != null && Number.isFinite(Number(depthUsdAtCap)) && Number(depthUsdAtCap) >= minDepthUsd;
+                    if (!sweepActive && remainingUsd1 >= 1 && depthOk && secondsToExpire >= 4 && probe1?.hasOpen !== true) {
+                        await new Promise((r) => setTimeout(r, 300));
+                        const book2 = await this.fetchClobBookSingle(tokenId, { minIntervalMs: 0, timeoutMs: 1_200 }).catch(() => null);
+                        const asks2 = Array.isArray((book2 as any)?.asks) ? (book2 as any).asks : [];
+                        const depth2 = computeAskDepthUsd({ asks: asks2, limitPrice, maxLevels: 200 });
+                        const d2 = depth2?.depthUsd != null ? Number(depth2.depthUsd) : NaN;
+                        const cap2 = Number.isFinite(d2) && d2 > 0 ? Math.max(1, Math.min(remainingUsd1, d2 * 0.95)) : remainingUsd1;
+                        const attemptUsd2 = Math.max(1, Math.min(remainingUsd1, cap2));
+                        const a2 = await runAttempt(2, attemptUsd2);
+                        ord = a2;
+                        const orderId2 = a2?.orderId != null ? String(a2.orderId) : (a2?.orderID != null ? String(a2.orderID) : (a2?.id != null ? String(a2.id) : null));
+                        const probe2 = await this.probeRecentBuyState({ conditionId, tokenId, orderId: orderId2, maxWaitMs: 900 }).catch(() => ({ orderId: orderId2, filledSize: null, filledUsd: null, hasOpen: false, openOrderId: null, openRemainingUsd: null } as any));
+                        (a2 as any).verified = true;
+                        (a2 as any).verifiedOrderId = probe2?.orderId ?? null;
+                        (a2 as any).verifiedFilledSize = probe2?.filledSize ?? null;
+                        (a2 as any).verifiedFilledUsd = probe2?.filledUsd ?? null;
+                        (a2 as any).verifiedHasOpen = probe2?.hasOpen === true;
+                    }
+                    globalOk = attempts.some((x) => x?.success === true) || (probe1?.filledUsd != null && Number(probe1.filledUsd) > 0) || probe1?.hasOpen === true || !!probe1?.orderId;
+                    const finalSuccess = globalOk;
+                    return { ...ord, success: finalSuccess, attempts };
+                } catch (e: any) {
+                    if (orderLockKey) {
+                        this.crypto15mOrderLocks.set(orderLockKey, { atMs: Date.now(), symbol: upperSymbol, expiresAtMs, conditionId, status: 'failed' });
+                    }
+                    throw e;
+                } finally {
+                    if (!force) {
+                        this.globalOrderPlaceInFlight = false;
+                        this.markGlobalOrderLockDone(globalKey, globalOk);
+                    }
+                }
+            })();
+
+        const amountUsdLogged = sweepActive && sweepResult ? Number(sweepResult.summary.totalAttemptedUsd || 0) : amountUsdFinal;
+
+        if (buySizingModeFinal !== 'fixed') {
+            replay.meta.sizingDepthUsd = sizingDepthUsd;
+            replay.meta.sizingDepthCap = sizingDepthCap;
+            replay.meta.sizingAskLevelsUsed = sizingAskLevelsUsed;
+        }
+        const book60s = this.getCrypto15mBook60sSnapshot(tokenId, Date.now());
         const entry = {
             id: Date.now(),
             timestamp: new Date().toISOString(),
@@ -6993,16 +9856,56 @@ export class GroupArbitrageScanner {
             price: price,
             bestAsk: price,
             limitPrice,
-            buySizingMode,
+            buySizingMode: buySizingModeFinal,
             requestedAmountUsd: amountUsd,
-            amountUsd: amountUsdFinal,
+            amountUsd: amountUsdLogged,
+            preOpenOrdersCount,
+            preOpenOrdersRemainingShares,
+            preOpenOrdersRemainingUsd,
+            depthUsdAtCap,
+            book60sEndSec: book60s.endSec,
+            book60s: book60s.points,
             sizingDepthUsd,
             sizingDepthCap,
             sizingAskLevelsUsed,
-            results: [{ ...order, tokenId, outcome, conditionId }],
+            sweep: sweepActive ? { windowSec: this.crypto15mAutoConfig.sweepWindowSec, ordersCount: sweepState?.ordersCount ?? 0, totalUsd: sweepState?.totalUsd ?? 0, maxOrders: this.crypto15mAutoConfig.sweepMaxOrdersPerMarket, maxTotalUsd: this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket } : null,
+            sweepLog: sweepResult,
+            replay,
+            results: sweepActive && sweepResult
+                ? [
+                    { ...order, tokenId, outcome, conditionId },
+                    ...sweepResult.orders.map((o) => ({
+                        success: o.success,
+                        orderId: o.orderId,
+                        orderStatus: o.orderStatus,
+                        filledSize: o.filledSize,
+                        orderPrice: o.orderPrice,
+                        errorMsg: o.errorMsg,
+                        roundtripMs: o.roundtripMs,
+                        statusLatencyMs: o.statusLatencyMs,
+                        attemptedUsd: o.attemptedUsd,
+                        submittedAt: o.submittedAt,
+                        tokenId,
+                        outcome,
+                        conditionId,
+                    })),
+                ]
+                : (Array.isArray((order as any)?.attempts) && (order as any).attempts.length
+                    ? (order as any).attempts.map((o: any) => ({ ...o, tokenId, outcome, conditionId }))
+                    : [{ ...order, tokenId, outcome, conditionId }]),
         };
+        try {
+            await new Promise((r) => setTimeout(r, 300));
+            const afterFetchedAtMs = Date.now();
+            const afterBooks = await this.fetchClobBooks([tokenId]).catch(() => []);
+            const afterBook = Array.isArray(afterBooks) && afterBooks.length ? afterBooks[0] : null;
+            const afterAsks = Array.isArray((afterBook as any)?.asks) ? (afterBook as any).asks : [];
+            const afterBids = Array.isArray((afterBook as any)?.bids) ? (afterBook as any).bids : [];
+            replay.after = buildOrderbookSnapshot({ book: { asks: afterAsks, bids: afterBids }, fetchedAtMs: afterFetchedAtMs, topN: 25 });
+        } catch {
+        }
         this.orderHistory.unshift(entry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
         this.schedulePersistOrderHistory();
 
         const active = {
@@ -7015,20 +9918,35 @@ export class GroupArbitrageScanner {
             price: price,
             bestAsk: price,
             limitPrice,
-            buySizingMode,
+            buySizingMode: buySizingModeFinal,
             requestedAmountUsd: amountUsd,
-            amountUsd: amountUsdFinal,
+            amountUsd: amountUsdLogged,
             sizingDepthUsd,
             sizingDepthCap,
             sizingAskLevelsUsed,
+            sweep: sweepActive ? { windowSec: this.crypto15mAutoConfig.sweepWindowSec, ordersCount: sweepState?.ordersCount ?? 0, totalUsd: sweepState?.totalUsd ?? 0, maxOrders: this.crypto15mAutoConfig.sweepMaxOrdersPerMarket, maxTotalUsd: this.crypto15mAutoConfig.sweepMaxTotalUsdPerMarket } : null,
             source,
             orderId: order?.orderId ?? order?.id ?? null,
             order,
             endDate,
             expiresAtMs,
-            secondsToExpire: params.secondsToExpire,
+            secondsToExpire,
             chosenPrice: params.chosenPrice,
         };
+        if (sweepActive && sweepState && sweepResult) {
+            const okOrders = (Array.isArray(sweepResult.orders) ? sweepResult.orders : []).filter((o) => o && o.success === true);
+            const addCount = okOrders.length;
+            const addUsd = okOrders.reduce((sum, o) => sum + (Number(o.attemptedUsd) || 0), 0);
+            if (addCount > 0 && addUsd > 0) {
+                const next = {
+                    ...sweepState,
+                    ordersCount: (Number(sweepState.ordersCount) || 0) + addCount,
+                    totalUsd: (Number(sweepState.totalUsd) || 0) + addUsd,
+                    lastOrderAtMs: Date.now(),
+                };
+                this.crypto15mSweepStateByConditionId.set(conditionId, next);
+            }
+        }
         this.crypto15mTrackedByCondition.set(conditionId, active);
         if (active.phase === 'ordered' && symbol && symbol !== 'UNKNOWN') {
             this.crypto15mActivesBySymbol.set(symbol, active);
@@ -7125,7 +10043,7 @@ export class GroupArbitrageScanner {
             results,
         };
         this.orderHistory.unshift(entry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
         this.schedulePersistOrderHistory();
 
         const okCount = results.filter(r => r.success).length;
@@ -7329,7 +10247,7 @@ export class GroupArbitrageScanner {
                 claimableCountAfter,
                 results,
             });
-            if (this.orderHistory.length > 50) this.orderHistory.pop();
+            if (this.orderHistory.length > 100) this.orderHistory.pop();
             this.schedulePersistOrderHistory();
         }
 
@@ -7502,10 +10420,33 @@ export class GroupArbitrageScanner {
                 const soldPct = (Number(p.soldSize) / Math.max(1e-9, Number(p.totalSize))) * 100;
                 return { ...p, secondsToExpire, soldPct };
             });
+        const adaptiveDelta: any = {};
+        for (const tf of ['5m', '15m', '1h', '4h', '1d'] as const) {
+            adaptiveDelta[tf] = {};
+            for (const sym of ['BTC', 'ETH', 'SOL', 'XRP']) {
+                const base = this.getCryptoAllMinDeltaRequired(sym, tf);
+                const st = this.cryptoAllAdaptiveDeltaBySymbol.get(`${sym}:${tf}`) || null;
+                const overrideDelta = st?.overrideDelta != null && Number.isFinite(Number(st.overrideDelta)) ? Number(st.overrideDelta) : null;
+                const noBuyCount = st?.noBuyCount != null ? Math.max(0, Math.floor(Number(st.noBuyCount))) : 0;
+                const limit = Math.max(1, Math.floor(Number(this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount) || 4));
+                adaptiveDelta[tf][sym] = {
+                    enabled: this.cryptoAllAutoConfig.adaptiveDeltaEnabled === true,
+                    baseMinDelta: base,
+                    overrideMinDelta: overrideDelta,
+                    effectiveMinDelta: overrideDelta != null ? overrideDelta : base,
+                    noBuyCount,
+                    revertAfter: limit,
+                    remainingToRevert: overrideDelta != null ? Math.max(0, limit - noBuyCount) : null,
+                    lastBigMoveAt: st?.lastBigMoveAt ?? null,
+                    lastBigMoveDelta: st?.lastBigMoveDelta ?? null,
+                };
+            }
+        }
         return {
             hasValidKey: this.hasValidKey === true,
             trading: this.getTradingInitStatus(),
             enabled: this.cryptoAllAutoEnabled,
+            dryRun: this.cryptoAllAutoDryRun === true,
             config: this.cryptoAllAutoConfig,
             lastScanAt: this.cryptoAllLastScanAt,
             lastScanSummary: this.cryptoAllLastScanSummary,
@@ -7521,6 +10462,7 @@ export class GroupArbitrageScanner {
             trackedCount: this.cryptoAllTrackedByCondition.size,
             addOn: { enabled: this.cryptoAllAutoConfig.addOn.enabled, positions: addOnPositions },
             stoploss: { enabled: this.cryptoAllAutoConfig.stoploss.enabled, positions: stoplossPositions },
+            adaptiveDelta,
         };
     }
 
@@ -7768,7 +10710,7 @@ export class GroupArbitrageScanner {
         w.reportPaths = { json: jsonPath, md: mdPath };
     }
 
-    private async refreshCryptoAllMarketSnapshot(params: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; limit: number }) {
+    private async refreshCryptoAllMarketSnapshot(params: { symbols: string[]; timeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'>; limit: number }) {
         const key = JSON.stringify({ symbols: params.symbols.slice().sort(), timeframes: params.timeframes.slice().sort(), limit: params.limit });
         if (this.cryptoAllMarketInFlight) return this.cryptoAllMarketInFlight;
         if ((this.cryptoAllMarketSnapshot as any).key === key && this.cryptoAllMarketSnapshot.atMs && Date.now() - this.cryptoAllMarketSnapshot.atMs < 5_000) return;
@@ -7780,9 +10722,18 @@ export class GroupArbitrageScanner {
                 const timeframes = params.timeframes;
                 const limit = params.limit;
                 const now = Date.now();
-                const maxSlugsPerTf = Math.max(30, Math.min(120, limit * 3));
+                const effectiveSymbols = symbols.length ? symbols.slice() : ['BTC', 'ETH', 'SOL', 'XRP'];
+                const effectiveTimeframes = timeframes.length ? timeframes.slice() : ['15m', '1h', '4h', '1d'];
+                const maxMarketsCap = Math.max(1, effectiveSymbols.length * effectiveTimeframes.length);
+                const maxSlugsPerTf = Math.max(24, Math.min(120, Math.max(8, maxMarketsCap) * 2));
+                const currentGraceMs = 90_000;
+                const isCurrentMarket = (tf: '5m' | '15m' | '1h' | '4h' | '1d', endMs: number, nowMs: number) => {
+                    const tfSec = this.getCryptoAllTimeframeSec(tf);
+                    const windowMs = tfSec * 1000 + currentGraceMs;
+                    return Number.isFinite(endMs) && endMs > nowMs && (endMs - nowMs) <= windowMs;
+                };
                 const marketRefs: Array<{
-                    timeframe: '15m' | '1h' | '4h' | '1d';
+                    timeframe: '5m' | '15m' | '1h' | '4h' | '1d';
                     timeframeSec: number;
                     slug: string;
                     conditionId: string;
@@ -7792,13 +10743,45 @@ export class GroupArbitrageScanner {
                     upTokenId: string;
                     downTokenId: string;
                 }> = [];
+                const diag: any = { atMs: Date.now(), key, perTf: {} as any };
+                const parseStartSecFromSlug = (slug: string): number | null => {
+                    const m = String(slug || '').trim().toLowerCase().match(/-(\d{9,12})$/);
+                    if (!m) return null;
+                    const sec = Number(m[1]);
+                    return Number.isFinite(sec) && sec > 0 ? Math.floor(sec) : null;
+                };
+                const parseEndMsFromMarket = (m: any): number => {
+                    const endIso =
+                        m?.endDate ?? m?.end_date ?? m?.endDateIso ?? m?.end_date_iso
+                        ?? m?.umaEndDate ?? m?.uma_end_date ?? m?.umaEndDateIso ?? m?.uma_end_date_iso
+                        ?? null;
+                    return endIso ? Date.parse(String(endIso)) : NaN;
+                };
 
-                for (const tf of timeframes) {
+                const pickOnePerSymbolFromSlugs = (tf: '5m' | '15m' | '1h' | '4h' | '1d', slugsRaw: any[], wantedSymbols: string[]): string[] => {
+                    const out: string[] = [];
+                    const seenSym = new Set<string>();
+                    const targets = Array.from(new Set((wantedSymbols || []).map((x) => String(x || '').toUpperCase()).filter(Boolean)));
+                    for (const raw of slugsRaw || []) {
+                        const slug = String(raw || '').trim().toLowerCase();
+                        if (!slug) continue;
+                        const sym = this.inferCryptoSymbolFromText(slug, '');
+                        if (!sym) continue;
+                        if (!targets.includes(sym)) continue;
+                        if (seenSym.has(sym)) continue;
+                        seenSym.add(sym);
+                        out.push(slug);
+                        if (seenSym.size >= targets.length) break;
+                    }
+                    return out;
+                };
+
+                for (const tf of effectiveTimeframes as Array<'5m' | '15m' | '1h' | '4h' | '1d'>) {
                     const timeframeSec = this.getCryptoAllTimeframeSec(tf);
                     const paths = this.getCryptoAllListPaths(tf);
                     const nowSec = Math.floor(now / 1000);
-                    const predicted = this.predictCryptoAllSlugs(tf, nowSec, symbols).slice(0, Math.max(20, Math.min(80, maxSlugsPerTf)));
-                    const tfLimit = Math.max(12, limit * 3);
+                    const tfLimit = Math.max(12, Math.min(60, maxSlugsPerTf));
+                    const tfDiag: any = { predictedCount: 0, sitePaths: paths, siteSlugsCount: 0, wantedSlugs: [] as string[], addedSite: 0, addedPredicted: 0, currentWindowSec: timeframeSec + Math.floor(currentGraceMs / 1000), foundSymbols: [] as string[], missingSymbols: [] as string[] };
                     const parseAndAppend = async (slugs: string[]) => {
                         const settled = await Promise.allSettled(Array.from(new Set(slugs)).slice(0, tfLimit).map(async (slug) => {
                             const gamma = await this.fetchGammaJson(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`);
@@ -7814,14 +10797,18 @@ export class GroupArbitrageScanner {
                                 const conditionId = String(m?.conditionId ?? m?.condition_id ?? '').trim();
                                 if (!conditionId || !conditionId.startsWith('0x')) continue;
                                 const q = String(m?.question ?? m?.title ?? '').trim();
+                                const inferredTf = this.inferCryptoTimeframeFromSlug(slug, q);
+                                if (!/up\s*or\s*down/i.test(q)) continue;
+                                if (inferredTf && inferredTf !== tf) continue;
+                                if (!inferredTf && (tf === '5m' || tf === '15m') && !this.matchesCryptoAllTimeframe(tf, slug, q)) continue;
                                 const sym = this.inferCryptoSymbolFromText(slug, q);
                                 if (!sym) continue;
                                 if (symbols.length && !symbols.includes(sym)) continue;
 
-                                const endIso = m?.endDate ?? m?.end_date ?? m?.endDateIso ?? m?.end_date_iso ?? null;
-                                const endMs = endIso ? Date.parse(String(endIso)) : NaN;
+                                const endMs = parseEndMsFromMarket(m);
                                 if (!Number.isFinite(endMs)) continue;
                                 if (endMs <= now) continue;
+                                if (!isCurrentMarket(tf, endMs, now)) continue;
 
                                 const outcomes = this.tryParseJsonArray(m?.outcomes);
                                 const tokenIds = this.tryParseJsonArray(m?.clobTokenIds ?? m?.clob_token_ids ?? null);
@@ -7839,19 +10826,252 @@ export class GroupArbitrageScanner {
                             }
                         }
                     };
-
-                    const before = marketRefs.length;
-                    await parseAndAppend(predicted);
-                    if (marketRefs.length === before && paths.length) {
-                        const settledPaths = await Promise.allSettled(paths.slice(0, 2).map((p) => this.fetchCryptoSlugsFromSitePath(p, maxSlugsPerTf)));
-                        const slugs = settledPaths.flatMap((r: any) => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : []);
-                        await parseAndAppend(slugs);
+                    const settledPaths = await Promise.allSettled(paths.slice(0, 2).map((p) => this.fetchCryptoSlugsFromSitePath(p, maxSlugsPerTf)));
+                    const slugsFromSite = settledPaths.flatMap((r: any) => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : []);
+                    tfDiag.siteSlugsCount = Array.isArray(slugsFromSite) ? slugsFromSite.length : 0;
+                    const symbolsForTf = effectiveSymbols;
+                    const predicted = this.predictCryptoAllSlugs(tf, nowSec, symbolsForTf);
+                    tfDiag.predictedCount = predicted.length;
+                    const wantedSite = await (async () => {
+                        const siteCandidateCap = tf === '1d' ? 80 : tf === '4h' ? 60 : tf === '1h' ? 50 : 40;
+                        const out: string[] = [];
+                        for (const sym of symbolsForTf) {
+                            const symUpper = String(sym || '').toUpperCase();
+                            const candidates = (slugsFromSite || [])
+                                .map((x: any) => String(x || '').trim().toLowerCase())
+                                .filter((s: string) => !!s)
+                                .filter((s: string) => this.inferCryptoSymbolFromText(s, '') === symUpper)
+                                .slice(0, siteCandidateCap);
+                            let best: { slug: string; endMs: number } | null = null;
+                            for (const slug of candidates) {
+                                const gamma = await this.fetchGammaJson(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(slug)}&limit=1`).catch(() => null);
+                                const list = Array.isArray(gamma) ? gamma : [];
+                                const m = list[0] || null;
+                                if (!m) continue;
+                                const q = String((m as any)?.question ?? (m as any)?.title ?? '').trim();
+                                const inferredTf = this.inferCryptoTimeframeFromSlug(slug, q);
+                                if (!/up\s*or\s*down/i.test(q)) continue;
+                                if (inferredTf && inferredTf !== tf) continue;
+                                if (!inferredTf && (tf === '5m' || tf === '15m') && !this.matchesCryptoAllTimeframe(tf, slug, q)) continue;
+                                const endMs = parseEndMsFromMarket(m);
+                                if (!Number.isFinite(endMs) || endMs <= now) continue;
+                                if (!isCurrentMarket(tf, endMs, now)) continue;
+                                if (!best || endMs < best.endMs) best = { slug, endMs };
+                            }
+                            if (best?.slug) out.push(best.slug);
+                        }
+                        return out;
+                    })();
+                    const wantSet = new Set<string>(wantedSite);
+                    const wantedPred: string[] = [];
+                    if (wantSet.size < symbolsForTf.length) {
+                        const seen = new Set<string>();
+                        for (const s of wantedSite) {
+                            const sym = this.inferCryptoSymbolFromText(s, '');
+                            if (sym) seen.add(sym);
+                        }
+                        const bySym = new Map<string, string[]>();
+                        for (const raw of predicted) {
+                            const slug = String(raw || '').trim().toLowerCase();
+                            const sym = this.inferCryptoSymbolFromText(slug, '');
+                            if (!sym) continue;
+                            if (!bySym.has(sym)) bySym.set(sym, []);
+                            bySym.get(sym)!.push(slug);
+                        }
+                        for (const sym of symbolsForTf) {
+                            const ss = String(sym || '').toUpperCase();
+                            if (seen.has(ss)) continue;
+                            const arr = bySym.get(ss) || [];
+                            const windowMs2 = timeframeSec * 1000 + currentGraceMs;
+                            const candidates = arr
+                                .map((slug) => {
+                                    const startSec = parseStartSecFromSlug(slug);
+                                    const endMs = startSec != null ? (startSec + timeframeSec) * 1000 : NaN;
+                                    return { slug, startSec, endMs };
+                                })
+                                .filter((x) => x.startSec != null && Number.isFinite(x.endMs) && x.endMs > now && (x.endMs - now) <= windowMs2)
+                                .sort((a, b) => Number(a.endMs) - Number(b.endMs))
+                                .slice(0, 10);
+                            let picked: string | null = null;
+                            for (const c of candidates) {
+                                const gamma = await this.fetchGammaJson(`https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(c.slug)}&limit=1`).catch(() => null);
+                                const list = Array.isArray(gamma) ? gamma : [];
+                                const m = list[0] || null;
+                                if (!m) continue;
+                                const q = String((m as any)?.question ?? (m as any)?.title ?? '').trim();
+                                const inferredTf = this.inferCryptoTimeframeFromSlug(c.slug, q);
+                                if (!/up\s*or\s*down/i.test(q)) continue;
+                                if (inferredTf && inferredTf !== tf) continue;
+                                if (!inferredTf && (tf === '5m' || tf === '15m') && !this.matchesCryptoAllTimeframe(tf, c.slug, q)) continue;
+                                const s2 = this.inferCryptoSymbolFromText(c.slug, q);
+                                if (!s2 || s2 !== ss) continue;
+                                const endMs = parseEndMsFromMarket(m);
+                                if (!Number.isFinite(endMs) || endMs <= now) continue;
+                                if (!isCurrentMarket(tf, endMs, now)) continue;
+                                picked = c.slug;
+                                break;
+                            }
+                            if (picked) {
+                                wantedPred.push(picked);
+                                seen.add(ss);
+                            }
+                        }
                     }
+                    const wanted = Array.from(new Set([...wantedSite, ...wantedPred])).slice(0, symbolsForTf.length * 2);
+                    tfDiag.wantedSlugs = wanted.slice();
+                    const before = marketRefs.length;
+                    await parseAndAppend(wanted);
+                    const haveSyms = new Set<string>();
+                    for (const mr of marketRefs) {
+                        if (!mr || String(mr.timeframe) !== tf) continue;
+                        haveSyms.add(String(mr.symbol || '').toUpperCase());
+                    }
+                    const missingSyms = new Set<string>(symbolsForTf.filter((s) => !haveSyms.has(String(s).toUpperCase())));
+                    if (missingSyms.size) {
+                        const pageSize = 200;
+                        const maxPages = 8;
+                        for (let page = 0; page < maxPages && missingSyms.size; page++) {
+                            const offset = page * pageSize;
+                            const url = `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=${pageSize}&offset=${offset}`;
+                            const markets = await this.fetchGammaJson(url).catch(() => null);
+                            const list = Array.isArray(markets) ? markets : [];
+                            if (!list.length) break;
+                            for (const m of list) {
+                                const slug = String((m as any)?.slug || '').trim();
+                                const q = String((m as any)?.question ?? (m as any)?.title ?? '').trim();
+                                if (!slug && !q) continue;
+                                if (!/up\s*or\s*down/i.test(q)) continue;
+                                const inferredTf = this.inferCryptoTimeframeFromSlug(slug, q);
+                                if (inferredTf && inferredTf !== tf) continue;
+                                if (!inferredTf && (tf === '5m' || tf === '15m') && !this.matchesCryptoAllTimeframe(tf, slug, q)) continue;
+                                const sym = this.inferCryptoSymbolFromText(slug, q);
+                                if (!sym || !missingSyms.has(sym)) continue;
+                                const conditionId = String((m as any)?.conditionId ?? (m as any)?.condition_id ?? '').trim();
+                                if (!conditionId || !conditionId.startsWith('0x')) continue;
+                                const endMs = parseEndMsFromMarket(m);
+                                if (!Number.isFinite(endMs) || endMs <= now) continue;
+                                if (!isCurrentMarket(tf, endMs, now)) continue;
+                                const outcomes = this.tryParseJsonArray((m as any)?.outcomes);
+                                const tokenIds = this.tryParseJsonArray((m as any)?.clobTokenIds ?? (m as any)?.clob_token_ids ?? null);
+                                if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length < 2 || tokenIds.length < 2) continue;
+                                const upIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('up'));
+                                const downIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('down'));
+                                if (upIdx < 0 || downIdx < 0) continue;
+                                const upTokenId = String(tokenIds[upIdx] || '').trim();
+                                const downTokenId = String(tokenIds[downIdx] || '').trim();
+                                if (!upTokenId || !downTokenId) continue;
+                                marketRefs.push({ timeframe: tf, timeframeSec, slug, conditionId, symbol: sym, question: q, endMs, upTokenId, downTokenId });
+                                missingSyms.delete(sym);
+                                if (!missingSyms.size) break;
+                            }
+                            if (list.length < pageSize) break;
+                        }
+                    }
+                    if (missingSyms.size) {
+                        const tagId = await this.resolveCryptoTagId();
+                        if (tagId) {
+                            const pageSize = 50;
+                            const maxPages = 6;
+                            for (let page = 0; page < maxPages && missingSyms.size; page++) {
+                                const events = await this.fetchGammaCryptoEvents(tagId, pageSize, page * pageSize).catch(() => []);
+                                if (!Array.isArray(events) || !events.length) break;
+                                for (const ev of events) {
+                                    const evSlug = String((ev as any)?.slug || '').trim();
+                                    const evTitle = String((ev as any)?.title || (ev as any)?.question || '').trim();
+                                    const evEndIso = (ev as any)?.endDate ?? (ev as any)?.endDateIso ?? (ev as any)?.end_date ?? (ev as any)?.end_date_iso ?? null;
+                                    const markets = Array.isArray((ev as any)?.markets) ? (ev as any).markets : [];
+                                    for (const m of markets) {
+                                        const slug = String((m as any)?.slug || (m as any)?.marketSlug || evSlug || '').trim();
+                                        const q = String((m as any)?.question ?? (m as any)?.title ?? evTitle ?? '').trim();
+                                        if (!slug && !q) continue;
+                                        if (!/up\s*or\s*down/i.test(q)) continue;
+                                        const inferredTf = this.inferCryptoTimeframeFromSlug(slug, q);
+                                        if (inferredTf && inferredTf !== tf) continue;
+                                        if (!inferredTf && (tf === '5m' || tf === '15m') && !this.matchesCryptoAllTimeframe(tf, slug, q)) continue;
+                                        const sym = this.inferCryptoSymbolFromText(slug, q);
+                                        if (!sym || !missingSyms.has(sym)) continue;
+                                        const conditionId = String((m as any)?.conditionId ?? (m as any)?.condition_id ?? '').trim();
+                                        if (!conditionId || !conditionId.startsWith('0x')) continue;
+                                        const endMs = Number.isFinite(parseEndMsFromMarket(m)) ? parseEndMsFromMarket(m) : (evEndIso ? Date.parse(String(evEndIso)) : NaN);
+                                        if (!Number.isFinite(endMs) || endMs <= now) continue;
+                                        if (!isCurrentMarket(tf, endMs, now)) continue;
+                                        const outcomes = this.tryParseJsonArray((m as any)?.outcomes);
+                                        const tokenIds = this.tryParseJsonArray((m as any)?.clobTokenIds ?? (m as any)?.clob_token_ids ?? null);
+                                        if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length < 2 || tokenIds.length < 2) continue;
+                                        const upIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('up'));
+                                        const downIdx = outcomes.findIndex((o: any) => String(o || '').toLowerCase().includes('down'));
+                                        if (upIdx < 0 || downIdx < 0) continue;
+                                        const upTokenId = String(tokenIds[upIdx] || '').trim();
+                                        const downTokenId = String(tokenIds[downIdx] || '').trim();
+                                        if (!upTokenId || !downTokenId) continue;
+                                        marketRefs.push({ timeframe: tf, timeframeSec, slug, conditionId, symbol: sym, question: q, endMs, upTokenId, downTokenId });
+                                        missingSyms.delete(sym);
+                                        if (!missingSyms.size) break;
+                                    }
+                                    if (!missingSyms.size) break;
+                                }
+                            }
+                        }
+                    }
+                    tfDiag.addedSite = wantedSite.length;
+                    tfDiag.addedPredicted = wantedPred.length;
+                    tfDiag.foundSymbols = Array.from(haveSyms.values()).sort();
+                    tfDiag.missingSymbols = Array.from(missingSyms.values()).sort();
+                    (diag.perTf as any)[tf] = tfDiag;
                 }
 
-                const uniqMarketRefs = Array.from(new Map(marketRefs.map((m) => [`${m.timeframe}:${m.conditionId}`, m])).values());
+                const nowMs = Date.now();
+                const uniqMarketRefsAll = Array.from(new Map(marketRefs.map((m) => [`${m.timeframe}:${m.conditionId}`, m])).values())
+                    .filter((m: any) => m && isCurrentMarket(String(m.timeframe) as any, Number(m.endMs), nowMs));
+                const perTfSym = new Map<string, any>();
+                for (const m of uniqMarketRefsAll) {
+                    if (!m) continue;
+                    const k = `${String(m.timeframe)}:${String(m.symbol)}`;
+                    const prev = perTfSym.get(k);
+                    if (!prev || Number(m.endMs) < Number(prev.endMs)) perTfSym.set(k, m);
+                }
+                const uniqMarketRefs = Array.from(perTfSym.values());
+                const prevMarketsAll = Array.isArray(this.cryptoAllMarketSnapshot.markets) ? this.cryptoAllMarketSnapshot.markets : [];
+                if (!uniqMarketRefs.length && prevMarketsAll.length) {
+                    (this.cryptoAllMarketSnapshot as any).key = key;
+                    this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, lastAttemptError: 'empty_market_snapshot' };
+                    (this.cryptoAllMarketSnapshot as any).diag = { ...diag, warning: 'empty_market_snapshot' };
+                    return;
+                }
+                const mergedMap = new Map<string, any>();
+                for (const pm of prevMarketsAll) {
+                    if (!pm) continue;
+                    const endMs = Number((pm as any).endMs || 0);
+                    const tf = String((pm as any).timeframe || '') as any;
+                    if (!isCurrentMarket(tf, endMs, nowMs)) continue;
+                    const k = `${String((pm as any).timeframe || '')}:${String((pm as any).conditionId || '')}`;
+                    if (!k.endsWith(':')) mergedMap.set(k, { ...(pm as any), _lastSeenAtMs: Number((pm as any)._lastSeenAtMs || this.cryptoAllMarketSnapshot.atMs || nowMs) });
+                }
+                for (const m of uniqMarketRefs) {
+                    if (!m) continue;
+                    const endMs = Number((m as any).endMs || 0);
+                    if (!isCurrentMarket(String((m as any).timeframe || '') as any, endMs, nowMs)) continue;
+                    const k = `${String((m as any).timeframe || '')}:${String((m as any).conditionId || '')}`;
+                    const prev = mergedMap.get(k) || {};
+                    mergedMap.set(k, { ...prev, ...(m as any), _lastSeenAtMs: nowMs });
+                }
+                const mergedAll = Array.from(mergedMap.values()).filter((m: any) => isCurrentMarket(String(m?.timeframe || '') as any, Number(m?.endMs || 0), nowMs));
+                const perTfSymMerged = new Map<string, any>();
+                for (const m of mergedAll) {
+                    if (!m) continue;
+                    const tf = String((m as any).timeframe || '').toLowerCase();
+                    const sym = String((m as any).symbol || '').toUpperCase();
+                    if (!tf || !sym) continue;
+                    const k = `${tf}:${sym}`;
+                    const prev = perTfSymMerged.get(k);
+                    if (!prev || Number((m as any).endMs || 0) < Number((prev as any).endMs || 0)) perTfSymMerged.set(k, m);
+                }
+                const merged = Array.from(perTfSymMerged.values())
+                    .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))
+                    .slice(0, Math.max(1, Math.min(800, maxMarketsCap)));
                 (this.cryptoAllMarketSnapshot as any).key = key;
-                this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, atMs: Date.now(), markets: uniqMarketRefs, lastError: null, lastAttemptError: null };
+                this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, atMs: nowMs, markets: merged, lastError: null, lastAttemptError: null };
+                (this.cryptoAllMarketSnapshot as any).diag = diag;
                 this.cryptoAllMarketBackoffMs = 0;
                 this.cryptoAllMarketNextAllowedAtMs = 0;
             } catch (e: any) {
@@ -7860,6 +11080,7 @@ export class GroupArbitrageScanner {
                 this.cryptoAllMarketBackoffMs = next;
                 this.cryptoAllMarketNextAllowedAtMs = Date.now() + next;
                 this.cryptoAllMarketSnapshot = { ...this.cryptoAllMarketSnapshot, lastError: msg, lastAttemptError: msg };
+                (this.cryptoAllMarketSnapshot as any).diag = { atMs: Date.now(), key, error: msg };
             } finally {
                 this.cryptoAllMarketInFlight = null;
             }
@@ -7867,7 +11088,7 @@ export class GroupArbitrageScanner {
         return this.cryptoAllMarketInFlight;
     }
 
-    private async refreshCryptoAllBooksSnapshot(params: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; limit: number }) {
+    private async refreshCryptoAllBooksSnapshot(params: { symbols: string[]; timeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'>; limit: number }) {
         const key = JSON.stringify({ symbols: params.symbols.slice().sort(), timeframes: params.timeframes.slice().sort(), limit: params.limit });
         if (this.cryptoAllBooksInFlight) return this.cryptoAllBooksInFlight;
         if ((this.cryptoAllBooksSnapshot as any).key === key && this.cryptoAllBooksSnapshot.atMs && Date.now() - this.cryptoAllBooksSnapshot.atMs < 500) return;
@@ -7879,7 +11100,7 @@ export class GroupArbitrageScanner {
                 const markets = marketsAll
                     .filter((m: any) => m && (!params.timeframes.length || params.timeframes.includes(String(m?.timeframe || '').toLowerCase() as any)) && (!params.symbols.length || params.symbols.includes(String(m?.symbol || '').toUpperCase())))
                     .sort((a: any, b: any) => (Number(a?.endMs) || 0) - (Number(b?.endMs) || 0))
-                    .slice(0, Math.max(60, Math.min(400, Math.floor(Number(params.limit) || 0) * 8)));
+                    .slice(0, Math.max(1, Math.min(60, Math.floor(Number(params.limit) || 0))));
                 const tokenIds: string[] = [];
                 const seen = new Set<string>();
                 for (const m of markets) {
@@ -7887,7 +11108,7 @@ export class GroupArbitrageScanner {
                     const down = String(m?.downTokenId || '').trim();
                     if (up && !seen.has(up)) { tokenIds.push(up); seen.add(up); }
                     if (down && !seen.has(down)) { tokenIds.push(down); seen.add(down); }
-                    if (tokenIds.length >= 480) break;
+                    if (tokenIds.length >= Math.max(2, Math.floor(Number(params.limit) || 0) * 2)) break;
                 }
                 if (!tokenIds.length) {
                     (this.cryptoAllBooksSnapshot as any).key = key;
@@ -7895,9 +11116,26 @@ export class GroupArbitrageScanner {
                     this.cryptoAllBooksSnapshot = { ...this.cryptoAllBooksSnapshot, atMs: Date.now(), byTokenId: {}, lastError: msg, lastAttemptError: msg };
                     return;
                 }
-                const books = await this.fetchClobBooks(tokenIds);
+                let books: any[] = [];
+                try {
+                    books = await this.fetchClobBooks(tokenIds);
+                } catch {
+                    const concurrency = 8;
+                    const out: any[] = [];
+                    for (let i = 0; i < tokenIds.length; i += concurrency) {
+                        const chunk = tokenIds.slice(i, i + concurrency);
+                        const settled = await Promise.allSettled(chunk.map(async (tid) => {
+                            const ob = await this.sdk.clobApi.getOrderbook(tid);
+                            return { asset_id: tid, asks: Array.isArray((ob as any)?.asks) ? (ob as any).asks : [], bids: Array.isArray((ob as any)?.bids) ? (ob as any).bids : [], timestamp: (ob as any)?.timestamp ?? null };
+                        }));
+                        for (const r of settled) {
+                            if (r.status === 'fulfilled') out.push((r as any).value);
+                        }
+                    }
+                    books = out;
+                }
                 if (!Array.isArray(books) || books.length === 0) {
-                    throw new Error(`CLOB /books returned empty (tokenIds=${tokenIds.length})`);
+                    throw new Error(`No orderbooks (tokenIds=${tokenIds.length})`);
                 }
                 const byTokenId: Record<string, any> = {};
                 for (const b of books) {
@@ -8060,8 +11298,8 @@ export class GroupArbitrageScanner {
         return { riskScore: score, dojiLikely, wickRatio, bodyRatio, retraceRatio, marginPct, momentum3m, spread, reasons, error: candle.error || beat.error || null };
     }
 
-    private async buildCryptoAllCandidatesFromSnapshots(options: { symbols: string[]; timeframes: Array<'15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; limit: number }) {
-        const { symbols, timeframes, minProb, expiresWithinSec, limit } = options;
+    private async buildCryptoAllCandidatesFromSnapshots(options: { symbols: string[]; timeframes: Array<'5m' | '15m' | '1h' | '4h' | '1d'>; minProb: number; expiresWithinSec: number; expiresWithinSecByTimeframe?: Record<'5m' | '15m' | '1h' | '4h' | '1d', number> | null; limit: number }) {
+        const { symbols, timeframes, minProb, expiresWithinSec, expiresWithinSecByTimeframe, limit } = options;
         const precomputeExpiryBufferSec = 10;
         const now = Date.now();
         const marketsAll = Array.isArray(this.cryptoAllMarketSnapshot.markets) ? this.cryptoAllMarketSnapshot.markets : [];
@@ -8088,13 +11326,12 @@ export class GroupArbitrageScanner {
                 : downPrice != null ? { outcome: 'Down', tokenId: m.downTokenId, price: downPrice }
                 : null;
             const meetsMinProb = chosen ? chosen.price >= minProb : false;
-            const eligibleByExpiry = secondsToExpire <= expiresWithinSec;
-            const withinComputeWindow = secondsToExpire <= (expiresWithinSec + precomputeExpiryBufferSec);
-            const minDeltaRequired =
-                m.symbol === 'BTC' ? this.cryptoAllDeltaThresholds.btcMinDelta
-                : m.symbol === 'ETH' ? this.cryptoAllDeltaThresholds.ethMinDelta
-                : m.symbol === 'SOL' ? this.cryptoAllDeltaThresholds.solMinDelta
-                : this.cryptoAllDeltaThresholds.xrpMinDelta;
+            const tf = String(m.timeframe || '15m').toLowerCase() as any;
+            const expiresForTf = expiresWithinSecByTimeframe && (expiresWithinSecByTimeframe as any)[tf] != null ? Number((expiresWithinSecByTimeframe as any)[tf]) : expiresWithinSec;
+            const expiresWithinSecEffective = Math.max(10, Math.floor(Number.isFinite(expiresForTf) ? expiresForTf : expiresWithinSec));
+            const eligibleByExpiry = secondsToExpire <= expiresWithinSecEffective;
+            const withinComputeWindow = secondsToExpire <= (expiresWithinSecEffective + precomputeExpiryBufferSec);
+            const minDeltaRequired = this.getCryptoAllMinDeltaRequired(String(m.symbol || ''), String(m.timeframe || '15m').toLowerCase() as any);
             const beat = withinComputeWindow ? await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: m.symbol, endMs: m.endMs, timeframeSec: m.timeframeSec }) : { priceToBeat: null, currentPrice: null, deltaAbs: null, error: null };
             const meetsMinDelta = withinComputeWindow ? (beat.deltaAbs != null && minDeltaRequired > 0 ? beat.deltaAbs >= minDeltaRequired : minDeltaRequired <= 0) : false;
             let risk: any = null;
@@ -8166,7 +11403,7 @@ export class GroupArbitrageScanner {
         return candidates.slice(0, limit);
     }
 
-    async getCryptoAllCandidates(options?: { symbols?: string[] | string; timeframes?: Array<'15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; limit?: number }) {
+    async getCryptoAllCandidates(options?: { symbols?: string[] | string; timeframes?: Array<'5m' | '15m' | '1h' | '4h' | '1d'> | string; minProb?: number; expiresWithinSec?: number; expiresWithinSecByTimeframe?: any; limit?: number }) {
         const symbolsInput = options?.symbols;
         const symbolsArr =
             Array.isArray(symbolsInput) ? symbolsInput
@@ -8179,28 +11416,49 @@ export class GroupArbitrageScanner {
             Array.isArray(tfsInput) ? tfsInput
             : typeof tfsInput === 'string' ? tfsInput.split(',').map((x) => x.trim()).filter(Boolean) as any
             : this.cryptoAllAutoConfig.timeframes;
-        const timeframes = Array.from(new Set(tfArr.map((x: any) => String(x || '').toLowerCase()).filter(Boolean))) as Array<'15m' | '1h' | '4h' | '1d'>;
+        const timeframes = Array.from(new Set(tfArr.map((x: any) => String(x || '').toLowerCase()).filter(Boolean))) as Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
 
         const minProbRaw = options?.minProb != null ? Number(options.minProb) : this.cryptoAllAutoConfig.minProb;
         const expiresWithinSecRaw = options?.expiresWithinSec != null ? Number(options.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec;
+        const expiresWithinSecByTimeframeRaw =
+            options?.expiresWithinSecByTimeframe && typeof options.expiresWithinSecByTimeframe === 'object'
+                ? options.expiresWithinSecByTimeframe
+                : (this.cryptoAllAutoConfig.expiresWithinSecByTimeframe || null);
         const limitRaw = options?.limit != null ? Number(options.limit) : 20;
 
         const minProb = Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : this.cryptoAllAutoConfig.minProb));
         const expiresWithinSec = Math.max(10, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : this.cryptoAllAutoConfig.expiresWithinSec));
+        const expiresWithinSecByTimeframe = (['5m', '15m', '1h', '4h', '1d'] as const).reduce((acc: any, tf) => {
+            const v = expiresWithinSecByTimeframeRaw && (expiresWithinSecByTimeframeRaw as any)[tf] != null ? Number((expiresWithinSecByTimeframeRaw as any)[tf]) : expiresWithinSec;
+            acc[tf] = Math.max(10, Math.floor(Number.isFinite(v) ? v : expiresWithinSec));
+            return acc;
+        }, {}) as Record<'5m' | '15m' | '1h' | '4h' | '1d', number>;
         const limit = Math.max(1, Math.min(100, Math.floor(Number.isFinite(limitRaw) ? limitRaw : 20)));
 
-        await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
-        await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
-        return await this.buildCryptoAllCandidatesFromSnapshots({ symbols, timeframes, minProb, expiresWithinSec, limit });
+        const now = Date.now();
+        const marketAt = this.cryptoAllMarketSnapshot.atMs ? Number(this.cryptoAllMarketSnapshot.atMs) : 0;
+        const booksAt = this.cryptoAllBooksSnapshot.atMs ? Number(this.cryptoAllBooksSnapshot.atMs) : 0;
+        const needMarket = marketAt <= 0;
+        const needBooks = booksAt <= 0;
+        const marketStale = !needMarket && (now - marketAt) > 5_000;
+        const booksStale = !needBooks && (now - booksAt) > 1_500;
+
+        if (needMarket) await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        else if (marketStale) this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
+
+        if (needBooks) await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        else if (booksStale) this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        return await this.buildCryptoAllCandidatesFromSnapshots({ symbols, timeframes, minProb, expiresWithinSec, expiresWithinSecByTimeframe, limit });
     }
 
     startCryptoAllAuto(config?: {
+        dryRun?: boolean;
         pollMs?: number;
         expiresWithinSec?: number;
         minProb?: number;
         amountUsd?: number;
         symbols?: string[];
-        timeframes?: Array<'15m' | '1h' | '4h' | '1d'>;
+        timeframes?: Array<'5m' | '15m' | '1h' | '4h' | '1d'>;
         dojiGuardEnabled?: boolean;
         riskSkipScore?: number;
         riskAddOnBlockScore?: number;
@@ -8236,11 +11494,12 @@ export class GroupArbitrageScanner {
         if (this.autoRedeemConfig.enabled !== true) {
             this.setAutoRedeemConfig({ enabled: true, persist: true });
         }
+        if (config?.dryRun != null) this.cryptoAllAutoDryRun = config.dryRun === true;
         this.updateCryptoAllConfig(config);
         this.ensureCryptoAllSplitBuyLoop();
 
         this.cryptoAllAutoEnabled = true;
-        this.recordAutoConfigEvent('cryptoall', 'start', { enabled: true, ...this.cryptoAllAutoConfig });
+        this.recordAutoConfigEvent('cryptoall', 'start', { enabled: true, dryRun: this.cryptoAllAutoDryRun === true, ...this.cryptoAllAutoConfig });
         this.startCryptoAllStoplossLoop();
         if (this.cryptoAllAutoTimer) {
             clearInterval(this.cryptoAllAutoTimer);
@@ -8267,6 +11526,41 @@ export class GroupArbitrageScanner {
             this.cryptoAllStoplossTimer = null;
         }
         return this.getCryptoAllStatus();
+    }
+
+    async runCryptoAllAutoOnce(options?: { dryRun?: boolean; minProb?: number; expiresWithinSec?: number; amountUsd?: number; symbols?: string[]; timeframes?: Array<'5m' | '15m' | '1h' | '4h' | '1d'> | string[] }) {
+        const prevEnabled = this.cryptoAllAutoEnabled;
+        const prevDryRun = this.cryptoAllAutoDryRun;
+        const prevConfig = JSON.parse(JSON.stringify(this.cryptoAllAutoConfig || {}));
+        try {
+            this.cryptoAllAutoEnabled = true;
+            if (options?.dryRun != null) this.cryptoAllAutoDryRun = options.dryRun === true;
+            if (options?.minProb != null || options?.expiresWithinSec != null || options?.amountUsd != null || options?.symbols != null || options?.timeframes != null) {
+                const minProbRaw = options?.minProb != null ? Number(options.minProb) : this.cryptoAllAutoConfig.minProb;
+                const expiresWithinSecRaw = options?.expiresWithinSec != null ? Number(options.expiresWithinSec) : this.cryptoAllAutoConfig.expiresWithinSec;
+                const amountUsdRaw = options?.amountUsd != null ? Number(options.amountUsd) : this.cryptoAllAutoConfig.amountUsd;
+                const symbolsRaw = Array.isArray(options?.symbols) ? options?.symbols : this.cryptoAllAutoConfig.symbols;
+                const timeframesRaw = Array.isArray(options?.timeframes) ? options?.timeframes : this.cryptoAllAutoConfig.timeframes;
+                const symbols = Array.from(new Set((symbolsRaw || []).map((x: any) => String(x || '').toUpperCase()).filter(Boolean)));
+                const timeframes = Array.from(new Set((timeframesRaw || []).map((x: any) => String(x || '').toLowerCase()).filter(Boolean))) as any;
+                this.cryptoAllAutoConfig = {
+                    ...this.cryptoAllAutoConfig,
+                    minProb: Math.max(0, Math.min(1, Number.isFinite(minProbRaw) ? minProbRaw : this.cryptoAllAutoConfig.minProb)),
+                    expiresWithinSec: Math.max(10, Math.floor(Number.isFinite(expiresWithinSecRaw) ? expiresWithinSecRaw : this.cryptoAllAutoConfig.expiresWithinSec)),
+                    amountUsd: Math.max(1, Number.isFinite(amountUsdRaw) ? amountUsdRaw : this.cryptoAllAutoConfig.amountUsd),
+                    symbols: symbols.length ? symbols : this.cryptoAllAutoConfig.symbols,
+                    timeframes: timeframes.length ? timeframes : this.cryptoAllAutoConfig.timeframes,
+                };
+            }
+            await this.cryptoAllTryAutoOnce();
+            return { success: true, status: this.getCryptoAllStatus() };
+        } catch (e: any) {
+            return { success: false, error: e?.message || String(e), status: this.getCryptoAllStatus() };
+        } finally {
+            this.cryptoAllAutoEnabled = prevEnabled;
+            this.cryptoAllAutoDryRun = prevDryRun;
+            this.cryptoAllAutoConfig = prevConfig;
+        }
     }
 
     private ensureCryptoAllSplitBuyLoop() {
@@ -8317,7 +11611,7 @@ export class GroupArbitrageScanner {
                     nextLeg === '3m' ? this.cryptoAllAutoConfig.splitBuyTrendMinutes3m
                     : nextLeg === '2m' ? this.cryptoAllAutoConfig.splitBuyTrendMinutes2m
                     : this.cryptoAllAutoConfig.splitBuyTrendMinutes1m;
-                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
+                const up = await this.isBinanceTrendOkWithSpot({ symbol: String(v.symbol || ''), minutes: needUpMin, direction: v.direction === 'Down' ? 'Down' : 'Up', allowEqual: nextLeg === '2m' || nextLeg === '1m' }).catch(() => ({ ok: false, closes: [], lastClose: null, spot: null, error: 'binance_error' }));
                 if (!up.ok) continue;
             }
             const r: any = await this.placeCryptoAllOrder({
@@ -8349,7 +11643,7 @@ export class GroupArbitrageScanner {
         if (Date.now() < this.cryptoAllNextScanAllowedAtMs) return;
         if (this.cryptoAllAutoInFlight) return;
         this.cryptoAllAutoInFlight = true;
-        if (!this.hasValidKey) {
+        if (!this.cryptoAllAutoDryRun && !this.hasValidKey) {
             this.cryptoAllLastError = 'Missing private key';
             this.cryptoAllAutoInFlight = false;
             return;
@@ -8375,17 +11669,25 @@ export class GroupArbitrageScanner {
                 this.cryptoAllAutoInFlight = false;
                 return;
             }
+            this.cryptoAllLastError = null;
+            const decisions: any[] = [];
             for (const c of candidates) {
-                if (!c.meetsMinProb || !c.meetsMinDelta || !c.chosen || c.riskScore >= this.cryptoAllAutoConfig.riskSkipScore) continue;
-                if (this.cryptoAllAutoConfig.dojiGuardEnabled && c.dojiLikely) continue;
+                const sym = String(c?.symbol || '');
+                const tf = String(c?.timeframe || '');
+                if (!c.meetsMinProb) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'min_prob' }); continue; }
+                if (!c.meetsMinDelta) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'min_delta' }); continue; }
+                if (!c.chosen) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'no_chosen' }); continue; }
+                if (c.riskScore >= this.cryptoAllAutoConfig.riskSkipScore) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'risk', riskScore: c.riskScore }); continue; }
+                if (this.cryptoAllAutoConfig.dojiGuardEnabled && c.dojiLikely) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'doji' }); continue; }
                 if (this.cryptoAllAutoConfig.adaptiveDeltaEnabled) {
-                    const st = this.cryptoAllAdaptiveDeltaBySymbol.get(c.symbol) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
-                    if (st.overrideDelta != null && Number(st.overrideDelta) > Number(c.deltaAbs)) continue;
+                    const adKey = `${String(c.symbol || '').toUpperCase()}:${String(c.timeframe || '15m').toLowerCase()}`;
+                    const st = this.cryptoAllAdaptiveDeltaBySymbol.get(adKey) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
+                    if (st.overrideDelta != null && Number(st.overrideDelta) > Number(c.deltaAbs)) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'adaptive_delta', overrideDelta: st.overrideDelta, deltaAbs: c.deltaAbs }); continue; }
                 }
                 const lockKey = `${c.conditionId}:${c.chosen.outcome}`;
-                if (this.cryptoAllOrderLocks.has(lockKey)) continue;
+                if (this.cryptoAllOrderLocks.has(lockKey)) { decisions.push({ symbol: sym, timeframe: tf, action: 'skip', reason: 'locked', conditionId: c.conditionId }); continue; }
                 this.cryptoAllOrderLocks.set(lockKey, { atMs: Date.now(), symbol: c.symbol, expiresAtMs: Date.now() + 60000, conditionId: c.conditionId, status: 'placing' });
-                const r: any = await this.placeCryptoAllOrder({
+                const orderParams: any = {
                     conditionId: c.conditionId,
                     outcomeIndex: c.chosenIndex,
                     amountUsd: this.cryptoAllAutoConfig.amountUsd,
@@ -8393,24 +11695,31 @@ export class GroupArbitrageScanner {
                     force: false,
                     source: 'auto',
                     symbol: c.symbol,
-                    timeframe: '15m',
+                    timeframe: c.timeframe,
                     endDate: c.endDateIso,
                     secondsToExpire: c.secondsToExpire,
-                }).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+                };
+                const r: any = this.cryptoAllAutoDryRun
+                    ? { success: true, dryRun: true, wouldPlaceOrder: true, params: orderParams }
+                    : await this.placeCryptoAllOrder(orderParams).catch((e: any) => ({ success: false, error: e?.message || String(e) }));
+                decisions.push({ symbol: sym, timeframe: tf, action: this.cryptoAllAutoDryRun ? 'would_place' : r?.success ? 'placed' : 'failed', conditionId: c.conditionId, outcome: c.chosen?.outcome ?? null, price: c.chosen?.price ?? null, dryRun: this.cryptoAllAutoDryRun === true, error: r?.error ?? null });
+                if (this.cryptoAllAutoDryRun) this.cryptoAllLastScanSummary = { at: new Date().toISOString(), dryRun: true, candidatesCount: candidates.length, decisions };
                 if (r?.success) {
                     this.cryptoAllOrderLocks.set(lockKey, { atMs: Date.now(), symbol: c.symbol, expiresAtMs: Date.now() + 300000, conditionId: c.conditionId, status: 'ordered' });
                     if (this.cryptoAllAutoConfig.adaptiveDeltaEnabled) {
-                        const st = this.cryptoAllAdaptiveDeltaBySymbol.get(c.symbol) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
-                        if (Number(c.deltaAbs) >= (this.cryptoAllDeltaThresholds as any)[c.symbol.toLowerCase() + 'MinDelta'] * this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier) {
+                        const adKey = `${String(c.symbol || '').toUpperCase()}:${String(c.timeframe || '15m').toLowerCase()}`;
+                        const st = this.cryptoAllAdaptiveDeltaBySymbol.get(adKey) || { overrideDelta: null, noBuyCount: 0, lastBigMoveAt: null, lastBigMoveDelta: null };
+                        const baseMinDelta = this.getCryptoAllMinDeltaRequired(String(c.symbol || ''), String(c.timeframe || '15m').toLowerCase() as any);
+                        if (Number(c.deltaAbs) >= baseMinDelta * this.cryptoAllAutoConfig.adaptiveDeltaBigMoveMultiplier) {
                             st.lastBigMoveAt = new Date().toISOString();
                             st.lastBigMoveDelta = Number(c.deltaAbs);
                             st.overrideDelta = Number(c.deltaAbs) * 0.8; 
                             st.noBuyCount = this.cryptoAllAutoConfig.adaptiveDeltaRevertNoBuyCount;
-                            this.cryptoAllAdaptiveDeltaBySymbol.set(c.symbol, st);
+                            this.cryptoAllAdaptiveDeltaBySymbol.set(adKey, st);
                         } else if (st.noBuyCount > 0) {
                             st.noBuyCount--;
                             if (st.noBuyCount <= 0) st.overrideDelta = null;
-                            this.cryptoAllAdaptiveDeltaBySymbol.set(c.symbol, st);
+                            this.cryptoAllAdaptiveDeltaBySymbol.set(adKey, st);
                         }
                     }
                     if (this.cryptoAllAutoConfig.splitBuyEnabled) {
@@ -8451,6 +11760,9 @@ export class GroupArbitrageScanner {
                     this.cryptoAllOrderLocks.delete(lockKey);
                 }
             }
+            if (this.cryptoAllAutoDryRun && !this.cryptoAllLastScanSummary) {
+                this.cryptoAllLastScanSummary = { at: new Date().toISOString(), dryRun: true, candidatesCount: candidates.length, decisions };
+            }
         } catch (e: any) {
             this.cryptoAllLastError = e?.message || String(e);
         } finally {
@@ -8483,7 +11795,7 @@ export class GroupArbitrageScanner {
         setTimeout(() => tick().catch(() => {}), 50);
     }
 
-    private registerCryptoAllStoplossPosition(params: { strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall'; conditionId: string; tokenId: string; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; entryPrice: number; sizeEstimate: number; stoploss: { cut1DropCents: number; cut1SellPct: number; cut2DropCents: number; cut2SellPct: number; minSecToExit: number } }) {
+    private registerCryptoAllStoplossPosition(params: { strategy: 'crypto15m' | 'cryptoall2' | 'cryptoall'; conditionId: string; tokenId: string; symbol: string; timeframe: '5m' | '15m' | '1h' | '4h' | '1d'; endMs: number; entryPrice: number; sizeEstimate: number; stoploss: { cut1DropCents: number; cut1SellPct: number; cut2DropCents: number; cut2SellPct: number; minSecToExit: number } }) {
         const positionKey = `${String(params.conditionId)}:${String(params.tokenId)}`;
         const prev = this.cryptoAllStoplossState.get(positionKey);
         const entryPrice = Number(params.entryPrice);
@@ -8745,7 +12057,7 @@ export class GroupArbitrageScanner {
         return Math.abs(s1) <= Math.abs(s2) && Math.abs(s2) <= Math.abs(s3);
     }
 
-    private registerCryptoAllAddOnPosition(params: { conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '15m' | '1h' | '4h' | '1d'; endMs: number; stakeUsd: number }) {
+    private registerCryptoAllAddOnPosition(params: { conditionId: string; tokenId: string; direction: 'Up' | 'Down'; outcomeIndex: number; symbol: string; timeframe: '5m' | '15m' | '1h' | '4h' | '1d'; endMs: number; stakeUsd: number }) {
         const positionKey = `${String(params.conditionId)}:${String(params.tokenId)}`;
         const prev = this.cryptoAllAddOnState.get(positionKey);
         const next = {
@@ -8900,6 +12212,17 @@ export class GroupArbitrageScanner {
             const status = String(tracked?.status || '').toLowerCase();
             const retryAfterMs = tracked?.retryAfterMs != null ? Number(tracked.retryAfterMs) : NaN;
             if (status === 'failed' && Number.isFinite(retryAfterMs) && Date.now() >= retryAfterMs) {
+                const tid = tracked?.tokenId != null ? String(tracked.tokenId).trim() : '';
+                const oid = tracked?.orderId != null ? String(tracked.orderId).trim() : '';
+                if (tid) {
+                    const probe = await this.probeRecentBuyState({ conditionId, tokenId: tid, orderId: oid || null, maxWaitMs: 0 }).catch(() => null as any);
+                    const has = probe && ((probe.filledUsd != null && Number(probe.filledUsd) > 0) || probe.hasOpen === true || probe.orderFetched === true);
+                    if (has) {
+                        this.cryptoAllTrackedByCondition.set(conditionId, { ...tracked, status: 'ordered', verifiedAt: new Date().toISOString(), orderId: (probe?.orderId ?? tracked?.orderId ?? null) });
+                        recordSkipEarly('already_ordered_tracked');
+                        return { success: false, skipped: true, reason: 'already_ordered_tracked', conditionId };
+                    }
+                }
                 this.cryptoAllTrackedByCondition.delete(conditionId);
             } else if (status === 'failed' && Number.isFinite(retryAfterMs)) {
                 recordSkipEarly('retry_cooldown', `retryAfterMs=${retryAfterMs}`);
@@ -8974,6 +12297,7 @@ export class GroupArbitrageScanner {
                     price: fields?.bestAsk ?? null,
                     bestAsk: fields?.bestAsk ?? null,
                     limitPrice: fields?.limitPrice ?? null,
+                    replay: fields?.replay ?? null,
                     results: [{ success: false, orderId: null, tokenId: fields?.tokenId ?? null, outcome: fields?.outcome ?? null, conditionId, orderStatus, errorMsg: fields?.errorMsg != null ? String(fields.errorMsg) : '' }],
                 });
                 this.schedulePersistOrderHistory();
@@ -9010,12 +12334,7 @@ export class GroupArbitrageScanner {
         const outcome = String(tok?.outcome ?? '').trim() || `idx_${idx}`;
 
         if (!force && symbol && symbol !== 'UNKNOWN') {
-            const minDeltaRequired =
-                upperSymbol === 'BTC' ? this.cryptoAllDeltaThresholds.btcMinDelta
-                : upperSymbol === 'ETH' ? this.cryptoAllDeltaThresholds.ethMinDelta
-                : upperSymbol === 'SOL' ? this.cryptoAllDeltaThresholds.solMinDelta
-                : upperSymbol === 'XRP' ? this.cryptoAllDeltaThresholds.xrpMinDelta
-                : 0;
+            const minDeltaRequired = this.getCryptoAllMinDeltaRequired(upperSymbol, tf);
             if (minDeltaRequired > 0) {
                 const beat = await this.fetchCryptoAllBeatAndCurrentFromBinance({ symbol: upperSymbol, endMs: expiresAtMs, timeframeSec });
                 if (beat.deltaAbs == null) {
@@ -9033,7 +12352,9 @@ export class GroupArbitrageScanner {
             this.cryptoAllOrderLocks.set(orderLockKey, { atMs: Date.now(), key: `${tf}:${upperSymbol}`, expiresAtMs, conditionId, status: 'placing' });
             orderLockPlaced = true;
         }
+        let replay: any = null;
         try {
+            const booksFetchedAtMs = Date.now();
             const books = await this.fetchClobBooks([tokenId]);
             const b0: any = Array.isArray(books) && books.length ? books[0] : null;
             const asks = Array.isArray(b0?.asks) ? b0.asks : [];
@@ -9046,28 +12367,53 @@ export class GroupArbitrageScanner {
                 return { success: false, skipped: true, reason: 'missing_book', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null };
             }
             const bidPrice = Number.isFinite(bestBid) ? bestBid : null;
+            const booksCache = (this as any).clobBooksCache as Map<string, { atMs: number; data: any[] }> | undefined;
+            const booksCacheAtMs = booksCache?.get(String(tokenId))?.atMs ?? null;
+            const booksStaleMs = booksCacheAtMs != null ? Math.max(0, booksFetchedAtMs - Number(booksCacheAtMs)) : null;
+            const limitPrice = Math.min(0.999, chosenPrice + 0.02);
+            replay = {
+                meta: {
+                    strategy: 'cryptoall',
+                    tokenId,
+                    conditionId,
+                    symbol: upperSymbol,
+                    timeframe: tf,
+                    outcome,
+                    outcomeIndex: idx,
+                    expiresAtMs,
+                    secondsToExpire: params.secondsToExpire != null ? Number(params.secondsToExpire) : Math.max(0, Math.floor((Number(expiresAtMs) - Date.now()) / 1000)),
+                    bestAsk: chosenPrice,
+                    bestBid: bidPrice,
+                    limitPrice,
+                    requestedAmountUsd,
+                    amountUsd,
+                    booksStaleMs,
+                },
+                before: buildOrderbookSnapshot({ book: { asks, bids }, fetchedAtMs: Number(booksCacheAtMs) || booksFetchedAtMs, topN: 25 }),
+                after: null,
+            };
             if (!force && this.cryptoAllAutoConfig.stoploss?.spreadGuardCents != null && bidPrice != null) {
                 const spread = chosenPrice - bidPrice;
                 const guard = Math.max(0, Math.floor(Number(this.cryptoAllAutoConfig.stoploss.spreadGuardCents) || 0)) / 100;
                 if (guard > 0 && spread >= guard) {
-                    recordSkip('spread_guard', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, bestBid: bidPrice, errorMsg: `spread=${spread}` });
+                    recordSkip('spread_guard', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, bestBid: bidPrice, limitPrice, replay, errorMsg: `spread=${spread}` });
                     return { success: false, skipped: true, reason: 'spread_guard', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, bestAsk: chosenPrice, bestBid: bidPrice, spread, guard };
                 }
             }
             if (!force && chosenPrice < effectiveMinPrice) {
-                recordSkip('min_prob', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, errorMsg: `bestAsk=${chosenPrice} min=${effectiveMinPrice}` });
+                recordSkip('min_prob', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, limitPrice, replay, errorMsg: `bestAsk=${chosenPrice} min=${effectiveMinPrice}` });
                 return { success: false, skipped: true, reason: 'min_prob', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, bestAsk: chosenPrice, minPrice: effectiveMinPrice };
             }
 
             const globalKey = `cryptoall:${conditionId}`.toLowerCase();
             if (!force) {
                 if (!this.tryAcquireGlobalOrderLock(globalKey, 'cryptoall')) {
-                    recordSkip('global_locked', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, expiresAtMs });
+                    recordSkip('global_locked', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, limitPrice, replay, expiresAtMs });
                     return { success: false, skipped: true, reason: 'global_locked', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
                 }
                 if (this.globalOrderPlaceInFlight) {
                     this.markGlobalOrderLockDone(globalKey, false);
-                    recordSkip('global_inflight', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, expiresAtMs });
+                    recordSkip('global_inflight', { tokenId, outcome, outcomeIndex: idx, bestAsk: chosenPrice, limitPrice, replay, expiresAtMs });
                     return { success: false, skipped: true, reason: 'global_inflight', symbol: upperSymbol, timeframe: tf, slug: marketSlug || null, expiresAtMs };
                 }
                 this.globalOrderPlaceInFlight = true;
@@ -9076,15 +12422,35 @@ export class GroupArbitrageScanner {
             let orderId: string | null = null;
             let orderErrorMsg: string | null = null;
             try {
-                const result = await this.tradingClient.createMarketOrder({ tokenId, amountUsd, limitPrice: Math.min(0.999, chosenPrice + 0.02), side: 'BUY' });
+                const result = await this.tradingClient.createMarketOrder({ tokenId, amountUsd, limitPrice, side: 'BUY' });
                 ok = !!(result as any)?.success;
                 orderId = (result as any)?.orderId || null;
                 orderErrorMsg = (result as any)?.errorMsg != null ? String((result as any).errorMsg) : ((result as any)?.error != null ? String((result as any).error) : null);
+                if (!ok) {
+                    const probe = await this.probeRecentBuyState({ conditionId, tokenId, orderId: orderId || null, maxWaitMs: 900 }).catch(() => null as any);
+                    const has = probe && ((probe.filledUsd != null && Number(probe.filledUsd) > 0) || probe.hasOpen === true || probe.orderFetched === true);
+                    if (has) {
+                        ok = true;
+                        if (!orderId && probe?.orderId) orderId = String(probe.orderId);
+                        orderErrorMsg = null;
+                    }
+                }
             } finally {
                 if (!force) {
                     this.globalOrderPlaceInFlight = false;
                     this.markGlobalOrderLockDone(globalKey, ok);
                 }
+            }
+
+            try {
+                await new Promise((r) => setTimeout(r, 300));
+                const afterFetchedAtMs = Date.now();
+                const afterBooks = await this.fetchClobBooks([tokenId]).catch(() => []);
+                const afterBook = Array.isArray(afterBooks) && afterBooks.length ? afterBooks[0] : null;
+                const afterAsks = Array.isArray((afterBook as any)?.asks) ? (afterBook as any).asks : [];
+                const afterBids = Array.isArray((afterBook as any)?.bids) ? (afterBook as any).bids : [];
+                if (replay) replay.after = buildOrderbookSnapshot({ book: { asks: afterAsks, bids: afterBids }, fetchedAtMs: afterFetchedAtMs, topN: 25 });
+            } catch {
             }
 
             const historyEntry: any = {
@@ -9102,10 +12468,11 @@ export class GroupArbitrageScanner {
                 tokenId,
                 price: chosenPrice,
                 bestAsk: chosenPrice,
-                limitPrice: Math.min(0.999, chosenPrice + 0.02),
+                limitPrice,
                 amountUsd,
                 addonWindow: params.addonWindow || null,
                 addonRiskScore: params.addonRiskScore != null ? Number(params.addonRiskScore) : null,
+                replay,
                 results: [{ success: ok, orderId, tokenId, outcome, conditionId, errorMsg: ok ? '' : (orderErrorMsg || '') }],
             };
             this.orderHistory.unshift(historyEntry);
@@ -9178,6 +12545,7 @@ export class GroupArbitrageScanner {
                     amountUsd,
                     addonWindow: params.addonWindow || null,
                     addonRiskScore: params.addonRiskScore != null ? Number(params.addonRiskScore) : null,
+                    replay,
                     results: [{ success: false, orderId: null, tokenId, outcome, conditionId, errorMsg: errMsg }],
                 };
                 this.orderHistory.unshift(historyEntry);
@@ -9356,7 +12724,7 @@ export class GroupArbitrageScanner {
                 action: 'manual_exit',
                 result: { success: false, error: 'No filled leg detected', cancelResults }
             });
-            if (this.orderHistory.length > 50) this.orderHistory.pop();
+            if (this.orderHistory.length > 100) this.orderHistory.pop();
             this.schedulePersistOrderHistory();
             return { success: false, error: 'No filled leg detected', cancelResults };
         }
@@ -9535,7 +12903,7 @@ export class GroupArbitrageScanner {
         };
 
         this.orderHistory.unshift(historyEntry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
         this.schedulePersistOrderHistory();
         this.schedulePersistOrderHistory();
 
@@ -9809,7 +13177,7 @@ export class GroupArbitrageScanner {
         
         // Add to history (limit to 50)
         this.orderHistory.unshift(historyEntry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
         this.schedulePersistOrderHistory();
 
         return { success: true, results, openOrders };
@@ -9928,7 +13296,7 @@ export class GroupArbitrageScanner {
         };
 
         this.orderHistory.unshift(historyEntry);
-        if (this.orderHistory.length > 50) this.orderHistory.pop();
+        if (this.orderHistory.length > 100) this.orderHistory.pop();
 
         const yes = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'yes' && r.orderId);
         const no = results.find((r: any) => String(r?.outcome ?? '').toLowerCase() === 'no' && r.orderId);
@@ -10003,7 +13371,7 @@ export class GroupArbitrageScanner {
                             action: 'timeout_cancel',
                             details: { oneLegTimeoutMinutes: pos.settings.oneLegTimeoutMinutes }
                         });
-                        if (this.orderHistory.length > 50) this.orderHistory.pop();
+                        if (this.orderHistory.length > 100) this.orderHistory.pop();
                         this.schedulePersistOrderHistory();
                     }
                     continue;
@@ -10048,7 +13416,7 @@ export class GroupArbitrageScanner {
                                         leg: otherLeg.outcome,
                                         result: hedge
                                     });
-                                    if (this.orderHistory.length > 50) this.orderHistory.pop();
+                                    if (this.orderHistory.length > 100) this.orderHistory.pop();
                                     this.schedulePersistOrderHistory();
                                 }
                             }
@@ -10132,7 +13500,7 @@ export class GroupArbitrageScanner {
                             spreadCents,
                             result: fallbackLimit?.success ? { ...fallbackLimit, method: 'limit_best_bid' } : { ...sell, method: attempt1?.success ? 'market_fak' : 'market_fak_with_price', fallbackLimit }
                         });
-                        if (this.orderHistory.length > 50) this.orderHistory.pop();
+                        if (this.orderHistory.length > 100) this.orderHistory.pop();
                         this.schedulePersistOrderHistory();
                         if (sell?.success || fallbackLimit?.success) {
                             pos.status = 'exited';

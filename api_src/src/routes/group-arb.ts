@@ -1,14 +1,35 @@
 import { FastifyPluginAsync } from 'fastify';
 import { GroupArbitrageScanner } from '../services/group-arbitrage.js';
-import { config } from '../config.js';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import { GroupArbScannerManager } from '../services/group-arb-scanner-manager.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
-    const setupConfigPath = process.env.POLY_SETUP_CONFIG_PATH
-        ? String(process.env.POLY_SETUP_CONFIG_PATH)
-        : path.join(os.tmpdir(), 'polymarket-tools', 'setup.json');
+    const scannerManager = new GroupArbScannerManager();
+    const als = new AsyncLocalStorage<{ scanner: GroupArbitrageScanner; accountId: string }>();
+    const scanner = new Proxy(
+        {} as any,
+        {
+            get(_t, prop) {
+                const s = als.getStore()?.scanner as any;
+                const v = s?.[prop as any];
+                return typeof v === 'function' ? v.bind(s) : v;
+            }
+        }
+    ) as any as GroupArbitrageScanner;
+
+    const getAccountId = (request: any): string => {
+        const p = request?.params || {};
+        const id = p?.accountId != null ? String(p.accountId).trim() : '';
+        return id || 'default';
+    };
+
+    fastify.addHook('preHandler', async (request) => {
+        const accountId = getAccountId(request as any);
+        (request as any).accountId = accountId;
+        const s = scannerManager.getOrCreateScanner(accountId);
+        (request as any).scanner = s;
+        als.enterWith({ scanner: s, accountId });
+    });
 
     const normalizeProxyAddress = (raw: unknown): string | undefined => {
         const s = raw != null ? String(raw).trim() : '';
@@ -20,59 +41,15 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         return undefined;
     };
 
-    const loadSetupConfig = (): { privateKey?: string; proxyAddress?: string } => {
-        try {
-            if (!fs.existsSync(setupConfigPath)) return {};
-            const raw = fs.readFileSync(setupConfigPath, 'utf8');
-            const parsed = JSON.parse(String(raw || '{}'));
-            const privateKey = parsed?.privateKey != null ? String(parsed.privateKey).trim() : undefined;
-            const proxyAddress = normalizeProxyAddress(parsed?.proxyAddress);
-            return { privateKey: privateKey || undefined, proxyAddress };
-        } catch {
-            return {};
-        }
-    };
-
-    const persistSetupConfig = (cfg: { privateKey?: string; proxyAddress?: string }) => {
-        const dir = path.dirname(setupConfigPath);
-        fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(setupConfigPath, JSON.stringify({ privateKey: cfg.privateKey || null, proxyAddress: cfg.proxyAddress || null }), { encoding: 'utf8', mode: 0o600 });
-        try { fs.chmodSync(setupConfigPath, 0o600); } catch {}
-    };
-
-    const applyProxyEnv = (proxyAddress?: string) => {
-        const v = proxyAddress != null ? String(proxyAddress).trim() : '';
-        if (v) process.env.POLY_PROXY_ADDRESS = v;
-        else delete (process.env as any).POLY_PROXY_ADDRESS;
-    };
-
-    const setup = loadSetupConfig();
-    applyProxyEnv(setup.proxyAddress);
-    const effectiveKey = (config.polymarket.privateKey && String(config.polymarket.privateKey).trim()) ? String(config.polymarket.privateKey).trim() : setup.privateKey;
-
-    let scanner = new GroupArbitrageScanner(effectiveKey);
-    scanner.start();
-
-    const getSetupStatus = () => {
-        return {
-            hasPrivateKey: (scanner as any).hasPrivateKey ? (scanner as any).hasPrivateKey() : false,
-            eoaAddress: (scanner as any).getEoaAddress ? (scanner as any).getEoaAddress() : null,
-            funderAddress: (scanner as any).getFunderAddress ? (scanner as any).getFunderAddress() : null,
-            proxyAddress: process.env.POLY_PROXY_ADDRESS || null,
-            trading: (scanner as any).getTradingInitStatus ? (scanner as any).getTradingInitStatus() : null,
-            setupConfigPath,
-            setupConfigFilePresent: fs.existsSync(setupConfigPath),
-        };
-    };
-
     fastify.get('/setup/status', {
         schema: {
             tags: ['Group Arb'],
             summary: 'Get local setup status (PrivateKey/EOA/Funder)',
         },
-        handler: async (_request, reply) => {
+        handler: async (request, reply) => {
             try {
-                return { success: true, status: getSetupStatus() };
+                const accountId = (request as any).accountId || 'default';
+                return { success: true, accountId, status: scannerManager.getSetupStatus(accountId) };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
@@ -93,6 +70,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const accountId = (request as any).accountId || 'default';
                 const b = (request.body || {}) as any;
                 const rawPriv = b.privateKey != null ? String(b.privateKey).trim() : '';
                 const rawProxy = b.proxyAddress != null ? String(b.proxyAddress).trim() : '';
@@ -104,13 +82,10 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     privateKey: rawPriv || undefined,
                     proxyAddress,
                 };
-                persistSetupConfig(next);
-                applyProxyEnv(next.proxyAddress);
-                if ((scanner as any).shutdown) (scanner as any).shutdown();
-                const key = next.privateKey || (config.polymarket.privateKey ? String(config.polymarket.privateKey).trim() : undefined);
-                scanner = new GroupArbitrageScanner(key);
-                scanner.start();
-                return { success: true, status: getSetupStatus() };
+                scannerManager.persistSetupConfig(accountId, next);
+                scannerManager.shutdownScanner(accountId);
+                scannerManager.getOrCreateScanner(accountId);
+                return { success: true, accountId, status: scannerManager.getSetupStatus(accountId) };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }
@@ -124,6 +99,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const result = scanner.getResults();
                 return {
                     success: true,
@@ -153,6 +129,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId, amount } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const amountUSDC = amount || 10;
                 const result = await scanner.preview(marketId, amountUSDC);
                 return { success: true, preview: result };
@@ -177,6 +154,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { identifier } = request.query as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const resolved = await scanner.resolveIdentifier(identifier);
                 return { success: true, resolved };
             } catch (err: any) {
@@ -201,6 +179,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { identifier, depth } = request.query as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const ladder = await scanner.getOrderbookLadder(identifier, depth ? Number(depth) : 5);
                 return { success: true, ladder };
             } catch (err: any) {
@@ -228,6 +207,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { identifier, yesPrice, noPrice, size, orderType } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const result = await scanner.executeManual({
                     identifier,
                     yesPrice: Number(yesPrice),
@@ -264,6 +244,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId, shares, slug, question, ...settings } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const result = await scanner.executeByShares(
                     String(marketId),
                     Number(shares),
@@ -292,6 +273,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId, amount } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const amountUSDC = amount || 10;
                 const result = await scanner.execute(marketId, amountUSDC);
                 return result;
@@ -316,6 +298,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId } = request.query as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const orders = await scanner.getActiveOrders(marketId);
                 return { success: true, orders };
             } catch (err: any) {
@@ -339,6 +322,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const q = request.query as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const identifier = q.identifier ? String(q.identifier) : '';
                 const marketId = q.marketId ? String(q.marketId) : '';
                 const resolved = identifier ? await scanner.resolveIdentifier(identifier) : null;
@@ -370,6 +354,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const status = await scanner.getTradingStatus();
                 return { success: true, status };
             } catch (err: any) {
@@ -383,7 +368,8 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             tags: ['Group Arb'],
             summary: 'Get Funder Address'
         },
-        handler: async () => {
+        handler: async (request) => {
+            const scanner = (request as any).scanner as GroupArbitrageScanner;
             return { success: true, funder: scanner.getFunderAddress() };
         }
     });
@@ -403,6 +389,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId } = request.query as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const custody = await scanner.getCtfCustody(marketId);
                 return { success: true, custody };
             } catch (err: any) {
@@ -418,6 +405,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const orders = await scanner.getAllOpenOrders();
                 return { success: true, orders };
             } catch (err: any) {
@@ -433,6 +421,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const positions = await scanner.getMonitoredPositionsSummary();
                 return { success: true, positions };
             } catch (err: any) {
@@ -454,6 +443,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const q = request.query as any;
                 const positionsLimit = q.positionsLimit != null ? Number(q.positionsLimit) : 50;
                 const summary = await scanner.getPortfolioSummary({ positionsLimit });
@@ -479,6 +469,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { orderId } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const result = await scanner.cancelOrder(orderId);
                 return { success: true, result };
             } catch (err: any) {
@@ -502,6 +493,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (request, reply) => {
             const { marketId } = request.body as any;
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const result = await scanner.exitNow(String(marketId));
                 return { success: true, result };
             } catch (err: any) {
@@ -517,6 +509,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const q = request.query as any;
                 const market = q.marketId || q.market;
                 const params: any = {};
@@ -536,6 +529,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         },
         handler: async (request, reply) => {
             try {
+                const scanner = (request as any).scanner as GroupArbitrageScanner;
                 const q = request.query as any;
                 const range = String(q.range || '1D').toUpperCase();
                 const limit = q.limit != null ? Number(q.limit) : 200;
@@ -1011,6 +1005,30 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.get('/crypto15m/replay/:id', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get crypto15m execution replay (orderbook before/after + order result)',
+            params: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' }
+                },
+                required: ['id']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const p = (request.params || {}) as any;
+                const id = String(p.id || '').trim();
+                const r = await (scanner as any).getCrypto15mReplay(id);
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.get('/crypto15m/stoploss/history', {
         schema: {
             tags: ['Group Arb'],
@@ -1070,6 +1088,32 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     minProb: q.minProb != null ? Number(q.minProb) : undefined,
                     expiresWithinSec: q.expiresWithinSec != null ? Number(q.expiresWithinSec) : undefined,
                     limit: q.limit != null ? Number(q.limit) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m/analysis/trades', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Analyze last crypto15m trades with 60s book timeline',
+            querystring: {
+                type: 'object',
+                properties: {
+                    limit: { type: 'number' },
+                    tradeId: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = (scanner as any).getCrypto15mTradeAnalysis({
+                    limit: q.limit != null ? Number(q.limit) : undefined,
+                    tradeId: q.tradeId != null ? Number(q.tradeId) : undefined,
                 });
                 return r;
             } catch (err: any) {
@@ -1151,6 +1195,11 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     expiresWithinSec: { type: 'number' },
                     pollMs: { type: 'number' },
                     buySizingMode: { type: 'string' },
+                    sweepEnabled: { type: 'boolean' },
+                    sweepWindowSec: { type: 'number' },
+                    sweepMaxOrdersPerMarket: { type: 'number' },
+                    sweepMaxTotalUsdPerMarket: { type: 'number' },
+                    sweepMinIntervalMs: { type: 'number' },
                     trendEnabled: { type: 'boolean' },
                     trendMinutes: { type: 'number' },
                     staleMsThreshold: { type: 'number' },
@@ -1175,6 +1224,11 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
                     pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
                     buySizingMode: b.buySizingMode != null ? String(b.buySizingMode) : undefined,
+                    sweepEnabled: b.sweepEnabled != null ? !!b.sweepEnabled : undefined,
+                    sweepWindowSec: b.sweepWindowSec != null ? Number(b.sweepWindowSec) : undefined,
+                    sweepMaxOrdersPerMarket: b.sweepMaxOrdersPerMarket != null ? Number(b.sweepMaxOrdersPerMarket) : undefined,
+                    sweepMaxTotalUsdPerMarket: b.sweepMaxTotalUsdPerMarket != null ? Number(b.sweepMaxTotalUsdPerMarket) : undefined,
+                    sweepMinIntervalMs: b.sweepMinIntervalMs != null ? Number(b.sweepMinIntervalMs) : undefined,
                     trendEnabled: b.trendEnabled != null ? !!b.trendEnabled : undefined,
                     trendMinutes: b.trendMinutes != null ? Number(b.trendMinutes) : undefined,
                     staleMsThreshold: b.staleMsThreshold != null ? Number(b.staleMsThreshold) : undefined,
@@ -1229,11 +1283,17 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             body: {
                 type: 'object',
                 properties: {
+                    dryRun: { type: 'boolean' },
                     amountUsd: { type: 'number' },
                     minProb: { type: 'number' },
                     expiresWithinSec: { type: 'number' },
                     pollMs: { type: 'number' },
                     buySizingMode: { type: 'string' },
+                    sweepEnabled: { type: 'boolean' },
+                    sweepWindowSec: { type: 'number' },
+                    sweepMaxOrdersPerMarket: { type: 'number' },
+                    sweepMaxTotalUsdPerMarket: { type: 'number' },
+                    sweepMinIntervalMs: { type: 'number' },
                     trendEnabled: { type: 'boolean' },
                     trendMinutes: { type: 'number' },
                     staleMsThreshold: { type: 'number' },
@@ -1254,11 +1314,17 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 const b = (request.body || {}) as any;
                 const status = scanner.startCrypto15mAuto({
                     enabled: true,
+                    dryRun: b.dryRun != null ? !!b.dryRun : undefined,
                     amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
                     minProb: b.minProb != null ? Number(b.minProb) : undefined,
                     expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
                     pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
                     buySizingMode: b.buySizingMode != null ? String(b.buySizingMode) : undefined,
+                    sweepEnabled: b.sweepEnabled != null ? !!b.sweepEnabled : undefined,
+                    sweepWindowSec: b.sweepWindowSec != null ? Number(b.sweepWindowSec) : undefined,
+                    sweepMaxOrdersPerMarket: b.sweepMaxOrdersPerMarket != null ? Number(b.sweepMaxOrdersPerMarket) : undefined,
+                    sweepMaxTotalUsdPerMarket: b.sweepMaxTotalUsdPerMarket != null ? Number(b.sweepMaxTotalUsdPerMarket) : undefined,
+                    sweepMinIntervalMs: b.sweepMinIntervalMs != null ? Number(b.sweepMinIntervalMs) : undefined,
                     staleMsThreshold: b.staleMsThreshold != null ? Number(b.staleMsThreshold) : undefined,
                     stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
                     stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
@@ -1277,6 +1343,36 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.post('/crypto15m/auto/run-once', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Run 15m crypto auto trade once (supports dryRun)',
+            body: {
+                type: 'object',
+                properties: {
+                    dryRun: { type: 'boolean' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const res = await (scanner as any).runCrypto15mAutoOnce({
+                    dryRun: b.dryRun === true,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                });
+                return { success: true, result: res };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.post('/crypto15m/auto/stop', {
         schema: {
             tags: ['Group Arb'],
@@ -1285,6 +1381,220 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         handler: async (_request, reply) => {
             try {
                 const status = scanner.stopCrypto15mAuto();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m-hedge/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get Crypto15M Hedge status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).getCrypto15mHedgeStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m-hedge/signals', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get Crypto15M Hedge entry/hedge signals (UI preview)',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const data = await (scanner as any).getCrypto15mHedgeSignals();
+                return data;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m-hedge/history', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get Crypto15M Hedge history',
+            querystring: {
+                type: 'object',
+                properties: {
+                    maxEntries: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = (scanner as any).getCrypto15mHedgeHistory({
+                    maxEntries: q.maxEntries != null ? Number(q.maxEntries) : undefined,
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m-hedge/config', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Persist Crypto15M Hedge settings (no auto start/stop)',
+            body: {
+                type: 'object',
+                properties: {
+                    pollMs: { type: 'number' },
+                    minProb: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    entryRemainingMinSec: { type: 'number' },
+                    entryRemainingMaxSec: { type: 'number' },
+                    entryCheapMinCents: { type: 'number' },
+                    entryCheapMaxCents: { type: 'number' },
+                    targetProfitCents: { type: 'number' },
+                    profitDecayEnabled: { type: 'boolean' },
+                    profitDecayMode: { type: 'string' },
+                    profitDecayPerMinCents: { type: 'number' },
+                    profitStartCents: { type: 'number' },
+                    profitEndCents: { type: 'number' },
+                    profitDecayStartSec: { type: 'number' },
+                    profitDecayEndSec: { type: 'number' },
+                    profitStepCents: { type: 'number' },
+                    mode: { type: 'string' },
+                    bufferCents: { type: 'number' },
+                    maxSpreadCents: { type: 'number' },
+                    minDepthPct: { type: 'number' },
+                    minSecToHedge: { type: 'number' },
+                    hedgeIgnoreSpread: { type: 'boolean' },
+                    panicHedgeEnabled: { type: 'boolean' },
+                    panicHedgeStartSec: { type: 'number' },
+                    panicMaxLossCents: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).updateCrypto15mHedgeConfig({
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    entryRemainingMinSec: b.entryRemainingMinSec != null ? Number(b.entryRemainingMinSec) : undefined,
+                    entryRemainingMaxSec: b.entryRemainingMaxSec != null ? Number(b.entryRemainingMaxSec) : undefined,
+                    entryCheapMinCents: b.entryCheapMinCents != null ? Number(b.entryCheapMinCents) : undefined,
+                    entryCheapMaxCents: b.entryCheapMaxCents != null ? Number(b.entryCheapMaxCents) : undefined,
+                    targetProfitCents: b.targetProfitCents != null ? Number(b.targetProfitCents) : undefined,
+                    profitDecayEnabled: b.profitDecayEnabled != null ? !!b.profitDecayEnabled : undefined,
+                    profitDecayMode: b.profitDecayMode != null ? String(b.profitDecayMode) : undefined,
+                    profitDecayPerMinCents: b.profitDecayPerMinCents != null ? Number(b.profitDecayPerMinCents) : undefined,
+                    profitStartCents: b.profitStartCents != null ? Number(b.profitStartCents) : undefined,
+                    profitEndCents: b.profitEndCents != null ? Number(b.profitEndCents) : undefined,
+                    profitDecayStartSec: b.profitDecayStartSec != null ? Number(b.profitDecayStartSec) : undefined,
+                    profitDecayEndSec: b.profitDecayEndSec != null ? Number(b.profitDecayEndSec) : undefined,
+                    profitStepCents: b.profitStepCents != null ? Number(b.profitStepCents) : undefined,
+                    mode: b.mode != null ? String(b.mode) : undefined,
+                    bufferCents: b.bufferCents != null ? Number(b.bufferCents) : undefined,
+                    maxSpreadCents: b.maxSpreadCents != null ? Number(b.maxSpreadCents) : undefined,
+                    minDepthPct: b.minDepthPct != null ? Number(b.minDepthPct) : undefined,
+                    minSecToHedge: b.minSecToHedge != null ? Number(b.minSecToHedge) : undefined,
+                    hedgeIgnoreSpread: b.hedgeIgnoreSpread != null ? !!b.hedgeIgnoreSpread : undefined,
+                    panicHedgeEnabled: b.panicHedgeEnabled != null ? !!b.panicHedgeEnabled : undefined,
+                    panicHedgeStartSec: b.panicHedgeStartSec != null ? Number(b.panicHedgeStartSec) : undefined,
+                    panicMaxLossCents: b.panicMaxLossCents != null ? Number(b.panicMaxLossCents) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m-hedge/auto/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start Crypto15M Hedge auto',
+            body: {
+                type: 'object',
+                properties: {
+                    pollMs: { type: 'number' },
+                    minProb: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    entryRemainingMinSec: { type: 'number' },
+                    entryRemainingMaxSec: { type: 'number' },
+                    entryCheapMinCents: { type: 'number' },
+                    entryCheapMaxCents: { type: 'number' },
+                    targetProfitCents: { type: 'number' },
+                    profitDecayEnabled: { type: 'boolean' },
+                    profitDecayMode: { type: 'string' },
+                    profitDecayPerMinCents: { type: 'number' },
+                    profitStartCents: { type: 'number' },
+                    profitEndCents: { type: 'number' },
+                    profitDecayStartSec: { type: 'number' },
+                    profitDecayEndSec: { type: 'number' },
+                    profitStepCents: { type: 'number' },
+                    mode: { type: 'string' },
+                    bufferCents: { type: 'number' },
+                    maxSpreadCents: { type: 'number' },
+                    minDepthPct: { type: 'number' },
+                    minSecToHedge: { type: 'number' },
+                    hedgeIgnoreSpread: { type: 'boolean' },
+                    panicHedgeEnabled: { type: 'boolean' },
+                    panicHedgeStartSec: { type: 'number' },
+                    panicMaxLossCents: { type: 'number' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).startCrypto15mHedgeAuto({
+                    enabled: true,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    entryRemainingMinSec: b.entryRemainingMinSec != null ? Number(b.entryRemainingMinSec) : undefined,
+                    entryRemainingMaxSec: b.entryRemainingMaxSec != null ? Number(b.entryRemainingMaxSec) : undefined,
+                    entryCheapMinCents: b.entryCheapMinCents != null ? Number(b.entryCheapMinCents) : undefined,
+                    entryCheapMaxCents: b.entryCheapMaxCents != null ? Number(b.entryCheapMaxCents) : undefined,
+                    targetProfitCents: b.targetProfitCents != null ? Number(b.targetProfitCents) : undefined,
+                    profitDecayEnabled: b.profitDecayEnabled != null ? !!b.profitDecayEnabled : undefined,
+                    profitDecayMode: b.profitDecayMode != null ? String(b.profitDecayMode) : undefined,
+                    profitDecayPerMinCents: b.profitDecayPerMinCents != null ? Number(b.profitDecayPerMinCents) : undefined,
+                    profitStartCents: b.profitStartCents != null ? Number(b.profitStartCents) : undefined,
+                    profitEndCents: b.profitEndCents != null ? Number(b.profitEndCents) : undefined,
+                    profitDecayStartSec: b.profitDecayStartSec != null ? Number(b.profitDecayStartSec) : undefined,
+                    profitDecayEndSec: b.profitDecayEndSec != null ? Number(b.profitDecayEndSec) : undefined,
+                    profitStepCents: b.profitStepCents != null ? Number(b.profitStepCents) : undefined,
+                    mode: b.mode != null ? String(b.mode) : undefined,
+                    bufferCents: b.bufferCents != null ? Number(b.bufferCents) : undefined,
+                    maxSpreadCents: b.maxSpreadCents != null ? Number(b.maxSpreadCents) : undefined,
+                    minDepthPct: b.minDepthPct != null ? Number(b.minDepthPct) : undefined,
+                    minSecToHedge: b.minSecToHedge != null ? Number(b.minSecToHedge) : undefined,
+                    hedgeIgnoreSpread: b.hedgeIgnoreSpread != null ? !!b.hedgeIgnoreSpread : undefined,
+                    panicHedgeEnabled: b.panicHedgeEnabled != null ? !!b.panicHedgeEnabled : undefined,
+                    panicHedgeStartSec: b.panicHedgeStartSec != null ? Number(b.panicHedgeStartSec) : undefined,
+                    panicMaxLossCents: b.panicMaxLossCents != null ? Number(b.panicMaxLossCents) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m-hedge/auto/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop Crypto15M Hedge auto',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).stopCrypto15mHedgeAuto();
                 return { success: true, status };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
@@ -1579,6 +1889,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 properties: {
                     pollMs: { type: 'number' },
                     expiresWithinSec: { type: 'number' },
+                    expiresWithinSecByTimeframe: { type: 'object' },
                     minProb: { type: 'number' },
                     amountUsd: { type: 'number' },
                     symbols: { type: 'array', items: { type: 'string' } },
@@ -1974,6 +2285,31 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.get('/crypto/delta-box', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Delta Box stats (10/20/50)',
+            querystring: {
+                type: 'object',
+                properties: {
+                    symbols: { type: 'string' },
+                    timeframes: { type: 'string' },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                return (scanner as any).getDeltaBoxStats({
+                    symbols: q.symbols != null ? String(q.symbols) : undefined,
+                    timeframes: q.timeframes != null ? String(q.timeframes) : undefined,
+                });
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.get('/cryptoall/ws', {
         websocket: true,
         schema: {
@@ -2067,6 +2403,30 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.get('/cryptoall/replay/:id', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get cryptoall execution replay (orderbook before/after + order result)',
+            params: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' }
+                },
+                required: ['id']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const p = (request.params || {}) as any;
+                const id = String(p.id || '').trim();
+                const r = await (scanner as any).getCryptoAllReplay(id);
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.get('/cryptoall/stoploss/history', {
         schema: {
             tags: ['Group Arb'],
@@ -2131,6 +2491,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                 (scanner as any).updateCryptoAllConfig({
                     pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
                     expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    expiresWithinSecByTimeframe: b.expiresWithinSecByTimeframe != null ? b.expiresWithinSecByTimeframe : undefined,
                     minProb: b.minProb != null ? Number(b.minProb) : undefined,
                     amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
                     symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x || '').toUpperCase()).filter(Boolean) : undefined,
@@ -2187,6 +2548,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     ethMinDelta: { type: 'number' },
                     solMinDelta: { type: 'number' },
                     xrpMinDelta: { type: 'number' },
+                    byTimeframe: { type: 'object', additionalProperties: true },
                 }
             }
         },
@@ -2198,6 +2560,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     ethMinDelta: b.ethMinDelta != null ? Number(b.ethMinDelta) : undefined,
                     solMinDelta: b.solMinDelta != null ? Number(b.solMinDelta) : undefined,
                     xrpMinDelta: b.xrpMinDelta != null ? Number(b.xrpMinDelta) : undefined,
+                    byTimeframe: b.byTimeframe != null ? b.byTimeframe : undefined,
                     persist: true,
                 });
                 return { success: true, thresholds };
@@ -2214,6 +2577,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             body: {
                 type: 'object',
                 properties: {
+                    dryRun: { type: 'boolean' },
                     amountUsd: { type: 'number' },
                     minProb: { type: 'number' },
                     expiresWithinSec: { type: 'number' },
@@ -2258,6 +2622,7 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
             try {
                 const b = (request.body || {}) as any;
                 const status = (scanner as any).startCryptoAllAuto({
+                    dryRun: b.dryRun != null ? !!b.dryRun : undefined,
                     amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
                     minProb: b.minProb != null ? Number(b.minProb) : undefined,
                     expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
@@ -2297,6 +2662,40 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
                     adaptiveDeltaRevertNoBuyCount: b.adaptiveDeltaRevertNoBuyCount != null ? Number(b.adaptiveDeltaRevertNoBuyCount) : undefined,
                 });
                 return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/cryptoall/auto/run-once', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Run Crypto All auto trade once (supports dryRun)',
+            body: {
+                type: 'object',
+                properties: {
+                    dryRun: { type: 'boolean' },
+                    minProb: { type: 'number' },
+                    expiresWithinSec: { type: 'number' },
+                    amountUsd: { type: 'number' },
+                    symbols: { type: 'array', items: { type: 'string' } },
+                    timeframes: { type: 'array', items: { type: 'string' } },
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const res = await (scanner as any).runCryptoAllAutoOnce({
+                    dryRun: b.dryRun === true,
+                    minProb: b.minProb != null ? Number(b.minProb) : undefined,
+                    expiresWithinSec: b.expiresWithinSec != null ? Number(b.expiresWithinSec) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    symbols: Array.isArray(b.symbols) ? b.symbols.map((x: any) => String(x)) : undefined,
+                    timeframes: Array.isArray(b.timeframes) ? b.timeframes.map((x: any) => String(x)) : undefined,
+                });
+                return { success: true, result: res };
             } catch (err: any) {
                 return reply.status(500).send({ error: err.message });
             }

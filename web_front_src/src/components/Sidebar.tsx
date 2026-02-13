@@ -60,6 +60,16 @@ function Sidebar() {
             label: '⏱️ 15M Crypto',
         },
         {
+            key: '/crypto-15m-all',
+            icon: <SwapOutlined />,
+            label: '⏱️ 15M ALL',
+        },
+        {
+            key: '/crypto-15m-hedge',
+            icon: <SwapOutlined />,
+            label: '🪤 Crypto15M Hedge',
+        },
+        {
             key: '/crypto-all',
             icon: <SwapOutlined />,
             label: '🧩 Crypto All',
@@ -68,6 +78,11 @@ function Sidebar() {
             key: '/crypto-all2',
             icon: <SwapOutlined />,
             label: '🧩 Crypto All2',
+        },
+        {
+            key: '/follow-activity',
+            icon: <WalletOutlined />,
+            label: '👣 FollowActivity',
         },
     ];
 
