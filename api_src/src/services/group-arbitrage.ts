@@ -6485,7 +6485,7 @@ export class GroupArbitrageScanner {
         const books = await this.deltaBoxFetchOrderbooks(tokenIds);
         const byTid = new Map<string, any>();
         for (const b of books) {
-            const tid = String((b as any)?.asset_id || (b as any)?.assetId || '').trim();
+            const tid = String((b as any)?.token_id ?? (b as any)?.tokenId ?? (b as any)?.tokenID ?? (b as any)?.asset_id ?? (b as any)?.assetId ?? '').trim();
             if (!tid) continue;
             byTid.set(tid, b);
         }
@@ -11139,7 +11139,7 @@ export class GroupArbitrageScanner {
                 }
                 const byTokenId: Record<string, any> = {};
                 for (const b of books) {
-                    const tokenId = String((b as any)?.asset_id || (b as any)?.assetId || '').trim();
+                    const tokenId = String((b as any)?.token_id ?? (b as any)?.tokenId ?? (b as any)?.tokenID ?? (b as any)?.asset_id ?? (b as any)?.assetId ?? '').trim();
                     if (!tokenId) continue;
                     const asks = Array.isArray((b as any)?.asks) ? (b as any).asks : [];
                     const bids = Array.isArray((b as any)?.bids) ? (b as any).bids : [];
@@ -11442,11 +11442,12 @@ export class GroupArbitrageScanner {
         const needBooks = booksAt <= 0;
         const marketStale = !needMarket && (now - marketAt) > 5_000;
         const booksStale = !needBooks && (now - booksAt) > 1_500;
+        const booksEmpty = !Object.keys(this.cryptoAllBooksSnapshot.byTokenId || {}).length;
 
         if (needMarket) await this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
         else if (marketStale) this.refreshCryptoAllMarketSnapshot({ symbols, timeframes, limit }).catch(() => {});
 
-        if (needBooks) await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
+        if (needBooks || booksEmpty) await this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
         else if (booksStale) this.refreshCryptoAllBooksSnapshot({ symbols, timeframes, limit }).catch(() => {});
         return await this.buildCryptoAllCandidatesFromSnapshots({ symbols, timeframes, minProb, expiresWithinSec, expiresWithinSecByTimeframe, limit });
     }

@@ -552,7 +552,7 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     const fetchCandidates = async () => {
         if (candidatesInFlightRef.current) return;
         candidatesInFlightRef.current = true;
-        setCandidatesLoading(true);
+        if (!candidates.length) setCandidatesLoading(true);
         const t0 = Date.now();
         setCandidatesLastError(null);
         if (variant === 'all') {
@@ -2240,7 +2240,7 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
                         showIcon
                     />
                 ) : null}
-                {status?.adaptiveDelta && deltaBoxViewMode === 'single' ? (
+                {status?.adaptiveDelta ? (
                     <Alert
                         style={{ marginTop: 12 }}
                         type="info"
@@ -2259,9 +2259,13 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
                                 const s = get(sym);
                                 const base = s?.baseMinDelta != null ? Number(s.baseMinDelta) : null;
                                 const ov = s?.overrideMinDelta != null ? Number(s.overrideMinDelta) : null;
-                                const rem = s?.remainingToRevert != null ? String(s.remainingToRevert) : '-';
+                                const eff = s?.effectiveMinDelta != null ? Number(s.effectiveMinDelta) : (ov != null ? ov : base);
+                                const revAfter = s?.revertAfter != null ? Math.max(0, Math.floor(Number(s.revertAfter))) : null;
+                                const rem = s?.remainingToRevert != null ? Math.max(0, Math.floor(Number(s.remainingToRevert))) : null;
                                 if (base == null) return `${sym}:-`;
-                                return ov != null ? `${sym}:${fmtNum(base)}→${fmtNum(ov)} (remain ${rem})` : `${sym}:${fmtNum(base)}`;
+                                const ovrActive = ov != null && eff != null && Number.isFinite(Number(eff)) && Math.abs(Number(eff) - Number(base)) > 1e-9;
+                                const remText = ovrActive && revAfter != null ? ` • rem ${rem != null ? String(rem) : '-'}\/${String(revAfter)}` : '';
+                                return `${sym}: ${fmtNum(base)}→${fmtNum(eff)}${ovrActive ? ' (OVR)' : ''}${remText}`;
                             }).join(' | ');
                             return hasByTf ? `Adaptive Δ (${tfKey}): ${parts}` : `Adaptive Δ: ${parts}`;
                         })()}
