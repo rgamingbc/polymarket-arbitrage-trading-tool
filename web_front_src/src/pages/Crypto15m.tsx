@@ -86,12 +86,22 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     }, [apiPath]);
     const [candidates, setCandidates] = useState<any[]>([]);
     const [candidatesMeta, setCandidatesMeta] = useState<{ count: number; eligible: number } | null>(null);
+    const [candidatesLoading, setCandidatesLoading] = useState(false);
+    const [candidatesLastOkAt, setCandidatesLastOkAt] = useState<string | null>(null);
+    const [candidatesLastError, setCandidatesLastError] = useState<string | null>(null);
+    const [candidatesLastDurationMs, setCandidatesLastDurationMs] = useState<number | null>(null);
     const [status, setStatus] = useState<any>(null);
+    const [statusLastError, setStatusLastError] = useState<string | null>(null);
     const [watchdog, setWatchdog] = useState<any>(null);
+    const [watchdogLastError, setWatchdogLastError] = useState<string | null>(null);
     const [health, setHealth] = useState<any>(null);
     const [history, setHistory] = useState<any[]>([]);
     const [configEvents, setConfigEvents] = useState<any[]>([]);
-    const [historyStrategy, setHistoryStrategy] = useState<'crypto15m' | 'cryptoall' | 'all'>('crypto15m');
+    const [historyLoading, setHistoryLoading] = useState(false);
+    const [historyLastOkAt, setHistoryLastOkAt] = useState<string | null>(null);
+    const [historyLastError, setHistoryLastError] = useState<string | null>(null);
+    const [historyLastDurationMs, setHistoryLastDurationMs] = useState<number | null>(null);
+    const [historyStrategy, setHistoryStrategy] = useState<'crypto15m' | 'cryptoall' | 'all'>(() => variant === 'all' ? 'all' : 'crypto15m');
     const [autoRefresh, setAutoRefresh] = useState(() => !safeMode);
     const [showPendingOnly, setShowPendingOnly] = useState(false);
     const [editing, setEditing] = useState(false);
@@ -200,6 +210,10 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     const timerRef = useRef<any>(null);
     const timerHistoryRef = useRef<any>(null);
     const timerDeltaBoxRef = useRef<any>(null);
+    const candidatesInFlightRef = useRef<boolean>(false);
+    const historyInFlightRef = useRef<boolean>(false);
+    const statusInFlightRef = useRef<boolean>(false);
+    const watchdogInFlightRef = useRef<boolean>(false);
     const wsRef = useRef<WebSocket | null>(null);
     const wsSessionRef = useRef(0);
     const cryptoAllStickyCandidatesRef = useRef<Map<string, any>>(new Map());
@@ -465,9 +479,20 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     }, [variant, expiresWithinSecByTimeframe]);
 
     const fetchStatus = async () => {
-        const endpoint = variant === 'all' ? '/group-arb/cryptoall/status' : '/group-arb/crypto15m/status';
-        const res = await apiGet('status', endpoint);
-        setStatus(res.data?.status);
+        if (statusInFlightRef.current) return;
+        statusInFlightRef.current = true;
+        setStatusLastError(null);
+        try {
+            const endpoint = variant === 'all' ? '/group-arb/cryptoall/status' : '/group-arb/crypto15m/status';
+            const res = await apiGet('status', endpoint);
+            setStatus(res.data?.status);
+        } catch (e: any) {
+            const msg = e?.response?.data?.error || e?.message || String(e);
+            const isAbort = String(msg || '').toLowerCase().includes('canceled') || String(msg || '').toLowerCase().includes('abort');
+            if (!isAbort) setStatusLastError(String(msg));
+        } finally {
+            statusInFlightRef.current = false;
+        }
     };
 
     useEffect(() => {
@@ -519,113 +544,140 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     };
 
     const fetchCandidates = async () => {
+        if (candidatesInFlightRef.current) return;
+        candidatesInFlightRef.current = true;
+        setCandidatesLoading(true);
+        const t0 = Date.now();
+        setCandidatesLastError(null);
         if (variant === 'all') {
-            if (!allSymbols.length || !allTimeframes.length) {
-                candidatesSigRef.current = '';
-                candidatesMetaSigRef.current = '';
-                setCandidates([]);
-                setCandidatesMeta(null);
-                return;
-            }
-            const rr = await apiGet('candidates_all', '/group-arb/cryptoall/candidates', {
-                params: {
-                    symbols: allSymbols.join(','),
-                    timeframes: allTimeframes.join(','),
-                    minProb,
-                    expiresWithinSec,
-                    limit: 17,
+            try {
+                if (!allSymbols.length || !allTimeframes.length) {
+                    candidatesSigRef.current = '';
+                    candidatesMetaSigRef.current = '';
+                    setCandidates([]);
+                    setCandidatesMeta(null);
+                    return;
                 }
-            });
-            const rawList = Array.isArray(rr.data?.candidates) ? rr.data.candidates : [];
-            const mapped = rawList.map((c: any) => {
-                const sec = c?.secondsToExpire != null ? Number(c.secondsToExpire) : NaN;
-                const secOk = Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : null;
-                const endDateIso = c?.endDateIso != null ? String(c.endDateIso) : null;
-                const endMs = endDateIso ? Date.parse(endDateIso) : NaN;
-                const computedEndDateIso = (!Number.isFinite(endMs) && secOk != null) ? new Date(Date.now() + secOk * 1000).toISOString() : null;
-                const upPrice = c?.upPrice != null ? Number(c.upPrice) : null;
-                const downPrice = c?.downPrice != null ? Number(c.downPrice) : null;
-                const upAsk = upPrice != null && Number.isFinite(upPrice) ? 1 : 0;
-                const downAsk = downPrice != null && Number.isFinite(downPrice) ? 1 : 0;
-                const meetsMinProb = c?.meetsMinProb === true;
-                const eligibleByExpiry = c?.eligibleByExpiry === true;
-                return {
-                    symbol: String(c?.symbol || '').toUpperCase() || '-',
-                    timeframe: String(c?.timeframe || ''),
-                    title: c?.question ?? c?.title ?? null,
-                    slug: c?.slug ?? null,
-                    conditionId: c?.conditionId ?? null,
-                    endDate: endDateIso || computedEndDateIso,
-                    secondsToExpire: secOk,
-                    eligibleByExpiry,
-                    meetsMinProb,
-                    outcomes: ['Up', 'Down'],
-                    prices: [upPrice, downPrice],
-                    asksCount: [upAsk, downAsk],
-                    chosenIndex: c?.chosenIndex ?? null,
-                    chosenOutcome: c?.chosenOutcome ?? null,
-                    chosenPrice: c?.chosenPrice ?? null,
-                    reason: !eligibleByExpiry ? 'expiry' : !meetsMinProb ? 'price' : null,
-                    snapshotAt: null,
-                    staleMs: null,
-                    booksAttemptError: c?.riskError ?? null,
-                };
-            });
-            const sorted = sortCandidates(mapped);
-            const nowMs = Date.now();
-            const monitorWindowSec = 1800;
-            const sticky = cryptoAllStickyCandidatesRef.current;
-            const seen = new Set<string>();
-            for (const r of sorted) {
-                const cid = String(r?.conditionId || '');
-                const tf = String(r?.timeframe || '');
-                const k = cid ? `${tf}:${cid}` : `${tf}:${String(r?.slug || '')}:${String(r?.symbol || '')}`;
-                seen.add(k);
-                const prev = sticky.get(k) || {};
-                sticky.set(k, { ...prev, ...r, _lastSeenAtMs: nowMs });
-            }
-            for (const [k, v] of Array.from(sticky.entries())) {
-                if (!v) { sticky.delete(k); continue; }
-                const endMs = v?.endDate ? Date.parse(String(v.endDate)) : NaN;
-                if (Number.isFinite(endMs)) {
-                    const sec = Math.floor((endMs - nowMs) / 1000);
-                    v.secondsToExpire = Math.max(0, sec);
+                const rr = await apiGet('candidates_all', '/group-arb/cryptoall/candidates', {
+                    params: {
+                        symbols: allSymbols.join(','),
+                        timeframes: allTimeframes.join(','),
+                        minProb,
+                        expiresWithinSec,
+                        limit: 17,
+                    }
+                });
+                const rawList = Array.isArray(rr.data?.candidates) ? rr.data.candidates : [];
+                const mapped = rawList.map((c: any) => {
+                    const sec = c?.secondsToExpire != null ? Number(c.secondsToExpire) : NaN;
+                    const secOk = Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : null;
+                    const endDateIso = c?.endDateIso != null ? String(c.endDateIso) : null;
+                    const endMs = endDateIso ? Date.parse(endDateIso) : NaN;
+                    const computedEndDateIso = (!Number.isFinite(endMs) && secOk != null) ? new Date(Date.now() + secOk * 1000).toISOString() : null;
+                    const upPrice = c?.upPrice != null ? Number(c.upPrice) : null;
+                    const downPrice = c?.downPrice != null ? Number(c.downPrice) : null;
+                    const upAsk = upPrice != null && Number.isFinite(upPrice) ? 1 : 0;
+                    const downAsk = downPrice != null && Number.isFinite(downPrice) ? 1 : 0;
+                    const meetsMinProb = c?.meetsMinProb === true;
+                    const eligibleByExpiry = c?.eligibleByExpiry === true;
+                    return {
+                        symbol: String(c?.symbol || '').toUpperCase() || '-',
+                        timeframe: String(c?.timeframe || ''),
+                        title: c?.question ?? c?.title ?? null,
+                        slug: c?.slug ?? null,
+                        conditionId: c?.conditionId ?? null,
+                        endDate: endDateIso || computedEndDateIso,
+                        secondsToExpire: secOk,
+                        eligibleByExpiry,
+                        meetsMinProb,
+                        outcomes: ['Up', 'Down'],
+                        prices: [upPrice, downPrice],
+                        asksCount: [upAsk, downAsk],
+                        chosenIndex: c?.chosenIndex ?? null,
+                        chosenOutcome: c?.chosenOutcome ?? null,
+                        chosenPrice: c?.chosenPrice ?? null,
+                        reason: !eligibleByExpiry ? 'expiry' : !meetsMinProb ? 'price' : null,
+                        snapshotAt: null,
+                        staleMs: null,
+                        booksAttemptError: c?.riskError ?? null,
+                    };
+                });
+                const sorted = sortCandidates(mapped);
+                const nowMs = Date.now();
+                const monitorWindowSec = 1800;
+                const sticky = cryptoAllStickyCandidatesRef.current;
+                const seen = new Set<string>();
+                for (const r of sorted) {
+                    const cid = String(r?.conditionId || '');
+                    const tf = String(r?.timeframe || '');
+                    const k = cid ? `${tf}:${cid}` : `${tf}:${String(r?.slug || '')}:${String(r?.symbol || '')}`;
+                    seen.add(k);
+                    const prev = sticky.get(k) || {};
+                    sticky.set(k, { ...prev, ...r, _lastSeenAtMs: nowMs });
                 }
-                const secNum = v?.secondsToExpire != null ? Number(v.secondsToExpire) : NaN;
-                const expired = Number.isFinite(endMs) ? endMs <= nowMs : (Number.isFinite(secNum) ? secNum <= 0 : false);
-                if (expired) { sticky.delete(k); continue; }
-                const inWindow = Number.isFinite(secNum) ? secNum <= monitorWindowSec : (Number.isFinite(endMs) ? (endMs - nowMs) <= monitorWindowSec * 1000 : false);
-                if (!seen.has(k) && !inWindow) sticky.delete(k);
+                for (const [k, v] of Array.from(sticky.entries())) {
+                    if (!v) { sticky.delete(k); continue; }
+                    const endMs = v?.endDate ? Date.parse(String(v.endDate)) : NaN;
+                    if (Number.isFinite(endMs)) {
+                        const sec = Math.floor((endMs - nowMs) / 1000);
+                        v.secondsToExpire = Math.max(0, sec);
+                    }
+                    const secNum = v?.secondsToExpire != null ? Number(v.secondsToExpire) : NaN;
+                    const expired = Number.isFinite(endMs) ? endMs <= nowMs : (Number.isFinite(secNum) ? secNum <= 0 : false);
+                    if (expired) { sticky.delete(k); continue; }
+                    const inWindow = Number.isFinite(secNum) ? secNum <= monitorWindowSec : (Number.isFinite(endMs) ? (endMs - nowMs) <= monitorWindowSec * 1000 : false);
+                    if (!seen.has(k) && !inWindow) sticky.delete(k);
+                }
+                const merged = sortCandidates(Array.from(sticky.values()));
+                const count = Number(rr.data?.count ?? sorted.length);
+                const eligible = Number(sorted.filter((c: any) => c?.meetsMinProb === true && c?.eligibleByExpiry === true).length);
+                const nextSig = merged.slice(0, 120).map((r: any) => `${String(r?.timeframe || '')}:${String(r?.conditionId || '')}:${String(r?.slug || '')}:${String(r?.symbol || '')}:${String(r?.secondsToExpire ?? '')}:${String(r?.chosenPrice ?? '')}:${r?.meetsMinProb === true ? 1 : 0}:${r?.eligibleByExpiry === true ? 1 : 0}`).join('|');
+                const nextMetaSig = `${count}:${eligible}`;
+                if (nextSig !== candidatesSigRef.current) {
+                    candidatesSigRef.current = nextSig;
+                    startTransition(() => setCandidates(merged));
+                }
+                if (nextMetaSig !== candidatesMetaSigRef.current) {
+                    candidatesMetaSigRef.current = nextMetaSig;
+                    setCandidatesMeta({ count, eligible });
+                }
+                setCandidatesLastOkAt(new Date().toISOString());
+                setCandidatesLastDurationMs(Date.now() - t0);
+            } catch (e: any) {
+                const msg = e?.response?.data?.error || e?.message || String(e);
+                const isAbort = String(msg || '').toLowerCase().includes('canceled') || String(msg || '').toLowerCase().includes('abort');
+                if (!isAbort) setCandidatesLastError(String(msg));
+            } finally {
+                setCandidatesLoading(false);
+                candidatesInFlightRef.current = false;
             }
-            const merged = sortCandidates(Array.from(sticky.values()));
-            const count = Number(rr.data?.count ?? sorted.length);
-            const eligible = Number(sorted.filter((c: any) => c?.meetsMinProb === true && c?.eligibleByExpiry === true).length);
-            const nextSig = merged.slice(0, 120).map((r: any) => `${String(r?.timeframe || '')}:${String(r?.conditionId || '')}:${String(r?.slug || '')}:${String(r?.symbol || '')}:${String(r?.secondsToExpire ?? '')}:${String(r?.chosenPrice ?? '')}:${r?.meetsMinProb === true ? 1 : 0}:${r?.eligibleByExpiry === true ? 1 : 0}`).join('|');
+            return;
+        }
+        try {
+            const res = await apiGet('candidates_15m', '/group-arb/crypto15m/candidates', { params: { minProb, expiresWithinSec, limit: 20 } });
+            const list = Array.isArray(res.data?.candidates) ? res.data.candidates : [];
+            const sorted = sortCandidates(list);
+            const count = Number(res.data?.count ?? sorted.length);
+            const eligible = Number(res.data?.countEligible ?? sorted.filter((c: any) => c?.meetsMinProb === true && c?.eligibleByExpiry === true).length);
+            const nextSig = sorted.slice(0, 60).map((r: any) => `${String(r?.conditionId || '')}:${String(r?.secondsToExpire ?? '')}:${String(r?.chosenPrice ?? '')}:${r?.meetsMinProb === true ? 1 : 0}:${r?.eligibleByExpiry === true ? 1 : 0}`).join('|');
             const nextMetaSig = `${count}:${eligible}`;
             if (nextSig !== candidatesSigRef.current) {
                 candidatesSigRef.current = nextSig;
-                startTransition(() => setCandidates(merged));
+                startTransition(() => setCandidates(sorted));
             }
             if (nextMetaSig !== candidatesMetaSigRef.current) {
                 candidatesMetaSigRef.current = nextMetaSig;
                 setCandidatesMeta({ count, eligible });
             }
-            return;
-        }
-        const res = await apiGet('candidates_15m', '/group-arb/crypto15m/candidates', { params: { minProb, expiresWithinSec, limit: 20 } });
-        const list = Array.isArray(res.data?.candidates) ? res.data.candidates : [];
-        const sorted = sortCandidates(list);
-        const count = Number(res.data?.count ?? sorted.length);
-        const eligible = Number(res.data?.countEligible ?? sorted.filter((c: any) => c?.meetsMinProb === true && c?.eligibleByExpiry === true).length);
-        const nextSig = sorted.slice(0, 60).map((r: any) => `${String(r?.conditionId || '')}:${String(r?.secondsToExpire ?? '')}:${String(r?.chosenPrice ?? '')}:${r?.meetsMinProb === true ? 1 : 0}:${r?.eligibleByExpiry === true ? 1 : 0}`).join('|');
-        const nextMetaSig = `${count}:${eligible}`;
-        if (nextSig !== candidatesSigRef.current) {
-            candidatesSigRef.current = nextSig;
-            startTransition(() => setCandidates(sorted));
-        }
-        if (nextMetaSig !== candidatesMetaSigRef.current) {
-            candidatesMetaSigRef.current = nextMetaSig;
-            setCandidatesMeta({ count, eligible });
+            setCandidatesLastOkAt(new Date().toISOString());
+            setCandidatesLastDurationMs(Date.now() - t0);
+        } catch (e: any) {
+            const msg = e?.response?.data?.error || e?.message || String(e);
+            const isAbort = String(msg || '').toLowerCase().includes('canceled') || String(msg || '').toLowerCase().includes('abort');
+            if (!isAbort) setCandidatesLastError(String(msg));
+        } finally {
+            setCandidatesLoading(false);
+            candidatesInFlightRef.current = false;
         }
     };
 
@@ -653,81 +705,101 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     };
 
     const fetchHistory = async () => {
-        if (historyStrategy === 'crypto15m') {
-            const res = await apiGet('history_15m', '/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
-            const h = Array.isArray(res.data?.history) ? res.data.history : [];
-            const nextHistory = h.map((x: any) => ({ ...x, strategy: 'crypto15m' }));
-            const nextSig = nextHistory.slice(0, 120).map((x: any) => `${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
-            const nextSummary = res.data?.summary || null;
-            const nextConfig = Array.isArray(res.data?.configEvents) ? res.data.configEvents : [];
-            const nextMetaSig = `${String(nextSummary?.count ?? '')}:${String(nextSummary?.pnlTotalUsdc ?? '')}:${String(nextConfig.length)}`;
+        if (historyInFlightRef.current) return;
+        historyInFlightRef.current = true;
+        setHistoryLoading(true);
+        const t0 = Date.now();
+        setHistoryLastError(null);
+        try {
+            if (historyStrategy === 'crypto15m') {
+                const res = await apiGet('history_15m', '/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
+                const h = Array.isArray(res.data?.history) ? res.data.history : [];
+                const nextHistory = h.map((x: any) => ({ ...x, strategy: 'crypto15m' }));
+                const nextSig = nextHistory.slice(0, 120).map((x: any) => `${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
+                const nextSummary = res.data?.summary || null;
+                const nextConfig = Array.isArray(res.data?.configEvents) ? res.data.configEvents : [];
+                const nextMetaSig = `${String(nextSummary?.count ?? '')}:${String(nextSummary?.pnlTotalUsdc ?? '')}:${String(nextConfig.length)}`;
+                if (nextSig !== historySigRef.current) {
+                    historySigRef.current = nextSig;
+                    startTransition(() => setHistory(nextHistory));
+                }
+                if (nextMetaSig !== historyMetaSigRef.current) {
+                    historyMetaSigRef.current = nextMetaSig;
+                    setHistorySummary(nextSummary);
+                    setConfigEvents(nextConfig);
+                }
+                setHistoryLastOkAt(new Date().toISOString());
+                setHistoryLastDurationMs(Date.now() - t0);
+                return;
+            }
+            if (historyStrategy === 'cryptoall') {
+                const res = await apiGet('history_all', '/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
+                const h = Array.isArray(res.data?.history) ? res.data.history : [];
+                const nextHistory = h.map((x: any) => ({ ...x, strategy: 'cryptoall' }));
+                const nextSig = nextHistory.slice(0, 120).map((x: any) => `${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
+                const nextSummary = res.data?.summary || null;
+                const nextMetaSig = `${String(nextSummary?.count ?? '')}:${String(nextSummary?.pnlTotalUsdc ?? '')}:0`;
+                if (nextSig !== historySigRef.current) {
+                    historySigRef.current = nextSig;
+                    startTransition(() => setHistory(nextHistory));
+                }
+                if (nextMetaSig !== historyMetaSigRef.current) {
+                    historyMetaSigRef.current = nextMetaSig;
+                    setHistorySummary(nextSummary);
+                    setConfigEvents([]);
+                }
+                setHistoryLastOkAt(new Date().toISOString());
+                setHistoryLastDurationMs(Date.now() - t0);
+                return;
+            }
+            const [r15, rAll] = await Promise.all([
+                apiGet('history_15m_all', '/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
+                apiGet('history_all_all', '/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
+            ]);
+            const h15 = (Array.isArray(r15.data?.history) ? r15.data.history : []).map((x: any) => ({ ...x, strategy: 'crypto15m' }));
+            const hAll = (Array.isArray(rAll.data?.history) ? rAll.data.history : []).map((x: any) => ({ ...x, strategy: 'cryptoall' }));
+            const merged = h15.concat(hAll).sort((a: any, b: any) => {
+                const ta = Date.parse(String(a?.timestamp || '')) || 0;
+                const tb = Date.parse(String(b?.timestamp || '')) || 0;
+                return tb - ta;
+            }).slice(0, 80);
+            const s15 = r15.data?.summary || {};
+            const sAll = rAll.data?.summary || {};
+            const sum = {
+                count: Number(s15.count || 0) + Number(sAll.count || 0),
+                totalStakeUsd: Number(s15.totalStakeUsd || 0) + Number(sAll.totalStakeUsd || 0),
+                pnlTotalUsdc: Number(s15.pnlTotalUsdc || 0) + Number(sAll.pnlTotalUsdc || 0),
+                winCount: Number(s15.winCount || 0) + Number(sAll.winCount || 0),
+                lossCount: Number(s15.lossCount || 0) + Number(sAll.lossCount || 0),
+                openCount: Number(s15.openCount || 0) + Number(sAll.openCount || 0),
+                redeemableCount: Number(s15.redeemableCount || 0) + Number(sAll.redeemableCount || 0),
+                redeemedCount: Number(s15.redeemedCount || 0) + Number(sAll.redeemedCount || 0),
+                totalOrders1h: Number(s15.totalOrders1h || 0) + Number(sAll.totalOrders1h || 0),
+                filledOrders1h: Number(s15.filledOrders1h || 0) + Number(sAll.filledOrders1h || 0),
+                filledUsd1h: Number(s15.filledUsd1h || 0) + Number(sAll.filledUsd1h || 0),
+            };
+            (sum as any).fillRate1h = Number(sum.totalOrders1h || 0) > 0 ? (Number(sum.filledOrders1h || 0) / Number(sum.totalOrders1h || 0)) : 0;
+            const nextSig = merged.slice(0, 120).map((x: any) => `${String(x?.strategy ?? '')}:${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
+            const nextConfig = Array.isArray(r15.data?.configEvents) ? r15.data.configEvents : [];
+            const nextMetaSig = `${String(sum.count)}:${String(sum.pnlTotalUsdc)}:${String(nextConfig.length)}`;
             if (nextSig !== historySigRef.current) {
                 historySigRef.current = nextSig;
-                startTransition(() => setHistory(nextHistory));
+                startTransition(() => setHistory(merged));
             }
             if (nextMetaSig !== historyMetaSigRef.current) {
                 historyMetaSigRef.current = nextMetaSig;
-                setHistorySummary(nextSummary);
+                setHistorySummary(sum);
                 setConfigEvents(nextConfig);
             }
-            return;
-        }
-        if (historyStrategy === 'cryptoall') {
-            const res = await apiGet('history_all', '/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } });
-            const h = Array.isArray(res.data?.history) ? res.data.history : [];
-            const nextHistory = h.map((x: any) => ({ ...x, strategy: 'cryptoall' }));
-            const nextSig = nextHistory.slice(0, 120).map((x: any) => `${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
-            const nextSummary = res.data?.summary || null;
-            const nextMetaSig = `${String(nextSummary?.count ?? '')}:${String(nextSummary?.pnlTotalUsdc ?? '')}:0`;
-            if (nextSig !== historySigRef.current) {
-                historySigRef.current = nextSig;
-                startTransition(() => setHistory(nextHistory));
-            }
-            if (nextMetaSig !== historyMetaSigRef.current) {
-                historyMetaSigRef.current = nextMetaSig;
-                setHistorySummary(nextSummary);
-                setConfigEvents([]);
-            }
-            return;
-        }
-        const [r15, rAll] = await Promise.all([
-            apiGet('history_15m_all', '/group-arb/crypto15m/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
-            apiGet('history_all_all', '/group-arb/cryptoall/history', { params: { refresh: true, intervalMs: 1000, maxEntries: 50 } }),
-        ]);
-        const h15 = (Array.isArray(r15.data?.history) ? r15.data.history : []).map((x: any) => ({ ...x, strategy: 'crypto15m' }));
-        const hAll = (Array.isArray(rAll.data?.history) ? rAll.data.history : []).map((x: any) => ({ ...x, strategy: 'cryptoall' }));
-        const merged = h15.concat(hAll).sort((a: any, b: any) => {
-            const ta = Date.parse(String(a?.timestamp || '')) || 0;
-            const tb = Date.parse(String(b?.timestamp || '')) || 0;
-            return tb - ta;
-        }).slice(0, 80);
-        const s15 = r15.data?.summary || {};
-        const sAll = rAll.data?.summary || {};
-        const sum = {
-            count: Number(s15.count || 0) + Number(sAll.count || 0),
-            totalStakeUsd: Number(s15.totalStakeUsd || 0) + Number(sAll.totalStakeUsd || 0),
-            pnlTotalUsdc: Number(s15.pnlTotalUsdc || 0) + Number(sAll.pnlTotalUsdc || 0),
-            winCount: Number(s15.winCount || 0) + Number(sAll.winCount || 0),
-            lossCount: Number(s15.lossCount || 0) + Number(sAll.lossCount || 0),
-            openCount: Number(s15.openCount || 0) + Number(sAll.openCount || 0),
-            redeemableCount: Number(s15.redeemableCount || 0) + Number(sAll.redeemableCount || 0),
-            redeemedCount: Number(s15.redeemedCount || 0) + Number(sAll.redeemedCount || 0),
-            totalOrders1h: Number(s15.totalOrders1h || 0) + Number(sAll.totalOrders1h || 0),
-            filledOrders1h: Number(s15.filledOrders1h || 0) + Number(sAll.filledOrders1h || 0),
-            filledUsd1h: Number(s15.filledUsd1h || 0) + Number(sAll.filledUsd1h || 0),
-        };
-        (sum as any).fillRate1h = Number(sum.totalOrders1h || 0) > 0 ? (Number(sum.filledOrders1h || 0) / Number(sum.totalOrders1h || 0)) : 0;
-        const nextSig = merged.slice(0, 120).map((x: any) => `${String(x?.strategy ?? '')}:${String(x?.id ?? '')}:${String(x?.orderStatus ?? '')}:${String(x?.filledSize ?? '')}:${String(x?.result ?? '')}:${String(x?.state ?? '')}`).join('|');
-        const nextConfig = Array.isArray(r15.data?.configEvents) ? r15.data.configEvents : [];
-        const nextMetaSig = `${String(sum.count)}:${String(sum.pnlTotalUsdc)}:${String(nextConfig.length)}`;
-        if (nextSig !== historySigRef.current) {
-            historySigRef.current = nextSig;
-            startTransition(() => setHistory(merged));
-        }
-        if (nextMetaSig !== historyMetaSigRef.current) {
-            historyMetaSigRef.current = nextMetaSig;
-            setHistorySummary(sum);
-            setConfigEvents(nextConfig);
+            setHistoryLastOkAt(new Date().toISOString());
+            setHistoryLastDurationMs(Date.now() - t0);
+        } catch (e: any) {
+            const msg = e?.response?.data?.error || e?.message || String(e);
+            const isAbort = String(msg || '').toLowerCase().includes('canceled') || String(msg || '').toLowerCase().includes('abort');
+            if (!isAbort) setHistoryLastError(String(msg));
+        } finally {
+            setHistoryLoading(false);
+            historyInFlightRef.current = false;
         }
     };
 
@@ -883,9 +955,20 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
     };
 
     const fetchWatchdog = async () => {
-        const endpoint = variant === 'all' ? '/group-arb/cryptoall/watchdog/status' : '/group-arb/crypto15m/watchdog/status';
-        const r = await apiGet('watchdog', endpoint);
-        setWatchdog(r.data?.status);
+        if (watchdogInFlightRef.current) return;
+        watchdogInFlightRef.current = true;
+        setWatchdogLastError(null);
+        try {
+            const endpoint = variant === 'all' ? '/group-arb/cryptoall/watchdog/status' : '/group-arb/crypto15m/watchdog/status';
+            const r = await apiGet('watchdog', endpoint);
+            setWatchdog(r.data?.status);
+        } catch (e: any) {
+            const msg = e?.response?.data?.error || e?.message || String(e);
+            const isAbort = String(msg || '').toLowerCase().includes('canceled') || String(msg || '').toLowerCase().includes('abort');
+            if (!isAbort) setWatchdogLastError(String(msg));
+        } finally {
+            watchdogInFlightRef.current = false;
+        }
     };
 
     const fetchThresholds = async () => {
@@ -2100,7 +2183,7 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
                 <Alert
                     style={{ marginTop: 12 }}
                     type="info"
-                    message={`WS: ${wsConnected ? 'ON' : 'OFF'} • WS Last: ${wsLastAt || '-'} • Key: ${status?.hasValidKey ? 'OK' : 'MISSING'} • Watchdog: ${watchdog?.running ? 'ON' : 'OFF'} • Auto: ${status?.enabled ? 'ON' : 'OFF'} • LastScanAt: ${status?.lastScanAt || '-'} • Tracked: ${trackedCount != null ? trackedCount : '-'} • Candidates: ${candidatesMeta?.eligible ?? '-'} eligible / ${candidatesMeta?.count ?? '-'} total`}
+                    message={`WS: ${wsConnected ? 'ON' : 'OFF'} • WS Last: ${wsLastAt || '-'} • Key: ${status?.hasValidKey ? 'OK' : 'MISSING'} • Watchdog: ${watchdog?.running ? 'ON' : 'OFF'} • Auto: ${status?.enabled ? 'ON' : 'OFF'} • LastScanAt: ${status?.lastScanAt || '-'} • Tracked: ${trackedCount != null ? trackedCount : '-'} • Candidates: ${candidatesMeta?.eligible ?? '-'} eligible / ${candidatesMeta?.count ?? '-'} total • CandOK: ${candidatesLastOkAt ? String(candidatesLastOkAt).replace('T', ' ').replace('Z', '') : '-'} • CandMs: ${candidatesLastDurationMs != null ? String(Math.max(0, Math.floor(Number(candidatesLastDurationMs)))) : '-'} • CandErr: ${candidatesLastError ? String(candidatesLastError).slice(0, 40) : '-'} • HistOK: ${historyLastOkAt ? String(historyLastOkAt).replace('T', ' ').replace('Z', '') : '-'} • HistMs: ${historyLastDurationMs != null ? String(Math.max(0, Math.floor(Number(historyLastDurationMs)))) : '-'} • HistErr: ${historyLastError ? String(historyLastError).slice(0, 40) : '-'} • S/E: ${statusLastError ? 'S!' : 'S✓'}${watchdogLastError ? ' W!' : ' W✓'}`}
                     showIcon
                 />
                 {variant === 'all' && cryptoAllTfCountsText ? (
@@ -2649,7 +2732,7 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
                             const tf = String((r as any)?.timeframe || '');
                             return cid ? `${tf}:${cid}` : `${tf}:${String((r as any)?.slug || '')}:${String((r as any)?.symbol || '')}`;
                         }}
-                        loading={false}
+                        loading={candidatesLoading}
                         dataSource={candidates}
                         columns={columns as any}
                         pagination={false}
@@ -2710,8 +2793,17 @@ function Crypto15m(props: { variant?: 'crypto15m' | 'all'; title?: string; setti
                 ) : null}
                 <Table
                     className="compact-antd-table"
-                    rowKey={(r) => String(r.id)}
-                    loading={false}
+                    rowKey={(r) => {
+                        const x: any = r as any;
+                        const id = x?.id ?? x?.orderId ?? x?.orderID ?? null;
+                        if (id != null) return String(id);
+                        const ts = x?.timestamp || x?.time || '';
+                        const mid = x?.marketId ?? x?.conditionId ?? x?.slug ?? '';
+                        const out = x?.outcome ?? x?.side ?? '';
+                        const extra = x?.txHash ?? x?.hash ?? '';
+                        return `${String(x?.strategy || '')}:${String(ts)}:${String(mid)}:${String(out)}:${String(extra)}`;
+                    }}
+                    loading={historyLoading}
                     dataSource={historyView}
                     columns={historyColumns as any}
                     pagination={false}
