@@ -1771,6 +1771,178 @@ export const groupArbRoutes: FastifyPluginAsync = async (fastify) => {
         }
     });
 
+    fastify.post('/crypto15m2/watchdog/start', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Start crypto15m2 watchdog (12h monitor + auto stop on issues)',
+            body: {
+                type: 'object',
+                properties: {
+                    durationHours: { type: 'number' },
+                    pollMs: { type: 'number' },
+                    staleMsThreshold: { type: 'number' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).startCrypto15m2Watchdog({
+                    durationHours: b.durationHours != null ? Number(b.durationHours) : undefined,
+                    pollMs: b.pollMs != null ? Number(b.pollMs) : undefined,
+                    staleMsThreshold: b.staleMsThreshold != null ? Number(b.staleMsThreshold) : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m2/watchdog/stop', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Stop crypto15m2 watchdog (and generate report)',
+            body: {
+                type: 'object',
+                properties: {
+                    reason: { type: 'string' },
+                    stopAuto: { type: 'boolean' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const status = (scanner as any).stopCrypto15m2Watchdog({
+                    reason: b.reason != null ? String(b.reason) : undefined,
+                    stopAuto: b.stopAuto != null ? !!b.stopAuto : undefined,
+                });
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m2/watchdog/status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get crypto15m2 watchdog status',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).getCrypto15m2WatchdogStatus();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m2/watchdog/report/latest', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get latest crypto15m2 watchdog report',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const report = (scanner as any).getCrypto15m2WatchdogReportLatest();
+                return report;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m2/active/reset', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Reset crypto15m2 active order state',
+        },
+        handler: async (_request, reply) => {
+            try {
+                const status = (scanner as any).resetCrypto15m2Active();
+                return { success: true, status };
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.get('/crypto15m2/order-status', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Get crypto15m2 order status by orderId (debug)',
+            querystring: {
+                type: 'object',
+                required: ['orderId'],
+                properties: {
+                    orderId: { type: 'string' }
+                }
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const q = request.query as any;
+                const r = await (scanner as any).debugCrypto15mOrderStatus(String(q.orderId));
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
+    fastify.post('/crypto15m2/order', {
+        schema: {
+            tags: ['Group Arb'],
+            summary: 'Place a single 15m crypto order (semi mode) [crypto15m2]',
+            body: {
+                type: 'object',
+                properties: {
+                    conditionId: { type: 'string' },
+                    outcomeIndex: { type: 'number' },
+                    chosenTokenId: { type: 'string' },
+                    timeframe: { type: 'string' },
+                    amountUsd: { type: 'number' },
+                    minPrice: { type: 'number' },
+                    stoplossEnabled: { type: 'boolean' },
+                    stoplossCut1DropCents: { type: 'number' },
+                    stoplossCut1SellPct: { type: 'number' },
+                    stoplossCut2DropCents: { type: 'number' },
+                    stoplossCut2SellPct: { type: 'number' },
+                    stoplossMinSecToExit: { type: 'number' },
+                    force: { type: 'boolean' }
+                },
+                required: ['conditionId']
+            }
+        },
+        handler: async (request, reply) => {
+            try {
+                const b = (request.body || {}) as any;
+                const r = await (scanner as any).placeCrypto15m2Order({
+                    conditionId: String(b.conditionId),
+                    outcomeIndex: b.outcomeIndex != null ? Number(b.outcomeIndex) : undefined,
+                    chosenTokenId: b.chosenTokenId != null ? String(b.chosenTokenId) : undefined,
+                    timeframe: b.timeframe != null ? String(b.timeframe) : undefined,
+                    amountUsd: b.amountUsd != null ? Number(b.amountUsd) : undefined,
+                    minPrice: b.minPrice != null ? Number(b.minPrice) : undefined,
+                    stoplossEnabled: b.stoplossEnabled != null ? !!b.stoplossEnabled : undefined,
+                    stoplossCut1DropCents: b.stoplossCut1DropCents != null ? Number(b.stoplossCut1DropCents) : undefined,
+                    stoplossCut1SellPct: b.stoplossCut1SellPct != null ? Number(b.stoplossCut1SellPct) : undefined,
+                    stoplossCut2DropCents: b.stoplossCut2DropCents != null ? Number(b.stoplossCut2DropCents) : undefined,
+                    stoplossCut2SellPct: b.stoplossCut2SellPct != null ? Number(b.stoplossCut2SellPct) : undefined,
+                    stoplossMinSecToExit: b.stoplossMinSecToExit != null ? Number(b.stoplossMinSecToExit) : undefined,
+                    force: b.force === true,
+                    source: 'semi',
+                });
+                return r;
+            } catch (err: any) {
+                return reply.status(500).send({ error: err.message });
+            }
+        }
+    });
+
     fastify.get('/crypto15m-hedge/status', {
         schema: {
             tags: ['Group Arb'],
